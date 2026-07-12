@@ -1,0 +1,30 @@
+{
+  "name": "pi-subagents-extension",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "dependencies": {
+    "typebox": "1.1.38"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "bun-types": "1.3.5",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "test": "bun scripts/run-tests.ts",
+    "test:unit": "bun test test/domain.test.ts test/settings.test.ts test/persistence.test.ts test/completion-service.test.ts",
+    "test:transport": "bun test test/jsonl.test.ts test/rpc-wire.test.ts test/rpc-client.test.ts test/output-store.test.ts test/ui-spike.test.ts",
+    "check:cgroup": "bun scripts/check-cgroup-v2.ts",
+    "test:process": "bun test test/watchdog.test.ts test/pi-launcher.test.ts test/launcher.test.ts test/cgroup-process.test.ts",
+    "test:controller": "bun test test/run-controller.test.ts test/controller.test.ts test/tools.test.ts test/restoration.test.ts test/extension.test.ts",
+    "test:integration": "bun test test/pi-integration.test.ts test/e2e.test.ts test/context-safety.test.ts",
+    "test:live-model": "PI_SUBAGENTS_LIVE_SMOKE=1 bun test test/live-model-smoke.test.ts --timeout 120000",
+    "typecheck": "tsc --noEmit"
+  }
+}
