@@ -6,18 +6,12 @@ import { createHash } from "node:crypto";
 import type {
   WireExtensionUIDialog as WireExtensionUIRequest,
   WireExtensionUINotification,
-} from "../src/rpc-wire.ts";
+} from "../src/schemas.ts";
 import { UIForwarder, type ExtensionUIContextLike } from "../src/ui-forwarder.ts";
+import { deferred } from "./support/async.ts";
 
 const AGENT_A = agentId("agent-a");
 const AGENT_B = agentId("agent-b");
-
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
-}
 
 function confirm(id: string, title = id.toUpperCase()): WireExtensionUIRequest {
   return { type: "extension_ui_request", method: "confirm", id, title, message: `Confirm ${id}?` };

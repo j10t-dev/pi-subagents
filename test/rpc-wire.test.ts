@@ -1,36 +1,49 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "../src/domain.ts";
 import type {
   RpcExtensionUIRequest,
   RpcExtensionUIResponse,
   RpcResponse,
 } from "@earendil-works/pi-coding-agent";
 
+import { assistantMessage as buildAssistantMessage } from "./support/messages.ts";
 import { classifyInboundRecord } from "../src/rpc-wire.ts";
-import type { WireExtensionUINotification } from "../src/rpc-wire.ts";
+import type { WireExtensionUINotification } from "../src/schemas.ts";
 
-function assistantMessage(overrides: Record<string, unknown> = {}) {
+const validUsage: Usage = {
+  input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 1, reasoning: 1,
+  totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+const invalidUsageCases = [
+  ["negative token", (usage: Usage) => ({ ...usage, input: -1 })],
+  ["NaN token", (usage: Usage) => ({ ...usage, output: Number.NaN })],
+  ["infinite token", (usage: Usage) => ({ ...usage, cacheRead: Number.POSITIVE_INFINITY })],
+  ["negative optional", (usage: Usage) => ({ ...usage, reasoning: -1 })],
+  ["missing totalTokens", (usage: Usage) => { const { totalTokens: _removed, ...rest } = usage; return rest; }],
+  ["missing cost field", (usage: Usage) => { const { cacheWrite: _removed, ...cost } = usage.cost; return { ...usage, cost }; }],
+] as const;
+
+function assistantMessage(text = "hello", overrides: Record<string, unknown> = {}) {
   return {
-    role: "assistant",
-    content: [{ type: "text", text: "hello" }],
+    ...buildAssistantMessage(text, { usage: validUsage }),
     api: "messages",
     provider: "anthropic",
     model: "claude",
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: "stop",
     timestamp: Date.now(),
     ...overrides,
   };
 }
 
 describe("classifyInboundRecord", () => {
+  test.each(invalidUsageCases)("rejects shared invalid usage: %s", (_label, mutate) => {
+    expect(classifyInboundRecord({ type: "message_end", message: assistantMessage("hello", { usage: mutate(validUsage) }) }).ok).toBe(false);
+  });
+
+  test("accepts the shared valid usage fixture", () => {
+    expect(classifyInboundRecord({ type: "message_end", message: assistantMessage("hello", { usage: validUsage }) }).ok).toBe(true);
+  });
+
   test("classifies a correlated get_entries response", () => {
     const result = classifyInboundRecord({
       id: "req-1",
@@ -90,14 +103,14 @@ describe("classifyInboundRecord", () => {
     ];
     for (const usage of invalidUsages) {
       const event = type === "message_update"
-        ? { type, message: assistantMessage({ usage }), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" } }
-        : { type, message: assistantMessage({ usage }) };
+        ? { type, message: assistantMessage("hello", { usage }), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" } }
+        : { type, message: assistantMessage("hello", { usage }) };
       expect(classifyInboundRecord(event).ok).toBe(false);
     }
   });
 
   test.each(["message_start", "message_update", "message_end"] as const)("accepts optional usage fields on %s", (type) => {
-    const message = assistantMessage({ usage: {
+    const message = assistantMessage("hello", { usage: {
       ...assistantMessage().usage,
       cacheWrite1h: 12,
       reasoning: 8,
@@ -144,6 +157,20 @@ describe("classifyInboundRecord", () => {
     });
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.record.kind).toBe("message_update_other");
+  });
+
+  test("treats a text_end carrying its own content as an unremarkable other update", () => {
+    const poisonedTextEnd = classifyInboundRecord({
+      type: "message_update",
+      message: assistantMessage("trusted delta"),
+      assistantMessageEvent: {
+        type: "text_end",
+        contentIndex: 0,
+        content: "POISONED_TEXT_END_CONTENT",
+        partial: { type: "text", text: "POISONED_PARTIAL" },
+      },
+    });
+    expect(poisonedTextEnd).toEqual({ ok: true, record: { kind: "message_update_other" } });
   });
 
   test("rejects malformed required text_delta events instead of treating them as other updates", () => {

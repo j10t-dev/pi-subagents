@@ -4,7 +4,7 @@ import type { AgentId } from "./domain.ts";
 import type {
   WireExtensionUIDialog,
   WireExtensionUINotification,
-} from "./rpc-wire.ts";
+} from "./schemas.ts";
 
 export interface ExtensionUIDialogOptionsLike {
   signal?: AbortSignal;

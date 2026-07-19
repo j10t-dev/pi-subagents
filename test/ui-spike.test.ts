@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { agentId } from "../src/domain.ts";
-import type { WireExtensionUIDialog as WireExtensionUIRequest } from "../src/rpc-wire.ts";
+import type { WireExtensionUIDialog as WireExtensionUIRequest } from "../src/schemas.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
 import type { ExtensionUIContextLike } from "../src/ui-forwarder.ts";
 

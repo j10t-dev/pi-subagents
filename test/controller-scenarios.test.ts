@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { CompletionService } from "../src/completion-service.ts";
-import { SubagentController, type RestorationPort, type SurrenderContainment } from "../src/controller.ts";
+import { SubagentController, type PiControllerComposition, type RestorationPort, type SurrenderContainment } from "../src/controller.ts";
 import {
   AgentErrorCode,
   AgentEventType,
@@ -19,14 +19,21 @@ import {
   truncateUtf8,
   type AgentCompletion,
   type AgentId,
+  type ContainmentReceiptPath,
   type RunId,
 } from "../src/domain.ts";
 import { OutputStore } from "../src/output-store.ts";
+import { containmentReceiptPath } from "../src/paths.ts";
 import { AgentEventAppender, foldAgentEvents } from "../src/persistence.ts";
 import { buildRpcLaunchSpec } from "../src/pi-launcher.ts";
 import { RunController, classifyTerminal, type RunControllerOptions } from "../src/run-controller.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
+import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testModelSpec, testReceiptPath, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
+import { agentSummary, assistantMessage, completedCompletion, testUsage } from "./support/messages.ts";
+import { testRuntime } from "./support/launches.ts";
+import { testRunController } from "./support/controllers.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const A = agentId("agent-a");
 const B = agentId("agent-b");
@@ -34,7 +41,7 @@ const R1 = runId("deadbeef");
 const R2 = runId("cafebabe");
 const RUN_SIGNAL = new AbortController().signal;
 
-describe("required end-to-end scenarios", () => {
+describe("controller orchestration scenarios", () => {
   test("01 spawn one child and receive its completion", async () => {
     const service = new CompletionService();
     service.upsertAgent(summary(A, AgentState.Running, R1));
@@ -78,10 +85,10 @@ describe("required end-to-end scenarios", () => {
       await Promise.all(processes.map(waitSpawn));
       for (const [index, id] of [A, B].entries()) {
         const child = processes[index]!;
-        runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: `/tmp/${id}` as never });
+        runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${id}`) });
         await runs.launch(id, async () => ({ status: "accepted", runId: R1, runtime: {
           abort: async () => { child.kill("SIGTERM"); },
-          contain: async () => { await waitExit(child); return `/tmp/${id}.receipt` as never; },
+          contain: async () => { await waitExit(child); return testVerifiedReceiptPath(`/tmp/pi-subagents-test/${id}.receipt`); },
         } }));
       }
       await Promise.all([A, B].map((id) => runs.stop(id, CancellationReason.ParentShutdown)));
@@ -94,13 +101,13 @@ describe("required end-to-end scenarios", () => {
 
   test("06 restored parent collects an earlier uncollected completion", async () => {
     const service = new CompletionService();
-    expect(service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: "/tmp/a" as never, latestCompletion: completion(A, R1, "old") }])).toEqual({ backPingCount: 1 });
+    expect(service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "old") }])).toEqual({ backPingCount: 1 });
     expect((await service.receive()).completions[0]?.output.text).toBe("old");
   });
 
   test("07 stopped child resumes after parent restart", async () => {
     const runs = controller();
-    runs.restore([{ agentId: A, state: AgentState.Stopped, transcriptPath: "/tmp/a" as never, runId: R1 }]);
+    runs.restore([{ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
     const resumed = await runs.launch(A, async () => ({ status: "accepted", runId: R2, runtime: runtime() }));
     expect(resumed).toMatchObject({ status: "running", agentId: A, runId: R2 });
   });
@@ -129,7 +136,7 @@ describe("required end-to-end scenarios", () => {
   test("11 send_input rejects running, settling and stopping without mutating runs", async () => {
     for (const state of [AgentState.Running, AgentState.Settling, AgentState.Stopping]) {
       const runs = controller();
-      runs.restore([{ agentId: A, state, transcriptPath: "/tmp/a" as never, runId: R1 }]);
+      runs.restore([{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
       await expect(runs.launch(A, async () => ({ status: "accepted", runId: R2, runtime: runtime() }))).rejects.toThrow("invalid_state:");
       expect(runs.snapshot(A)).toMatchObject({ state, runId: R1 });
     }
@@ -137,24 +144,28 @@ describe("required end-to-end scenarios", () => {
 
   test("12 compaction-safe restoration recovers pre-compaction inventory and completion", async () => {
     const service = new CompletionService();
-    service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: "/tmp/a" as never, latestCompletion: completion(A, R1, "before compaction") }]);
+    service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "before compaction") }]);
     expect((await service.receive())).toMatchObject({ completions: [{ agentId: A, runId: R1 }], agents: [{ agentId: A }] });
   });
 
   test("13 switch, fork, clone, reload and new-session boundaries cancel ownership without shutdown pings", async () => {
     for (const boundary of ["switch", "fork", "clone", "reload", "new-session"] as const) {
-      const root = mkdtempSync(join(tmpdir(), `pi-e2e-boundary-${boundary}-`));
+      const state = temporaryStateRoot(`pi-controller-boundary-${boundary}-`);
+      const root = String(state.path);
+      try {
       const receipt = join(root, "attempt.receipt");
+      // The receipt lives under a per-test OS temp root, so validate against that real root.
+      const receiptPath = containmentReceiptPath(root, receipt);
       writeReceipt(receipt, "attempt");
       const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
       const appender = new AgentEventAppender((customType, data) => { entries.push({ type: "custom", customType, data }); });
-      await appendRunning(appender, receipt);
+      await appendRunning(appender, receiptPath);
       const warnings: string[] = []; const pings: string[] = []; let contained = 0;
       const host = new SubagentController({ composition: {
         prepareSpawn: async () => { throw new Error("unused"); }, prepareSend: async () => { throw new Error("unused"); },
         persistStopping: async (record, reason) => appender.appendRunStopping({ agentId: record.agentId, runId: record.runId!,
           reason: reason === CancellationReason.ParentShutdown ? reason : CancellationReason.StopRequested,
-          containmentReceiptPath: receipt as never }),
+          containmentReceiptPath: receiptPath }),
         finaliseRun: async (record, settlement) => {
           const value = { ...completion(record.agentId, record.runId!, ""), state: CompletionState.Cancelled,
             reason: settlement.kind === "cancelled" ? settlement.reason ?? CancellationReason.StopRequested : CancellationReason.StopRequested } as const;
@@ -162,8 +173,8 @@ describe("required end-to-end scenarios", () => {
           return value;
         },
       }, parent: { isBusy: () => false, sendMessage: (message) => { pings.push(message); }, warn: (message) => { warnings.push(message); } } });
-      host.runs.restore([{ agentId: A, state: AgentState.Running, transcriptPath: "/tmp/agent-a.jsonl" as never, runId: R1,
-        runtime: { abort: async () => {}, contain: async () => { contained++; return verifyContainmentReceipt(receipt as never, "attempt" as never).path; } } }]);
+      host.runs.restore([{ agentId: A, state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl"), runId: R1,
+        runtime: { abort: async () => {}, contain: async () => { contained++; return verifyContainmentReceipt(receiptPath, testAttemptId("attempt")).path; } } }]);
 
       expect(boundary === "fork" ? host.beforeFork() : host.beforeSwitch()).toBeTrue();
       await host.shutdown();
@@ -184,14 +195,16 @@ describe("required end-to-end scenarios", () => {
         state: CompletionState.Cancelled, reason: CancellationReason.ParentShutdown }]);
       expect(foldAgentEvents(entries, "/tmp").agents.get(A)).toMatchObject({ state: AgentState.Stopped,
         latestCompletion: { runId: R1, reason: CancellationReason.ParentShutdown } });
-      rmSync(root, { recursive: true, force: true });
+      } finally {
+        state.cleanup();
+      }
     }
   });
 
   test("14 tree navigation is cancelled for running, settling and stopping ownership", () => {
     for (const state of [AgentState.Running, AgentState.Settling, AgentState.Stopping]) {
       const host = new SubagentController({ parent: { isBusy: () => false, sendMessage: () => {} } });
-      host.runs.restore([{ agentId: A, state, transcriptPath: "/tmp/a" as never, runId: R1 }]);
+      host.runs.restore([{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
       expect(host.beforeTree()).toBeFalse();
     }
   });
@@ -202,23 +215,23 @@ describe("required end-to-end scenarios", () => {
     await service.publish(completion(B, R1, "later"));
     const received = await service.receive();
     expect(received.completions.map((item) => item.output.text)).toEqual(["1234", ""]);
-    expect(String(received.completions[1]?.outputPath)).toBe("/tmp/agent-b-deadbeef.txt");
+    expect(String(received.completions[1]?.outputPath)).toBe("/tmp/pi-subagents-test/agent-b-deadbeef.txt");
   });
 
   test("16 receive inventory rediscovers IDs hidden by compaction", async () => {
     const service = new CompletionService();
     service.restore([
-      { agentId: A, state: AgentState.Stopped, sessionPath: "/tmp/a" as never, latestCompletion: completion(A, R1, "done") },
-      { agentId: B, state: AgentState.Running, sessionPath: "/tmp/b" as never, currentRunId: R2 },
+      { agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "done") },
+      { agentId: B, state: AgentState.Running, sessionPath: testSessionPath("/tmp/pi-subagents-test/b"), currentRunId: R2 },
     ]);
     expect((await service.receive()).agents.map((item) => item.agentId).sort()).toEqual([A, B].sort());
   });
 
   test("17 external cwd does not inherit parent project trust", () => {
     const spec = buildRpcLaunchSpec({
-      invocation: { command: "/usr/bin/node" as never, argsPrefix: ["/opt/pi/cli.js"] }, cwd: "/external" as never,
-      childSessionDir: "/tmp/sessions" as never, effectiveTools: ["read"], effectiveModel: "mock/model" as never,
-      effectiveThinking: "minimal", trustedRoot: "/project" as never, env: {},
+      invocation: { command: testAbsolutePath("/usr/bin/node"), argsPrefix: ["/opt/pi/cli.js"] }, cwd: testAbsolutePath("/external"),
+      childSessionDir: testAbsolutePath("/tmp/sessions"), effectiveTools: ["read"], effectiveModel: testModelSpec("mock/model"),
+      effectiveThinking: "minimal", trustedRoot: testAbsolutePath("/project"), env: {},
     });
     expect(spec.args).not.toContain("--approve");
   });
@@ -226,14 +239,14 @@ describe("required end-to-end scenarios", () => {
   test("18 restoration can expose a persisted completion again with the stable run ID", async () => {
     const persisted = completion(A, R1, "stable");
     const first = new CompletionService(); await first.publish(persisted); await first.receive();
-    const restored = new CompletionService(); restored.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: "/tmp/a" as never, latestCompletion: persisted }]);
+    const restored = new CompletionService(); restored.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: persisted }]);
     expect((await restored.receive()).completions[0]?.runId).toBe(R1);
   });
 
   test("19 stop versus settlement with failed containment retains one stopping terminal obligation", async () => {
     let attempts = 0; let terminals = 0;
     const runs = controller({ onTerminal: () => { terminals++; } });
-    runs.register({ agentId: A, state: AgentState.Stopped, transcriptPath: "/tmp/a" as never });
+    runs.register({ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a") });
     await runs.launch(A, async () => ({ status: "accepted", runId: R1, runtime: runtime(async () => { if (++attempts === 1) throw new Error("alive"); }) }));
     expect((await runs.stop(A, CancellationReason.StopRequested)).status).toBe("containment_failed");
     expect(runs.snapshot(A)?.state).toBe(AgentState.Stopping);
@@ -250,14 +263,14 @@ describe("required end-to-end scenarios", () => {
       persistedTerminal++;
       await completions.publish(completion(record.agentId, record.runId!, "contained"));
     } });
-    runs.register({ agentId: A, state: AgentState.Stopped, transcriptPath: "/tmp/a" as never });
-    runs.register({ agentId: B, state: AgentState.Stopped, transcriptPath: "/tmp/b" as never });
+    runs.register({ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a") });
+    runs.register({ agentId: B, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/b") });
     await runs.launch(A, async () => ({ status: "accepted", runId: R1, runtime: {
       abort: async () => {},
       contain: async () => {
         if (killOrEmptyProofFails) throw new Error("kill or populated-empty proof failed");
         acceptedV2Receipts++;
-        return "/tmp/verified-v2-receipt" as never;
+        return testVerifiedReceiptPath("/tmp/pi-subagents-test/verified-v2-receipt");
       },
     } }));
 
@@ -280,8 +293,12 @@ describe("required end-to-end scenarios", () => {
   });
 
   test("21 restored RunStopping finalises only after watchdog-confirmed containment", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-e2e-restored-stopping-"));
+    const state = temporaryStateRoot("pi-controller-restored-stopping-");
+    const root = String(state.path);
+    try {
     const receipt = join(root, "attempt.receipt");
+    // The receipt lives under a per-test OS temp root, so validate against that real root.
+    const receiptPath = containmentReceiptPath(root, receipt);
     const child = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
     await waitSpawn(child);
     process.kill(-child.pid!, "SIGKILL");
@@ -289,31 +306,33 @@ describe("required end-to-end scenarios", () => {
     writeFileSync(receipt, JSON.stringify({ version: 1, attemptId: "attempt", pgid: child.pid,
       outcome: "terminated", timestamp: new Date().toISOString() }));
     expect(processAbsent(child)).toBeTrue();
-    expect(String(verifyContainmentReceipt(receipt as never, "attempt" as never).path)).toBe(receipt);
+    expect(String(verifyContainmentReceipt(receiptPath, testAttemptId("attempt")).path)).toBe(receipt);
 
     const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
     const appender = new AgentEventAppender((customType, data) => { entries.push({ type: "custom", customType, data }); });
-    await appendRunning(appender, receipt);
+    await appendRunning(appender, receiptPath);
     await appender.appendRunStopping({ agentId: A, runId: R1, reason: CancellationReason.ParentShutdown,
-      containmentReceiptPath: receipt as never });
+      containmentReceiptPath: receiptPath });
     const restored = new SubagentController({ restoration: restorationPort(entries, appender) });
     await restored.restore();
     expect(restored.runs.activeCount()).toBe(0);
     expect((await restored.receive()).completions).toMatchObject([{ agentId: A, runId: R1,
       state: CompletionState.Cancelled, reason: CancellationReason.ParentShutdown }]);
     expect(entries.map((entry) => (entry.data as { eventType: string }).eventType).at(-1)).toBe(AgentEventType.RunCompleted);
-    rmSync(root, { recursive: true, force: true });
+    } finally {
+      state.cleanup();
+    }
   });
 
   test("21 repeated restoration bounds duplicate completion visibility by stable run ID", async () => {
     const service = new CompletionService(); const persisted = completion(A, R1, "stable");
-    service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: "/tmp/a" as never, latestCompletion: persisted }]);
-    service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: "/tmp/a" as never, latestCompletion: persisted }]);
+    service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: persisted }]);
+    service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: persisted }]);
     expect((await service.receive()).completions.map((item) => item.runId)).toEqual([R1]);
   });
 
   test("22 partial assistant output is discarded and prior committed output remains authoritative", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-subagents-e2e-"));
+    const dir = mkdtempSync(join(tmpdir(), "pi-subagents-controller-"));
     try {
       const store = new OutputStore({ workDir: dir }); const attempt = createRunAttemptId();
       store.beginAttempt(attempt); const path = store.bindRun(attempt, R1);
@@ -327,7 +346,7 @@ describe("required end-to-end scenarios", () => {
     const assignment = "Additional context without protocol markers";
     let prompted = "";
     const host = controllerWithNativeLaunch(A, R2, (message) => { prompted = message; });
-    host.runs.restore([{ agentId: A, state: AgentState.Stopped, transcriptPath: "/tmp/a" as never, runId: R1 }]);
+    host.runs.restore([{ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
 
     const resumed = await host.sendInput(A, assignment);
 
@@ -351,30 +370,36 @@ describe("required end-to-end scenarios", () => {
 });
 
 function completion(id: AgentId, run: RunId, text: string): AgentCompletion {
-  return { agentId: id, runId: run, state: CompletionState.Completed, output: truncateUtf8(text, 50_000),
-    outputPath: `/tmp/${id}-${run}.txt` as never, transcriptPath: `/tmp/${id}.jsonl` as never };
+  return completedCompletion({
+    agentId: id,
+    runId: run,
+    output: truncateUtf8(text, 50_000),
+    outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${id}-${run}.txt`),
+    transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${id}.jsonl`),
+  });
 }
 function summary(id: AgentId, state: typeof AgentState.Running, currentRunId: RunId) {
-  return { agentId: id, state, transcriptPath: `/tmp/${id}.jsonl` as never, currentRunId };
+  return agentSummary({ agentId: id, state, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${id}.jsonl`), currentRunId });
 }
-function controller(options: Partial<RunControllerOptions> = {}) { return new RunController({ capacity: 2, ...options }); }
+function controller(options: Partial<RunControllerOptions> = {}) { return testRunController(options); }
 async function start(runs: RunController, id: AgentId, run: RunId) {
-  runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: `/tmp/${id}` as never });
+  runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${id}`) });
   return runs.launch(id, async () => ({ status: "accepted", runId: run, runtime: runtime() }));
 }
 function runtime(contain: () => Promise<void> = async () => {}) {
-  return { abort: async () => {}, contain: async () => { await contain(); return "/tmp/receipt" as never; } };
+  return testRuntime({ contain: async () => {
+    await contain();
+    return testVerifiedReceiptPath("/tmp/pi-subagents-test/receipt");
+  } });
 }
 function assistant(text: string) {
-  return { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", usage: {
-    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  }, timestamp: Date.now() } as never;
+  // Zero usage, as this fixture carried before it moved onto the shared builder.
+  return assistantMessage(text, { timestamp: Date.now(), usage: testUsage({ input: 0, output: 0, totalTokens: 0 }) });
 }
 
 function controllerWithNativeLaunch(id: AgentId, nativeRunId: RunId, onPrompt: (message: string) => void): SubagentController {
-  const session = { agentId: id, transcriptPath: `/tmp/${id}.jsonl` as never, previousLeafId: null,
-    attemptId: `attempt-${id}` as never, containmentReceiptPath: `/tmp/${id}.receipt` as never };
+  const session = { agentId: id, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${id}.jsonl`), previousLeafId: null,
+    attemptId: testAttemptId(`attempt-${id}`), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${id}.receipt`) };
   const launch = async (surrender: SurrenderContainment) => {
     const owned = runtime();
     surrender(owned);
@@ -382,7 +407,7 @@ function controllerWithNativeLaunch(id: AgentId, nativeRunId: RunId, onPrompt: (
     let assignment = "";
     return {
       runtime: owned,
-      containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+      containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
       ready: async () => {}, persistLaunchRequested: async () => {}, persistRunStarted: async () => {}, start: async () => {},
       getEntries: async () => reads++ === 0 ? { entries: [], leafId: null } : {
         entries: [{ type: "message", id: nativeRunId, message: { role: "user", content: assignment } }], leafId: nativeRunId,
@@ -390,11 +415,12 @@ function controllerWithNativeLaunch(id: AgentId, nativeRunId: RunId, onPrompt: (
       prompt: async (message: string) => { assignment = message; onPrompt(message); }, waitForAgentStart: async () => {}, bindRun: () => {}, waitSettled: () => new Promise<never>(() => {}),
     };
   };
-  return new SubagentController({ composition: {
+  const composition = {
     prepareSpawn: async () => ({ selection: { model: modelSpec("mock-provider/luna"), thinkingLevel: "high", tools: ["read"] },
       createSession: async () => session, persistSpawned: async () => {}, createLaunch: async (_session, surrender) => launch(surrender) }),
     prepareSend: async () => ({ session, createLaunch: launch }),
-  } });
+  } satisfies PiControllerComposition;
+  return new SubagentController({ composition });
 }
 
 function spawnSleeper(): ChildProcess {
@@ -417,13 +443,13 @@ function processAbsent(child: ChildProcess): boolean {
   try { process.kill(pid, 0); return false; } catch { return true; }
 }
 
-async function appendRunning(appender: AgentEventAppender, receipt: string): Promise<void> {
-  await appender.appendSpawned({ agentId: A, sessionPath: "/tmp/agent-a.jsonl" as never, cwd: "/tmp" as never,
-    provider: "mock", modelId: "mock/model" as never, thinkingLevel: "minimal", tools: [] });
-  await appender.appendRunLaunchRequested({ agentId: A, previousLeafId: null, attemptId: "attempt" as never,
-    containmentReceiptPath: receipt as never,
-    containment: { backend: "cgroup-v2", scopePath: "/tmp/test-cgroup/attempt" as never } });
-  await appender.appendRunStarted({ agentId: A, runId: R1, attemptId: "attempt" as never });
+async function appendRunning(appender: AgentEventAppender, receipt: ContainmentReceiptPath): Promise<void> {
+  await appender.appendSpawned({ agentId: A, sessionPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl"), cwd: testAbsolutePath("/tmp"),
+    provider: "mock", modelId: testModelSpec("mock/model"), thinkingLevel: "minimal", tools: [] });
+  await appender.appendRunLaunchRequested({ agentId: A, previousLeafId: null, attemptId: testAttemptId("attempt"),
+    containmentReceiptPath: receipt,
+    containment: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") } });
+  await appender.appendRunStarted({ agentId: A, runId: R1, attemptId: testAttemptId("attempt") });
 }
 
 function writeReceipt(path: string, attemptId: string): void {
@@ -436,7 +462,7 @@ function restorationPort(
   appender: AgentEventAppender,
 ): RestorationPort {
   return {
-    stateRoot: "/tmp" as never,
+    stateRoot: testAbsolutePath("/tmp"),
     getBranch: () => entries,
     resolveContainment: async ({ receiptPath, attemptId }) => ({
       kind: "contained",

@@ -8,28 +8,41 @@ import { CHILD_MARKER_ENV } from "./src/constants.ts";
 import { SubagentController } from "./src/controller.ts";
 import { createProductionController } from "./src/pi-composition.ts";
 import { loadSubagentSettings, readSubagentSettingsFiles, type SubagentSettingsResolved } from "./src/settings.ts";
-import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, createSubagentTools, type SubagentTool } from "./src/tools.ts";
+import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
 
 const STATUS_KEY = "pi-subagents";
-const TOOL_SPECS = [
-  [
-    "spawn_agent",
-    "Spawn agent",
-    "Start a persistent child assignment asynchronously; collect completion with receive_agent.",
-    spawnAgentSchema,
-    "Delegate a fresh persistent assignment with spawn_agent",
-    ["When delegation is requested, call spawn_agent directly, then use receive_agent to collect completion."],
-  ],
-  ["send_input", "Send input", "Start a literal assignment on a stopped child agent.", sendInputSchema],
-  ["receive_agent", "Receive agent", "Receive ready completions and the complete owned-agent inventory.", receiveAgentSchema],
-  ["stop_agent", "Stop agent", "Stop one or more owned child agents.", stopAgentSchema],
-] as const;
+type ToolRegistrationSpec<K extends SubagentToolName> = {
+  readonly label: string;
+  readonly description: string;
+  readonly parameters: (typeof subagentToolSchemas)[K];
+  readonly promptSnippet?: string;
+  readonly promptGuidelines?: readonly string[];
+};
+
+type ToolRegistrationSpecs = {
+  readonly [K in SubagentToolName]: ToolRegistrationSpec<K>;
+};
+
+const TOOL_SPECS = {
+  spawn_agent: {
+    label: "Spawn agent",
+    description: "Start a persistent child assignment asynchronously; collect completion with receive_agent.",
+    parameters: spawnAgentSchema,
+    promptSnippet: "Delegate a fresh persistent assignment with spawn_agent",
+    promptGuidelines: [
+      "When delegation is requested, call spawn_agent directly, then use receive_agent to collect completion.",
+    ],
+  },
+  send_input: { label: "Send input", description: "Start a literal assignment on a stopped child agent.", parameters: sendInputSchema },
+  receive_agent: { label: "Receive agent", description: "Receive ready completions and the complete owned-agent inventory.", parameters: receiveAgentSchema },
+  stop_agent: { label: "Stop agent", description: "Stop one or more owned child agents.", parameters: stopAgentSchema },
+} satisfies ToolRegistrationSpecs;
 
 export interface ExtensionController {
   restore(): Promise<void>;
   shutdown(): Promise<void>;
   status(): string;
-  tools(): readonly SubagentTool[];
+  tools(): SubagentToolRegistry;
   beforeTree?(): boolean;
   beforeSwitch?(): boolean;
   beforeFork?(): boolean;
@@ -59,30 +72,17 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
     let closing: Promise<void> | undefined;
     let lifecycleTail = Promise.resolve();
 
-    for (const [name, label, description, parameters, promptSnippet, promptGuidelines] of TOOL_SPECS) {
-      pi.registerTool({
-        name,
-        label,
-        description,
-        parameters,
-        ...(promptSnippet === undefined ? {} : { promptSnippet }),
-        ...(promptGuidelines === undefined ? {} : { promptGuidelines: [...promptGuidelines] }),
-        execute: async (_toolCallId, input, signal) => {
-          const controller = requireController(current);
-          const implementation = controller.tools().find((candidate) => candidate.name === name);
-          if (implementation === undefined) throw new Error(`internal_error: missing ${name} implementation`);
-          const result = await implementation.execute(input, signal);
-          activeContext?.ui.setStatus(STATUS_KEY, controller.status());
-          return { content: [{ type: "text", text: result.content }], details: result.details };
-        },
-        renderCall: () => new Text(label, 0, 0),
-        renderResult: (result) => {
-          const implementation = current?.tools().find((candidate) => candidate.name === name);
-          const text = implementation?.renderResult?.(recordDetails(result.details)) ?? compactResult(result.details);
-          return new Text(text, 0, 0);
-        },
-      });
-    }
+    // Bound to the controller that actually executed: a tool call can outlive its session
+    // (shutdown, or a replacing session_start), and neither case may destroy the result or
+    // publish status from a controller that is no longer current.
+    const refreshAfterTool = (owner: ExtensionController): void => {
+      if (current === owner) activeContext?.ui.setStatus(STATUS_KEY, owner.status());
+    };
+    const resolveCurrent = (): ExtensionController | undefined => current;
+    registerSubagentTool(pi, "spawn_agent", TOOL_SPECS.spawn_agent, resolveCurrent, refreshAfterTool);
+    registerSubagentTool(pi, "send_input", TOOL_SPECS.send_input, resolveCurrent, refreshAfterTool);
+    registerSubagentTool(pi, "receive_agent", TOOL_SPECS.receive_agent, resolveCurrent, refreshAfterTool);
+    registerSubagentTool(pi, "stop_agent", TOOL_SPECS.stop_agent, resolveCurrent, refreshAfterTool);
 
     pi.on("session_start", (_event, context) => serialiseLifecycle(async () => {
       if (current !== undefined) await closeCurrent();
@@ -123,6 +123,34 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       return closing;
     }
   };
+}
+
+function registerSubagentTool<K extends SubagentToolName>(
+  pi: ExtensionAPI,
+  name: K,
+  spec: ToolRegistrationSpec<K>,
+  resolveController: () => ExtensionController | undefined,
+  afterExecute: (owner: ExtensionController) => void,
+): void {
+  pi.registerTool({
+    name,
+    label: spec.label,
+    description: spec.description,
+    parameters: spec.parameters,
+    ...(spec.promptSnippet === undefined ? {} : { promptSnippet: spec.promptSnippet }),
+    ...(spec.promptGuidelines === undefined ? {} : { promptGuidelines: [...spec.promptGuidelines] }),
+    execute: async (_toolCallId, input, signal) => {
+      const owner = requireController(resolveController());
+      const result = await owner.tools()[name].execute(input, signal);
+      afterExecute(owner);
+      return { content: [{ type: "text", text: result.content }], details: result.details };
+    },
+    renderCall: () => new Text(spec.label, 0, 0),
+    renderResult: (result) => {
+      const text = resolveController()?.tools()[name].renderResult?.(recordDetails(result.details)) ?? compactResult(result.details);
+      return new Text(text, 0, 0);
+    },
+  });
 }
 
 function supportedNode(value: string): boolean {
@@ -170,7 +198,9 @@ const extension = createPiSubagentsExtension({
       pi,
       buildProductionControllerOptions(agentDir, loaded.value, refreshStatus),
     );
-    return Object.assign(controller, { tools: () => createSubagentTools(controller) });
+    // Built once per controller: `tools()` is called on every tool execution and every render.
+    let registry: SubagentToolRegistry | undefined;
+    return Object.assign(controller, { tools: () => (registry ??= createSubagentTools(controller)) });
   },
   diagnostic: (message) => { process.stderr.write(`${message}\n`); },
 });

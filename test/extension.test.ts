@@ -4,21 +4,32 @@ import extension, { buildProductionControllerOptions, createPiSubagentsExtension
 import { withProductionContainmentPreflight } from "../src/pi-composition.ts";
 import type { ContainmentBackend } from "../src/containment.ts";
 import { absolutePath } from "../src/paths.ts";
+import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
+import { deferred } from "./support/async.ts";
+import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
 
 interface HarnessContext {
   statuses: Array<string | undefined>;
   ui: { setStatus(key: string, value: string | undefined): void };
 }
-type Handler = (event: object, context: HarnessContext) => Promise<void> | void;
+type Handler = LifecycleHandler<HarnessContext>;
+
+function registerTestTool(tools: Array<Record<string, unknown>>): ExtensionApiPort["registerTool"] {
+  return ((tool: object) => tools.push(tool as Record<string, unknown>)) as ExtensionApiPort["registerTool"];
+}
 
 function harness() {
   const tools: Array<Record<string, unknown>> = [];
   const handlers = new Map<string, Handler[]>();
   return {
     api: {
-      registerTool: (tool: Record<string, unknown>) => tools.push(tool),
-      on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
-    },
+      registerTool: registerTestTool(tools),
+      on: lifecycleOn(handlers),
+      appendEntry: () => {},
+      sendMessage: () => {},
+      getThinkingLevel: () => "high",
+      getActiveTools: () => [],
+    } satisfies ExtensionApiPort,
     tools,
     handlers,
     emit: async (name: string, event: object, ctx = context()) => {
@@ -41,13 +52,12 @@ function controller(log: string[]): ExtensionController {
     restore: async () => { log.push("restore"); },
     shutdown: async () => { log.push("shutdown"); },
     status: () => "0 running · 0 ready",
-    tools: () => (["spawn_agent", "send_input", "receive_agent", "stop_agent"] as const).map((name) => ({
-      name,
-      description: name,
-      parameters: { type: "object" },
-      execute: async () => ({ content: name, details: { name } }),
-      renderResult: () => name,
-    })),
+    tools: () => ({
+      spawn_agent: { name: "spawn_agent", description: "spawn_agent", parameters: spawnAgentSchema, execute: async () => ({ content: "spawn_agent", details: { name: "spawn_agent" } }), renderResult: () => "spawn_agent" },
+      send_input: { name: "send_input", description: "send_input", parameters: sendInputSchema, execute: async () => ({ content: "send_input", details: { name: "send_input" } }), renderResult: () => "send_input" },
+      receive_agent: { name: "receive_agent", description: "receive_agent", parameters: receiveAgentSchema, execute: async () => ({ content: "receive_agent", details: { name: "receive_agent" } }), renderResult: () => "receive_agent" },
+      stop_agent: { name: "stop_agent", description: "stop_agent", parameters: stopAgentSchema, execute: async () => ({ content: "stop_agent", details: { name: "stop_agent" } }), renderResult: () => "stop_agent" },
+    }),
   };
 }
 
@@ -61,14 +71,71 @@ describe("Pi subagents extension", () => {
       child: false,
       createController: () => controller(log),
       diagnostic: (message) => log.push(message),
-    })(h.api as never);
+    })(extensionApiForTest(h.api));
 
     expect(log).toEqual([]);
     expect(h.tools.map((tool) => tool.name)).toEqual(["spawn_agent", "send_input", "receive_agent", "stop_agent"]);
     expect(h.tools.every((tool) => typeof tool.renderCall === "function" && typeof tool.renderResult === "function")).toBe(true);
+    expect(h.tools[0]?.parameters).toBe(spawnAgentSchema);
+    expect(h.tools[1]?.parameters).toBe(sendInputSchema);
+    expect(h.tools[2]?.parameters).toBe(receiveAgentSchema);
+    expect(h.tools[3]?.parameters).toBe(stopAgentSchema);
     expect([...h.handlers.keys()]).toEqual([
       "session_start", "session_before_tree", "session_before_switch", "session_before_fork", "session_shutdown",
     ]);
+  });
+
+  test("renders historical tool results without an active session", async () => {
+    const h = harness();
+    const log: string[] = [];
+    createPiSubagentsExtension({
+      platform: "linux", child: false,
+      createController: () => controller(log), diagnostic: () => {},
+    })(extensionApiForTest(h.api));
+    const tool = h.tools[0] as { renderResult(result: { details?: object }): { text: string } };
+
+    expect(tool.renderResult({ details: { name: "historical" } }).text).toBe('{"name":"historical"}');
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+    expect(tool.renderResult({ details: { name: "historical" } }).text).toBe('{"name":"historical"}');
+  });
+
+  test("a tool execution outliving its session returns its result instead of throwing session_unavailable", async () => {
+    const h = harness();
+    const log: string[] = [];
+    const gate = deferred<void>();
+    const base = controller(log);
+    const slow: ExtensionController = {
+      ...base,
+      tools: () => {
+        const registry = base.tools();
+        return {
+          ...registry,
+          receive_agent: {
+            ...registry.receive_agent,
+            execute: async () => {
+              await gate.promise;
+              return { content: "receive_agent", details: { name: "receive_agent" } };
+            },
+          },
+        };
+      },
+    };
+    createPiSubagentsExtension({
+      platform: "linux", nodeVersion: "22.19.0", child: false,
+      createController: () => slow, diagnostic: () => {},
+    })(extensionApiForTest(h.api));
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    const tool = h.tools.find((entry) => entry.name === "receive_agent") as {
+      execute(id: string, input: object, signal?: AbortSignal): Promise<{ details: object }>;
+    };
+
+    // The execution spans the shutdown that clears the active controller.
+    const pending = tool.execute("call-1", {}, undefined);
+    await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+    gate.resolve();
+
+    expect(await pending).toMatchObject({ details: { name: "receive_agent" } });
   });
 
   test("spawn registration gives one non-duplicated asynchronous delegation guideline", () => {
@@ -78,7 +145,7 @@ describe("Pi subagents extension", () => {
       child: false,
       createController: () => controller([]),
       diagnostic: () => {},
-    })(h.api as never);
+    })(extensionApiForTest(h.api));
     const spawn = h.tools.find((tool) => tool.name === "spawn_agent");
 
     expect(spawn?.description).toBe(
@@ -95,11 +162,11 @@ describe("Pi subagents extension", () => {
 
   test("child suppression registers nothing and cannot disable other extensions", () => {
     const h = harness();
-    h.api.registerTool({ name: "other_extension" });
+    h.tools.push({ name: "other_extension" });
     createPiSubagentsExtension({
       platform: "linux", child: true,
       createController: () => { throw new Error("must not construct"); }, diagnostic: () => {},
-    })(h.api as never);
+    })(extensionApiForTest(h.api));
     expect(h.tools.map((tool) => tool.name)).toEqual(["other_extension"]);
     expect(h.handlers.size).toBe(0);
   });
@@ -111,7 +178,7 @@ describe("Pi subagents extension", () => {
       platform: "darwin", nodeVersion: "22.19.0", child: false,
       createController: () => { throw new Error("must not construct"); },
       diagnostic: (message) => diagnostics.push(message),
-    })(h.api as never);
+    })(extensionApiForTest(h.api));
     expect(h.tools).toEqual([]);
     expect(h.handlers.size).toBe(0);
     expect(diagnostics).toEqual([
@@ -127,7 +194,7 @@ describe("Pi subagents extension", () => {
       platform: "darwin", nodeVersion: "22.19.0", child: true,
       createController: () => { throw new Error("must not construct"); },
       diagnostic: (message) => diagnostics.push(message),
-    })(h.api as never);
+    })(extensionApiForTest(h.api));
     expect(h.tools).toEqual([]);
     expect(h.handlers.size).toBe(0);
     expect(diagnostics).toEqual([
@@ -141,7 +208,7 @@ describe("Pi subagents extension", () => {
       const h = harness();
       const log: string[] = [];
       createPiSubagentsExtension({ platform: "linux", child: false,
-        createController: () => controller(log), diagnostic: () => {} })(h.api as never);
+        createController: () => controller(log), diagnostic: () => {} })(extensionApiForTest(h.api));
       const ctx = await h.emit("session_start", { type: "session_start", reason: "startup" });
       expect(log).toEqual(["restore"]);
       expect(ctx.statuses.at(-1)).toBe("0 running · 0 ready");
@@ -155,7 +222,7 @@ describe("Pi subagents extension", () => {
     const h = harness();
     const log: string[] = [];
     createPiSubagentsExtension({ platform: "linux", child: false,
-      createController: () => controller(log), diagnostic: () => {} })(h.api as never);
+      createController: () => controller(log), diagnostic: () => {} })(extensionApiForTest(h.api));
     await h.emit("session_start", { type: "session_start", reason: "startup" });
     await h.emit("session_shutdown", { type: "session_shutdown", reason: "reload" });
     await h.emit("session_start", { type: "session_start", reason: "reload" });
@@ -173,7 +240,7 @@ describe("Pi subagents extension", () => {
         shutdownAttempts++;
         log.push(`shutdown-${shutdownAttempts}`);
         if (shutdownAttempts === 1) { entered.resolve(); await release.promise; throw new Error("containment failed"); }
-      } }), diagnostic: () => {} })(h.api as never);
+      } }), diagnostic: () => {} })(extensionApiForTest(h.api));
     const firstContext = await h.emit("session_start", { type: "session_start", reason: "startup" });
     const replacementContext = context();
     const replacing = h.emit("session_start", { type: "session_start", reason: "reload" }, replacementContext);
@@ -193,7 +260,7 @@ describe("Pi subagents extension", () => {
   test("Node versions before 22.19 are rejected before registration", () => {
     const h = harness(); const diagnostics: string[] = [];
     createPiSubagentsExtension({ platform: "linux", nodeVersion: "22.18.0", child: false,
-      createController: () => { throw new Error("must not construct"); }, diagnostic: (message) => diagnostics.push(message) })(h.api as never);
+      createController: () => { throw new Error("must not construct"); }, diagnostic: (message) => diagnostics.push(message) })(extensionApiForTest(h.api));
     expect(h.tools).toEqual([]);
     expect(diagnostics).toEqual([
       "pi-subagents disabled: requires Linux and Node 22.19 or newer; found linux and Node 22.18.0",
@@ -209,7 +276,7 @@ describe("Pi subagents extension", () => {
       createController: (_context, _api, refresh) => {
         refreshStatus = refresh;
         return { ...controller(log), status: () => value };
-      }, diagnostic: () => {} })(h.api as never);
+      }, diagnostic: () => {} })(extensionApiForTest(h.api));
     const ctx = await h.emit("session_start", { type: "session_start", reason: "startup" });
     value = "agents: 0 running, 1 result ready";
 
@@ -281,8 +348,3 @@ function containmentBackend(preflight: () => Promise<void>): ContainmentBackend 
   };
 }
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
-}

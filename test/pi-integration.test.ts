@@ -20,43 +20,60 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { CONFIG_DIR_NAME, RpcClient, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { constructContainedLaunch } from "../src/pi-composition.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
+import { containmentReceiptPath } from "../src/paths.ts";
 import {
   adaptParentPiEnvironmentForRpcClient,
   createParentPiEnvironment,
   reportIntegrationCli,
   resolveIntegrationCli,
 } from "./support/pi-integration-harness.ts";
+import { testAttemptId, testVerifiedReceiptPath } from "./support/brands.ts";
 
 const PI_EXECUTABLE = resolveIntegrationCli();
 reportIntegrationCli(PI_EXECUTABLE);
 const LIFECYCLE_TOOLS = ["spawn_agent", "send_input", "receive_agent", "stop_agent"] as const;
 
 describe("installed Pi integration prerequisites", () => {
-  test("executes the literal command-v Pi launcher with the mirror extension enabled", () => {
+  test("the literal command-v Pi launcher registers the extension in a real parent session", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-literal-launcher-"));
     const agentDir = join(root, "agent");
-    mkdirSync(join(agentDir, "extensions"), { recursive: true });
-    symlinkSync(fileURLToPath(new URL("..", import.meta.url)), join(agentDir, "extensions", "pi-subagents"));
+    const extensions = join(agentDir, "extensions");
+    const project = join(root, "project");
+    mkdirSync(extensions, { recursive: true });
+    mkdirSync(project);
+    symlinkSync(fileURLToPath(new URL("..", import.meta.url)), join(extensions, "pi-subagents"));
+    symlinkSync(
+      fileURLToPath(new URL("fixtures/mock-provider-extension.ts", import.meta.url)),
+      join(extensions, "mock-provider-extension.ts"),
+    );
+    const client = new RpcClient({
+      cliPath: PI_EXECUTABLE,
+      cwd: project,
+      env: adaptParentPiEnvironmentForRpcClient(
+        createParentPiEnvironment({ agentDir, home: root }),
+      ),
+      provider: "mock-provider",
+      model: "mock-model",
+      args: ["--approve", "--offline"],
+    });
     try {
-      const result = spawnSync(PI_EXECUTABLE, ["--help"], {
-        encoding: "utf8",
-        env: createParentPiEnvironment({ agentDir, home: root }),
-      });
-      expect(result.error).toBeUndefined();
-      expect(result.status).toBe(0);
-      expect(result.stdout).toContain("pi - AI coding assistant");
-      expect(result.stderr).not.toContain("pi-subagents disabled:");
+      await client.start();
+      await client.promptAndWait("REPORT_TOOLS", undefined, 20_000);
+      expect(parseStringArray(await client.getLastAssistantText())).toEqual(
+        expect.arrayContaining([...LIFECYCLE_TOOLS]),
+      );
+      expect(client.getStderr()).not.toContain("pi-subagents disabled:");
     } finally {
+      await client.stop();
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("normal launcher registers four lifecycle tools and runs one deterministic child without network access", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-real-integration-"));
@@ -209,7 +226,7 @@ describe("installed Pi integration prerequisites", () => {
 
   test("real composition surrenders containment before watchdog construction", () => {
     const order: string[] = [];
-    const runtime = { abort: async () => {}, contain: async () => "/tmp/receipt" as never };
+    const runtime = { abort: async () => {}, contain: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/receipt") };
     const result = constructContainedLaunch(
       runtime,
       (owned) => { expect(owned).toBe(runtime); order.push("surrender"); },
@@ -224,7 +241,7 @@ describe("installed Pi integration prerequisites", () => {
     const path = join(root, "receipt.json");
     const attempt = "attempt-real-pi";
     writeFileSync(path, JSON.stringify({ version: 1, attemptId: attempt, pgid: null, outcome: "no_process", timestamp: new Date().toISOString() }));
-    expect(String(verifyContainmentReceipt(path as never, attempt as never, Date.now() - 1_000).path)).toBe(path);
+    expect(String(verifyContainmentReceipt(containmentReceiptPath(path, path), testAttemptId(attempt), Date.now() - 1_000).path)).toBe(path);
     expect(readFileSync(path, "utf8")).toContain(attempt);
   });
 });
@@ -325,7 +342,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       const attemptId = String(launch!.attemptId);
       expect(lifecycleEventTypes(events)).not.toContain("run_started");
       const receipt = String(launch!.containmentReceiptPath);
-      expect(String(verifyContainmentReceipt(receipt as never, attemptId as never).path)).toBe(receipt);
+      expect(String(verifyContainmentReceipt(containmentReceiptPath(receipt, receipt), testAttemptId(attemptId)).path)).toBe(receipt);
     }, process.env, () => ({ MOCK_CHILD_IDENTITY_FIXTURE: "transform" }));
   }, 30_000);
 
@@ -722,7 +739,7 @@ describe("deterministic network-free real-Pi matrix", () => {
         state: "cancelled",
         reason: "stop_requested",
       });
-      expect(String(verifyContainmentReceipt(receiptPath as never, attemptId as never).path)).toBe(receiptPath);
+      expect(String(verifyContainmentReceipt(containmentReceiptPath(receiptPath, receiptPath), testAttemptId(attemptId)).path)).toBe(receiptPath);
       const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as {
         version: number;
         backend: string;

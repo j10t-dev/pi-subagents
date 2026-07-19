@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildRpcLaunchSpec, resolvePiInvocation } from "../src/pi-launcher.ts";
+import { testAbsolutePath, testModelSpec } from "./support/brands.ts";
 
 describe("resolvePiInvocation", () => {
   test("uses Node with the exact parent script", () => {
@@ -33,10 +34,10 @@ describe("resolvePiInvocation", () => {
 describe("buildRpcLaunchSpec", () => {
   test("uses an exact allowlist or explicit no-tools argument", () => {
     const base = (override: { effectiveTools: readonly string[] }) => ({
-      invocation: { command: "/pi" as never, argsPrefix: [] },
-      cwd: "/work" as never,
-      childSessionDir: "/sessions" as never,
-      effectiveModel: "mock-provider/luna" as never,
+      invocation: { command: testAbsolutePath("/pi"), argsPrefix: [] },
+      cwd: testAbsolutePath("/work"),
+      childSessionDir: testAbsolutePath("/sessions"),
+      effectiveModel: testModelSpec("mock-provider/luna"),
       effectiveThinking: "high" as const,
       ...override,
     });
@@ -49,8 +50,8 @@ describe("buildRpcLaunchSpec", () => {
   });
 
   test("builds the exact RPC prefix and isolated environment", () => {
-    const spec = buildRpcLaunchSpec({ invocation: { command: "/usr/bin/node" as never, argsPrefix: ["/pi.js"] }, cwd: "/work" as never,
-      childSessionDir: "/state/child" as never, effectiveTools: ["read", "bash"], effectiveModel: "openai/gpt" as never,
+    const spec = buildRpcLaunchSpec({ invocation: { command: testAbsolutePath("/usr/bin/node"), argsPrefix: ["/pi.js"] }, cwd: testAbsolutePath("/work"),
+      childSessionDir: testAbsolutePath("/state/child"), effectiveTools: ["read", "bash"], effectiveModel: testModelSpec("openai/gpt"),
       effectiveThinking: "high", env: { HOME: "/home/me" } });
     expect(spec.args).toEqual([
       "/pi.js",
@@ -67,9 +68,9 @@ describe("buildRpcLaunchSpec", () => {
   test("adds trust only for realpath-contained cwd", () => {
     const root = mkdtempSync(join(tmpdir(), "launcher-")); mkdirSync(join(root, "project", "child"), { recursive: true }); mkdirSync(join(root, "outside"));
     symlinkSync(join(root, "outside"), join(root, "project", "escape"));
-    const base = { invocation: { command: "/pi" as never, argsPrefix: [] }, childSessionDir: "/sessions" as never, effectiveTools: [], effectiveModel: "x" as never, effectiveThinking: "low" as const, trustedRoot: join(root, "project") as never };
-    expect(buildRpcLaunchSpec({ ...base, cwd: join(root, "project", "child") as never }).args).toContain("--approve");
-    expect(buildRpcLaunchSpec({ ...base, cwd: join(root, "project2") as never }).args).not.toContain("--approve");
-    expect(buildRpcLaunchSpec({ ...base, cwd: join(root, "project", "escape") as never }).args).not.toContain("--approve");
+    const base = { invocation: { command: testAbsolutePath("/pi"), argsPrefix: [] }, childSessionDir: testAbsolutePath("/sessions"), effectiveTools: [], effectiveModel: testModelSpec("x"), effectiveThinking: "low" as const, trustedRoot: testAbsolutePath(join(root, "project")) };
+    expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "child")) }).args).toContain("--approve");
+    expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project2")) }).args).not.toContain("--approve");
+    expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "escape")) }).args).not.toContain("--approve");
   });
 });

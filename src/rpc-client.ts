@@ -23,10 +23,10 @@ import { Value } from "typebox/value";
 
 import { AgentErrorCode, terminalFailureCause, type AgentId, type AgentUsage, type RunAttemptId, type RunId, type TerminalFailureCause, type Usage } from "./domain.ts";
 import { BoundedJsonlDecoder, serializeJsonlRecord } from "./jsonl.ts";
-import { classifyInboundRecord, type RpcInboundRecord, type WireAssistantMessage, type WireExtensionUIDialog } from "./rpc-wire.ts";
+import { classifyInboundRecord, type RpcInboundRecord } from "./rpc-wire.ts";
 import { OutputStore } from "./output-store.ts";
 import { UIForwarder, type UIForwardOutcome } from "./ui-forwarder.ts";
-import { AgentUsageSchema, UsageSchema } from "./schemas.ts";
+import { AgentUsageSchema, AssistantMessageSchema, UsageSchema, type WireAssistantMessage, type WireExtensionUIDialog } from "./schemas.ts";
 import type { RpcLaunchSpec } from "./pi-launcher.ts";
 import { launchWatchdogRpcTransport, type WatchdogClient } from "./watchdog-client.ts";
 
@@ -614,8 +614,8 @@ export function authoritativeSettlement(entries: readonly unknown[]): Authoritat
     if (entry.type !== "message" || typeof entry.message !== "object" || entry.message === null) continue;
     const message = entry.message as { role?: unknown };
     if (message.role === "assistant") {
-      if (!Value.Check(AssistantEvidenceSchema, entry.message)) return { kind: "invalid" };
-      final = Value.Decode(AssistantEvidenceSchema, entry.message);
+      if (!Value.Check(AssistantMessageSchema, entry.message)) return { kind: "invalid" };
+      final = Value.Decode(AssistantMessageSchema, entry.message);
       outstanding.clear();
       for (const item of final.content) if (item.type === "toolCall" && typeof item.id === "string") outstanding.add(item.id);
     } else if (message.role === "toolResult") {
@@ -628,11 +628,3 @@ export function authoritativeSettlement(entries: readonly unknown[]): Authoritat
     : { kind: "found", evidence: { message: final, toolSequenceCompleted: outstanding.size === 0 } };
 }
 
-const AssistantEvidenceSchema = Type.Object({
-  role: Type.Literal("assistant"),
-  content: Type.Array(Type.Record(Type.String(), Type.Unknown())),
-  usage: UsageSchema,
-  stopReason: Type.String(),
-  errorMessage: Type.Optional(Type.String()),
-  timestamp: Type.Optional(Type.Number()),
-});

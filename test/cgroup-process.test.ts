@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { resolveCgroupV2Backend } from "../src/cgroup-v2.ts";
 import { createRunAttemptId } from "../src/domain.ts";
+import { testAbsolutePath } from "./support/brands.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
 import { WatchdogClient, verifyContainmentReceipt } from "../src/watchdog-client.ts";
 
@@ -32,9 +33,9 @@ describe("production cgroup-v2 process containment", () => {
       mkdirSync(nestedRoot, { mode: 0o700 });
       mkdirSync(nestedParent, { mode: 0o700 });
       await client.launch({
-        command: process.execPath as never,
+        command: testAbsolutePath(process.execPath),
         args: [join(import.meta.dir, "fixtures/setsid-descendant.mjs"), pidPath, SETSID],
-        cwd: state as never,
+        cwd: testAbsolutePath(state),
         env: process.env,
         shell: false,
       });

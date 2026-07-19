@@ -1,47 +1,132 @@
 import { describe, expect, test } from "bun:test";
-import { AGENT_EVENT_CUSTOM_TYPE } from "../src/constants.ts";
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { AgentEventAppender } from "../src/persistence.ts";
 import { firstUserEntryAfterCursor } from "../src/pi-composition.ts";
 import { SubagentController, type RestorationPort } from "../src/controller.ts";
+import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testMilliseconds, testModelSpec, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
+import { testBarrier } from "./support/barriers.ts";
+import { testRuntime } from "./support/launches.ts";
+import { completedEntry, launchEntry, spawnedEntry, startedEntry, stoppingEntry, testRestorationPort, type RestorationEventEntry } from "./support/restoration.ts";
+import { completedCompletion } from "./support/messages.ts";
 import { AgentEventType, CancellationReason, CompletionState, agentId, runId, truncateUtf8 } from "../src/domain.ts";
 
 describe("branch restoration", () => {
   test("a missing non-null restoration cursor is session unavailable and never scans from zero", () => {
     const entries = [{ id: "deadbeef", type: "message", message: { role: "user" } }];
-    expect(() => firstUserEntryAfterCursor(entries as never, "cafebabe" as never)).toThrow("session_unavailable");
+    // malformed trust-boundary fixture: Pi entry decoding must reject this incomplete wire value.
+    const malformedEntries = entries as unknown as SessionEntry[];
+    expect(() => firstUserEntryAfterCursor(malformedEntries, testRunId("cafebabe"))).toThrow("session_unavailable");
   });
-  test("100 restore/shutdown barriers either contain the restored owner or prevent restore mutation", async () => {
-    for (let schedule = 0; schedule < 100; schedule++) {
-      const entered = deferred<void>();
-      const decide = deferred<boolean>();
-      let validations = 0;
-      const restoration = port([spawned(), launch(), started()], false, []);
-      restoration.validateReceipt = async () => {
-        if (++validations === 1) { entered.resolve(); return decide.promise; }
-        return true;
-      };
-      const c = new SubagentController({ restoration });
-      const restoring = c.restore();
-      await entered.promise;
-      let shuttingDown: Promise<void>;
-      if (schedule % 4 === 0) {
-        decide.resolve(false);
-        shuttingDown = c.shutdown();
-      } else if (schedule % 4 === 1) {
-        shuttingDown = c.shutdown();
-        decide.resolve(false);
-      } else if (schedule % 4 === 2) {
-        queueMicrotask(() => decide.resolve(false));
-        shuttingDown = c.shutdown();
-      } else {
-        shuttingDown = c.shutdown();
-        await Promise.resolve();
-        decide.resolve(false);
-      }
-      await Promise.all([restoring, shuttingDown]);
-      expect(c.runs.activeCount()).toBe(0);
-      expect(c.runs.snapshots()).toMatchObject([{ state: "stopped" }]);
-    }
+  test("receipt decision completes before shutdown", async () => {
+    const deciding = testBarrier("receipt-decision-first");
+    let completeDecision!: () => void;
+    const decisionCompleted = new Promise<void>((resolve) => { completeDecision = resolve; });
+    const writes: unknown[] = [], pings: unknown[] = [];
+    const order: string[] = [];
+    let validations = 0;
+    const restoration = port([spawned(), launch(), started()], false, writes);
+    // The first decision is the restoration receipt; later calls are the shutdown containment retry.
+    restoration.validateReceipt = async () => {
+      if (++validations > 1) return true;
+      await deciding.enterAndWait();
+      return false;
+    };
+    const resolveContainment = restoration.resolveContainment.bind(restoration);
+    restoration.resolveContainment = async (input) => {
+      const decision = await resolveContainment(input);
+      order.push("receipt-decision:constructed");
+      completeDecision();
+      return decision;
+    };
+    const c = new SubagentController({ restoration, parent: { isBusy: () => false, sendMessage: async (_text, options) => { pings.push(options); } } });
+
+    // Minimal pair with the row below: the decision is released *before* shutdown starts,
+    // but shutdown still overlaps the in-flight restoration — it must join it, not race it.
+    const restoring = c.restore();
+    await deciding.entered;
+    expect(validations).toBe(1);
+    deciding.release();
+    await decisionCompleted;
+    order.push("shutdown:started");
+    const shuttingDown = c.shutdown();
+    await Promise.all([restoring, shuttingDown]);
+
+    expect(order).toEqual(["receipt-decision:constructed", "shutdown:started"]);
+    expect({ validations, writes: writes.length, active: c.runs.activeCount(), queued: c.completions.queuedCount(), pings: pings.length })
+      .toEqual({ validations: 2, writes: 1, active: 0, queued: 1, pings: 0 });
+    expect(c.runs.snapshots()).toMatchObject([{ state: "stopped" }]);
+  });
+
+  test("shutdown starts before receipt decision", async () => {
+    const deciding = testBarrier("receipt-decision");
+    const writes: unknown[] = [], pings: unknown[] = [];
+    let validations = 0;
+    const restoration = port([spawned(), launch(), started()], false, writes);
+    restoration.validateReceipt = async () => {
+      if (++validations > 1) return true;
+      await deciding.enterAndWait();
+      return false;
+    };
+    const c = new SubagentController({ restoration, parent: { isBusy: () => false, sendMessage: async (_text, options) => { pings.push(options); } } });
+
+    const restoring = c.restore();
+    await deciding.entered;
+    const shuttingDown = c.shutdown();
+    deciding.release();
+    await Promise.all([restoring, shuttingDown]);
+
+    expect({ validations, writes: writes.length, active: c.runs.activeCount(), queued: c.completions.queuedCount(), pings: pings.length })
+      .toEqual({ validations: 2, writes: 1, active: 0, queued: 1, pings: 0 });
+    expect(c.runs.snapshots()).toMatchObject([{ state: "stopped" }]);
+  });
+
+  test("restoration stages before shutdown and commits", async () => {
+    const committing = testBarrier("restore-commit");
+    const writes: unknown[] = [], pings: unknown[] = [];
+    const restoration = port([spawned(), launch(), started()], true, writes);
+    const appendCompleted = restoration.appender.appendRunCompleted.bind(restoration.appender);
+    restoration.appender.appendRunCompleted = async (completion) => {
+      await committing.enterAndWait();
+      return appendCompleted(completion);
+    };
+    const c = new SubagentController({ restoration, parent: { isBusy: () => false, sendMessage: async (_text, options) => { pings.push(options); } } });
+
+    const restoring = c.restore();
+    await committing.entered;
+    const shuttingDown = c.shutdown();
+    committing.release();
+    await Promise.all([restoring, shuttingDown]);
+
+    expect(writes.map((value) => (value as { eventType: string }).eventType)).toEqual([AgentEventType.RunCompleted]);
+    expect({ active: c.runs.activeCount(), queued: c.completions.queuedCount(), pings: pings.length })
+      .toEqual({ active: 0, queued: 1, pings: 0 });
+    expect(c.runs.snapshots()).toMatchObject([{ state: "stopped" }]);
+  });
+
+  test("restoration stages before shutdown and rolls back", async () => {
+    const committing = testBarrier("restore-commit-rollback");
+    const writes: unknown[] = [], pings: unknown[] = [];
+    let attempts = 0;
+    const restoration = port([spawned(), launch(), started()], true, writes);
+    const appendCompleted = restoration.appender.appendRunCompleted.bind(restoration.appender);
+    restoration.appender.appendRunCompleted = async (completion) => {
+      if (++attempts > 1) return appendCompleted(completion);
+      await committing.enterAndWait();
+      throw new Error("disk unavailable");
+    };
+    const c = new SubagentController({ restoration, parent: { isBusy: () => false, sendMessage: async (_text, options) => { pings.push(options); } } });
+
+    const restoring = c.restore();
+    await committing.entered;
+    const shuttingDown = c.shutdown();
+    committing.release();
+
+    await expect(restoring).rejects.toThrow("disk unavailable");
+    await expect(shuttingDown).resolves.toBeUndefined();
+    expect(writes.map((value) => (value as { eventType: string }).eventType)).toEqual([AgentEventType.RunCompleted]);
+    expect({ attempts, active: c.runs.activeCount(), queued: c.completions.queuedCount(), pings: pings.length })
+      .toEqual({ attempts: 2, active: 0, queued: 1, pings: 0 });
+    expect(c.runs.snapshots()).toMatchObject([{ state: "stopped" }]);
   });
 
   test("restore requested after shutdown rejects without reading the branch", async () => {
@@ -80,7 +165,7 @@ describe("branch restoration", () => {
     restoration.validateReceipt = async () => { trace.push("receipt:verified"); return true; };
     restoration.finaliseContained = async (_record, id) => {
       trace.push("transcript:recovered", "output:file-sync", "output:rename", "output:directory-sync");
-      return { ...base(id), state: CompletionState.Failed, error: { code: "run_interrupted", message: "run was interrupted before completion" } };
+      return { ...completedCompletion({ runId: id }), state: CompletionState.Failed, error: { code: "run_interrupted", message: "run was interrupted before completion" } };
     };
     const append = restoration.appender.appendRunCompleted.bind(restoration.appender);
     restoration.appender.appendRunCompleted = async (completion) => { trace.push("persist:run-completed"); await append(completion); };
@@ -110,12 +195,12 @@ describe("branch restoration", () => {
     const c = new SubagentController({ capacity: 1, restoration });
 
     await expect(c.restore()).rejects.toThrow("publication failed");
-    expect(c.runs.snapshot(agentId("agent-a"))?.state).toBe("settling");
+    expect(c.runs.snapshot(testAgentId("agent-a"))?.state).toBe("settling");
     expect(c.runs.activeCount()).toBe(1);
     expect(writes).toEqual([]);
-    expect((await c.receive({ timeoutMs: 1 as never })).completions).toEqual([]);
+    expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
 
-    await c.stop(agentId("agent-a"));
+    await c.stop(testAgentId("agent-a"));
     expect(c.runs.activeCount()).toBe(0);
     expect(writes).toHaveLength(1);
     expect((await c.receive()).completions).toHaveLength(1);
@@ -125,7 +210,7 @@ describe("branch restoration", () => {
     const warnings: string[] = [];
     let identityLookups = 0;
     const restoration = port([spawned(), launch()], false, []);
-    restoration.firstUserEntryAfter = async () => { identityLookups++; return runId("cafebabe"); };
+    restoration.firstUserEntryAfter = async () => { identityLookups++; return testRunId("cafebabe"); };
     const c = new SubagentController({
       capacity: 1,
       restoration,
@@ -134,7 +219,7 @@ describe("branch restoration", () => {
 
     await c.restore();
 
-    expect(c.runs.snapshot(agentId("agent-a"))).toMatchObject({
+    expect(c.runs.snapshot(testAgentId("agent-a"))).toMatchObject({
       state: "stopping",
       containmentResponsibility: "historical-unresolved",
     });
@@ -159,7 +244,7 @@ describe("branch restoration", () => {
           contain: async () => {
             containmentAttempts++;
             if (containmentAttempts === 1) throw new Error("cgroup kill failed");
-            return input.receiptPath as never;
+            return testVerifiedReceiptPath(input.receiptPath);
           },
         },
       };
@@ -169,9 +254,9 @@ describe("branch restoration", () => {
     await c.restore();
     expect(containmentAttempts).toBe(1);
     expect(c.runs.activeCount()).toBe(1);
-    expect(c.runs.snapshot(agentId("agent-a"))?.state).toBe("settling");
+    expect(c.runs.snapshot(testAgentId("agent-a"))?.state).toBe("settling");
 
-    await c.stop(agentId("agent-a"));
+    await c.stop(testAgentId("agent-a"));
     expect(containmentAttempts).toBe(2);
     expect(c.runs.activeCount()).toBe(0);
     expect(writes).toHaveLength(1);
@@ -188,7 +273,7 @@ describe("branch restoration", () => {
 
   test("unmatched launch uses the first native user entry after its cursor", async () => {
     const writes: unknown[] = [];
-    const c = new SubagentController({ restoration: port([spawned(), launch()], true, writes, runId("cafebabe")) });
+    const c = new SubagentController({ restoration: port([spawned(), launch()], true, writes, testRunId("cafebabe")) });
     await c.restore();
     const received = await c.receive();
     expect(received.completions[0]?.runId as string | undefined).toBe("cafebabe");
@@ -231,7 +316,7 @@ describe("branch restoration", () => {
     const c = new SubagentController({ capacity: 1, restoration: port([spawned(), launch(), started(), completed()], false, []), parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
     await c.restore();
     expect(c.runs.activeCount()).toBe(1);
-    expect((await c.receive({ timeoutMs: 1 as never })).completions).toEqual([]);
+    expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
     expect(warnings[0]).toContain("containment_failed");
   });
 
@@ -253,7 +338,7 @@ describe("branch restoration", () => {
       resolutions++;
       expect(input.eventVersion).toBe(version);
       expect(input.descriptor?.backend).toBe(version === 2 ? "cgroup-v2" : undefined);
-      if (receiptValid) return { kind: "contained", receipt: input.receiptPath as never };
+      if (receiptValid) return { kind: "contained", receipt: testVerifiedReceiptPath(input.receiptPath) };
       const runtime = {
         abort: async () => {},
         contain: async () => { failedContainments++; throw new Error("receipt unavailable"); },
@@ -275,10 +360,10 @@ describe("branch restoration", () => {
     await c.restore();
 
     expect(c.runs.activeCount()).toBe(1);
-    expect(c.runs.snapshot(agentId("agent-a"))?.state).toBe("settling");
-    expect((await c.receive({ timeoutMs: 1 as never })).completions).toEqual([]);
+    expect(c.runs.snapshot(testAgentId("agent-a"))?.state).toBe("settling");
+    expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
     let resumed = false;
-    await expect(c.runs.launch(agentId("agent-a"), async () => {
+    await expect(c.runs.launch(testAgentId("agent-a"), async () => {
       resumed = true;
       throw new Error("must not resume");
     })).rejects.toThrow("invalid_state:");
@@ -286,8 +371,8 @@ describe("branch restoration", () => {
 
     receiptValid = true;
     await Promise.all([
-      c.stop(agentId("agent-a")),
-      c.stop(agentId("agent-a")),
+      c.stop(testAgentId("agent-a")),
+      c.stop(testAgentId("agent-a")),
     ]);
 
     expect(resolutions).toBe(2);
@@ -298,8 +383,8 @@ describe("branch restoration", () => {
     expect(c.runs.activeCount()).toBe(0);
     const restored = await c.receive();
     expect(restored.completions).toMatchObject([{
-      agentId: agentId("agent-a"),
-      runId: runId("deadbeef"),
+      agentId: testAgentId("agent-a"),
+      runId: testRunId("deadbeef"),
       state: CompletionState.Completed,
       output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false },
     }]);
@@ -310,7 +395,7 @@ describe("branch restoration", () => {
     const warnings: string[] = [];
     const restoration = port([spawned(), launch()], true, []);
     restoration.validateReceipt = async () => { throw new Error("malformed receipt"); };
-    const c = new SubagentController({ restoration: restoration as never, parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
+    const c = new SubagentController({ restoration, parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
     await c.restore();
     expect(c.runs.activeCount()).toBe(1);
     expect(warnings[0]).toContain("containment_failed");
@@ -323,10 +408,10 @@ describe("branch restoration", () => {
     restoration.validateReceipt = async () => valid;
     const c = new SubagentController({ capacity: 1, restoration });
     await c.restore();
-    expect(await c.stop(agentId("agent-a"))).toMatchObject({ state: "failed", agentState: "stopping" });
+    expect(await c.stop(testAgentId("agent-a"))).toMatchObject({ state: "failed", agentState: "stopping" });
     valid = true;
-    await Promise.all([c.stop(agentId("agent-a")), c.shutdown()]);
-    expect(c.runs.snapshots()).toMatchObject([{ agentId: agentId("agent-a"), state: "stopped", transcriptPath: "/tmp/a.jsonl" }]);
+    await Promise.all([c.stop(testAgentId("agent-a")), c.shutdown()]);
+    expect(c.runs.snapshots()).toMatchObject([{ agentId: testAgentId("agent-a"), state: "stopped", transcriptPath: "/tmp/pi-subagents-test/a.jsonl" }]);
     expect(c.runs.activeCount()).toBe(0);
     expect(writes).toEqual([]);
     expect((await c.receive()).completions).toEqual([]);
@@ -338,7 +423,7 @@ describe("branch restoration", () => {
     let cursorReconciliations = 0;
     let restoredFinalisations = 0;
     let liveFinalisations = 0;
-    const restoration = port([spawned(), launch()], false, writes, runId("cafebabe"));
+    const restoration = port([spawned(), launch()], false, writes, testRunId("cafebabe"));
     restoration.validateReceipt = async () => valid;
     const firstUserEntryAfter = restoration.firstUserEntryAfter;
     restoration.firstUserEntryAfter = async (...args) => {
@@ -357,14 +442,14 @@ describe("branch restoration", () => {
     } });
 
     await c.restore();
-    expect(c.runs.snapshot(agentId("agent-a"))?.state).toBe("stopping");
+    expect(c.runs.snapshot(testAgentId("agent-a"))?.state).toBe("stopping");
     expect(c.runs.activeCount()).toBe(1);
     expect(cursorReconciliations).toBe(0);
 
     valid = true;
-    await c.stop(agentId("agent-a"));
+    await c.stop(testAgentId("agent-a"));
 
-    expect(c.runs.snapshot(agentId("agent-a"))).toMatchObject({ state: "stopped", runId: runId("cafebabe") });
+    expect(c.runs.snapshot(testAgentId("agent-a"))).toMatchObject({ state: "stopped", runId: testRunId("cafebabe") });
     expect(c.runs.activeCount()).toBe(0);
     expect(cursorReconciliations).toBe(1);
     expect(restoredFinalisations).toBe(1);
@@ -383,10 +468,10 @@ describe("branch restoration", () => {
     restoration.validateReceipt = async () => valid;
     const c = new SubagentController({ capacity: 1, restoration });
     await c.restore();
-    expect(await c.stop(agentId("agent-a"))).toMatchObject({ state: "failed", agentState: "settling", error: { code: "containment_failed" } });
+    expect(await c.stop(testAgentId("agent-a"))).toMatchObject({ state: "failed", agentState: "settling", error: { code: "containment_failed" } });
     expect(writes).toHaveLength(0);
     valid = true;
-    expect(await c.stop(agentId("agent-a"))).toMatchObject({ state: "already_stopped" });
+    expect(await c.stop(testAgentId("agent-a"))).toMatchObject({ state: "already_stopped" });
     expect(writes).toHaveLength(1);
     expect((await c.receive()).completions).toMatchObject([{ state: "failed", runId: "deadbeef" }]);
     expect(c.runs.activeCount()).toBe(0);
@@ -396,7 +481,7 @@ describe("branch restoration", () => {
     const warnings: string[] = [];
     const restoration = port([spawned(), launch()], true, []);
     restoration.firstUserEntryAfter = async () => { throw new Error("session unavailable"); };
-    const c = new SubagentController({ restoration: restoration as never, parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
+    const c = new SubagentController({ restoration, parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
     await c.restore();
     expect(c.runs.activeCount()).toBe(1);
     expect(c.runs.snapshots()[0]?.state).toBe("stopping");
@@ -408,7 +493,7 @@ describe("branch restoration", () => {
     const barrier = new Promise<boolean>((resolve) => { decide = resolve; });
     const restoration = port([spawned(), launch(), started()], true, []);
     restoration.validateReceipt = async () => barrier;
-    const c = new SubagentController({ restoration: restoration as never });
+    const c = new SubagentController({ restoration });
     const restoring = c.restore();
     expect(c.runs.snapshots()).toEqual([]);
     decide(false);
@@ -425,34 +510,35 @@ describe("branch restoration", () => {
     expect((await c.receive()).completions).toHaveLength(1);
   });
 
-  test("100 restoration schedules expose one durable record, reservation, completion, and next-turn ping", async () => {
-    for (let schedule = 0; schedule < 100; schedule++) {
-      let validations = 0;
-      let decide!: (valid: boolean) => void;
-      const barrier = new Promise<boolean>((resolve) => { decide = resolve; });
-      const writes: unknown[] = [], pings: unknown[] = [];
-      const restoration = port([spawned(), launch(), started()], true, writes);
-      restoration.validateReceipt = async () => { validations++; return barrier; };
-      const c = new SubagentController({ restoration, parent: {
-        isBusy: () => false,
-        sendMessage: async (_text, options) => { pings.push(options); },
-      } });
-      const callers = Array.from({ length: 100 }, () => c.restore());
-      decide(true);
-      await Promise.all(callers);
-      expect(validations).toBe(1);
-      expect(writes).toHaveLength(1);
-      expect(c.runs.snapshots()).toHaveLength(1);
-      expect(c.runs.activeCount()).toBe(0);
-      expect(c.completions.queuedCount()).toBe(1);
-      expect(pings).toEqual([{ deliverAs: "nextTurn", triggerTurn: false }]);
-    }
+  test("a second restore caller joins the in-flight receipt decision and shares one durable record, reservation, completion, and next-turn ping", async () => {
+    let validations = 0;
+    const deciding = testBarrier("shared-receipt-decision");
+    const writes: unknown[] = [], pings: unknown[] = [];
+    const restoration = port([spawned(), launch(), started()], true, writes);
+    restoration.validateReceipt = async () => { validations++; await deciding.enterAndWait(); return true; };
+    const c = new SubagentController({ restoration, parent: {
+      isBusy: () => false,
+      sendMessage: async (_text, options) => { pings.push(options); },
+    } });
+
+    const first = c.restore();
+    await deciding.entered;
+    const second = c.restore();
+    deciding.release();
+    await Promise.all([first, second]);
+
+    expect(validations).toBe(1);
+    expect(writes).toHaveLength(1);
+    expect(c.runs.snapshots()).toHaveLength(1);
+    expect(c.runs.activeCount()).toBe(0);
+    expect(c.completions.queuedCount()).toBe(1);
+    expect(pings).toEqual([{ deliverAs: "nextTurn", triggerTurn: false }]);
   });
 
   test("restore failure clears the in-flight promise and retry does not duplicate durable appends", async () => {
     const writes: unknown[] = [];
     let completionAttempts = 0;
-    const restoration = port([spawned(), launch()], true, writes, runId("cafebabe"));
+    const restoration = port([spawned(), launch()], true, writes, testRunId("cafebabe"));
     const appendCompleted = restoration.appender.appendRunCompleted.bind(restoration.appender);
     restoration.appender.appendRunCompleted = async (completion) => {
       completionAttempts++;
@@ -463,7 +549,7 @@ describe("branch restoration", () => {
     await expect(Promise.all([c.restore(), c.restore()])).rejects.toThrow("disk unavailable");
     expect(c.runs.snapshots()).toMatchObject([{ state: "settling" }]);
     expect(c.runs.activeCount()).toBe(1);
-    await c.stop(agentId("agent-a"));
+    await c.stop(testAgentId("agent-a"));
     await c.restore();
     expect(writes).toHaveLength(2);
     expect(writes.map((value) => (value as { eventType: string }).eventType)).toEqual([AgentEventType.RunStarted, AgentEventType.RunCompleted]);
@@ -475,7 +561,7 @@ describe("branch restoration", () => {
       const writes: unknown[] = [];
       let calls = 0;
       let completionAttempts = 0;
-      const restoration = port([spawned(), launch()], false, writes, runId("cafebabe"));
+      const restoration = port([spawned(), launch()], false, writes, testRunId("cafebabe"));
       restoration.validateReceipt = async () => decisions[calls++]!;
       const appendCompleted = restoration.appender.appendRunCompleted.bind(restoration.appender);
       restoration.appender.appendRunCompleted = async (completion) => {
@@ -486,7 +572,7 @@ describe("branch restoration", () => {
 
       if (decisions[0]) {
         await expect(c.restore()).rejects.toThrow("disk unavailable");
-        await c.stop(agentId("agent-a"));
+        await c.stop(testAgentId("agent-a"));
         expect(writes.map((value) => (value as { eventType: string }).eventType)).toEqual([AgentEventType.RunStarted, AgentEventType.RunCompleted]);
         expect((await c.receive()).completions).toHaveLength(1);
       } else {
@@ -518,10 +604,10 @@ describe("branch restoration", () => {
     await expect(c.runs.spawnNew(async () => { throw new Error("must not run"); })).rejects.toThrow("capacity_exceeded:");
 
     valid = true;
-    await c.stop(agentId("agent-a"));
+    await c.stop(testAgentId("agent-a"));
     expect(c.runs.activeCount()).toBe(1);
     await expect(c.runs.spawnNew(async () => { throw new Error("must not run"); })).rejects.toThrow("capacity_exceeded:");
-    await c.stop(agentId("agent-b"));
+    await c.stop(testAgentId("agent-b"));
     expect(c.runs.activeCount()).toBe(0);
     expect(c.completions.queuedCount()).toBe(2);
     expect(writes).toHaveLength(2);
@@ -549,8 +635,8 @@ describe("branch restoration", () => {
     expect(c.completions.queuedCount()).toBe(1);
 
     secondContained = true;
-    await c.stop(agentId("agent-b"));
-    await c.stop(agentId("agent-c"));
+    await c.stop(testAgentId("agent-b"));
+    await c.stop(testAgentId("agent-c"));
     expect(writes).toHaveLength(3);
     expect(c.runs.activeCount()).toBe(0);
     expect(c.completions.queuedCount()).toBe(3);
@@ -571,73 +657,61 @@ describe("branch restoration", () => {
         expect((await c.receive()).completions).toHaveLength(1);
       } else {
         expect(c.runs.activeCount()).toBe(1);
-        expect((await c.receive({ timeoutMs: 1 as never })).completions).toEqual([]);
+        expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
       }
     });
   }
 });
 
-function spawned() { return entry(AgentEventType.Spawned, { agentId: "agent-a", sessionPath: "/tmp/a.jsonl", cwd: "/tmp", provider: "p", modelId: "m", thinkingLevel: "high", tools: [] }); }
-function spawnedFor(id: string, sessionPath: string) { return entry(AgentEventType.Spawned, { agentId: id, sessionPath, cwd: "/tmp", provider: "p", modelId: "m", thinkingLevel: "high", tools: [] }); }
-function launch(attemptId = "attempt") { return entry(AgentEventType.RunLaunchRequested, { agentId: "agent-a", previousLeafId: null, attemptId, containmentReceiptPath: `/tmp/${attemptId}.receipt` }); }
-function launchV2(attemptId = "attempt") {
-  return entry(AgentEventType.RunLaunchRequested, {
-    agentId: "agent-a",
-    previousLeafId: null,
-    attemptId,
-    containmentReceiptPath: `/tmp/${attemptId}.receipt`,
-    containment: { backend: "cgroup-v2", scopePath: `/tmp/cgroups/agent-a/${attemptId}` },
-  }, 2);
+function spawned() { return spawnedEntry({ agentId: testAgentId(), sessionPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), cwd: testAbsolutePath("/tmp"), provider: "p", modelId: testModelSpec("m"), tools: [] }, 1); }
+function spawnedFor(id: string, path: string) { return spawnedEntry({ agentId: testAgentId(id), sessionPath: testSessionPath(`/tmp/pi-subagents-test/${path.split("/").at(-1)!}`), cwd: testAbsolutePath("/tmp"), provider: "p", modelId: testModelSpec("m"), tools: [] }, 1); }
+function launch(attemptId = "attempt") { return launchEntry({ agentId: testAgentId(), attemptId: testAttemptId(attemptId), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${attemptId}.receipt`) }, 1); }
+function launchV2(attemptId = "attempt") { return launchEntry({ agentId: testAgentId(), attemptId: testAttemptId(attemptId), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${attemptId}.receipt`), containment: { backend: "cgroup-v2", scopePath: testAbsolutePath(`/tmp/cgroups/agent-a/${attemptId}`) } }, 2); }
+function launchFor(id: string, attemptId: string) { return launchEntry({ agentId: testAgentId(id), attemptId: testAttemptId(attemptId), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${attemptId}.receipt`) }, 1); }
+function started(id = "deadbeef", attemptId = "attempt") { return startedEntry({ agentId: testAgentId(), runId: testRunId(id), attemptId: testAttemptId(attemptId) }, 1); }
+function startedV2(id = "deadbeef", attemptId = "attempt") { return startedEntry({ agentId: testAgentId(), runId: testRunId(id), attemptId: testAttemptId(attemptId) }, 2); }
+function startedFor(id: string, nativeRunId: string, attemptId: string) { return startedEntry({ agentId: testAgentId(id), runId: testRunId(nativeRunId), attemptId: testAttemptId(attemptId) }, 1); }
+function stopping(reason: CancellationReason) { return stoppingEntry({ reason, containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/attempt.receipt") }, 1); }
+function completed(id = "deadbeef") {
+  return completedEntry({
+    runId: testRunId(id), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"),
+    outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${id}.md`), output: truncateUtf8("", 50_000),
+  }, 1);
 }
-function launchFor(id: string, attemptId: string) { return entry(AgentEventType.RunLaunchRequested, { agentId: id, previousLeafId: null, attemptId, containmentReceiptPath: `/tmp/${attemptId}.receipt` }); }
-function started(id = "deadbeef", attemptId = "attempt") { return entry(AgentEventType.RunStarted, { agentId: "agent-a", runId: id, attemptId }); }
-function startedV2(id = "deadbeef", attemptId = "attempt") {
-  return entry(AgentEventType.RunStarted, { agentId: "agent-a", runId: id, attemptId }, 2);
-}
-function startedFor(id: string, nativeRunId: string, attemptId: string) { return entry(AgentEventType.RunStarted, { agentId: id, runId: nativeRunId, attemptId }); }
-function stopping(reason: CancellationReason) { return entry(AgentEventType.RunStopping, { agentId: "agent-a", runId: "deadbeef", reason, containmentReceiptPath: "/tmp/attempt.receipt" }); }
-function completed(id = "deadbeef") { return entry(AgentEventType.RunCompleted, { ...base(runId(id)), state: CompletionState.Completed }); }
 function completedV2(id = "deadbeef") {
-  return entry(AgentEventType.RunCompleted, { ...base(runId(id)), state: CompletionState.Completed }, 2);
-}
-function entry(eventType: string, payload: object, schemaVersion: 1 | 2 = 1) {
-  return { type: "custom", customType: AGENT_EVENT_CUSTOM_TYPE, data: { schemaVersion, eventType, payload } };
+  return completedEntry({
+    runId: testRunId(id), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"),
+    outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${id}.md`), output: truncateUtf8("", 50_000),
+  }, 2);
 }
 
 type TestRestorationPort = RestorationPort & {
   validateReceipt(path: unknown, attemptId: unknown): Promise<boolean>;
 };
 
-function port(branch: ReturnType<typeof entry>[], valid: boolean, writes: unknown[], found?: ReturnType<typeof runId>, attempts?: string[]): TestRestorationPort {
+function port(branch: RestorationEventEntry[], valid: boolean, writes: unknown[], found?: ReturnType<typeof testRunId>, attempts?: string[]): TestRestorationPort {
   const appender = new AgentEventAppender((_type, data) => { writes.push(data); });
-  const result: TestRestorationPort = {
-    stateRoot: "/tmp" as never,
+  let result!: TestRestorationPort;
+  result = Object.assign(testRestorationPort({
+    stateRoot: testAbsolutePath("/tmp"),
     getBranch: () => branch,
-    validateReceipt: async (_path: unknown, attemptId: unknown) => { attempts?.push(String(attemptId)); return valid; },
     resolveContainment: async (input) => {
-      if (await result.validateReceipt(input.receiptPath, input.attemptId)) {
-        return { kind: "contained", receipt: input.receiptPath as never };
-      }
+      if (await result.validateReceipt(input.receiptPath, input.attemptId)) return { kind: "contained", receipt: testVerifiedReceiptPath(input.receiptPath) };
       return {
         kind: "unresolved-historical",
-        runtime: {
-          abort: async () => {},
-          contain: async () => {
-            if (!await result.validateReceipt(input.receiptPath, input.attemptId)) throw new Error("containment receipt unavailable");
-            return input.receiptPath as never;
-          },
-        },
+        runtime: testRuntime({ contain: async () => {
+          if (!await result.validateReceipt(input.receiptPath, input.attemptId)) throw new Error("containment receipt unavailable");
+          return testVerifiedReceiptPath(input.receiptPath);
+        } }),
       };
     },
     firstUserEntryAfter: async () => found,
-    finaliseContained: async (_record: unknown, id: ReturnType<typeof runId>, settlement) => settlement.kind === "cancelled"
-      ? ({ ...base(id), state: CompletionState.Cancelled, reason: settlement.reason })
-      : ({ ...base(id), state: CompletionState.Failed, error: { code: "run_interrupted", message: "run was interrupted before completion" } }),
+    finaliseContained: async (_record, id, settlement) => settlement.kind === "cancelled"
+      ? { ...completedCompletion({ runId: id }), state: CompletionState.Cancelled, reason: settlement.reason }
+      : { ...completedCompletion({ runId: id }), state: CompletionState.Failed, error: { code: "run_interrupted", message: "run was interrupted before completion" } },
     appender,
-  };
+  }), {
+    validateReceipt: async (_path: unknown, attemptId: unknown) => { attempts?.push(String(attemptId)); return valid; },
+  });
   return result;
 }
-
-function deferred<T>() { let resolve!: (value: T | PromiseLike<T>) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }
-
-function base(id: ReturnType<typeof runId>) { return { agentId: agentId("agent-a"), runId: id, output: truncateUtf8("", 50_000), outputPath: `/tmp/${id}.md` as never, transcriptPath: "/tmp/a.jsonl" as never }; }

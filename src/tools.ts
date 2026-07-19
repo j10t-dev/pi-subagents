@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
-import { Type, type Static, type TSchema } from "typebox";
+import { Type, type Static } from "typebox";
 import {
   AgentErrorCode,
   AgentState,
   CancellationReason,
   CompletionState,
+  THINKING_LEVELS,
   agentId,
   milliseconds,
   runId,
@@ -53,28 +54,50 @@ export const stopAgentSchema = Type.Object({
 }, { additionalProperties: false });
 export type StopAgentInput = Static<typeof stopAgentSchema>;
 
-export interface SubagentTool {
-  name: "spawn_agent" | "send_input" | "receive_agent" | "stop_agent";
-  description: string;
-  parameters: TSchema;
-  execute: (input: object, signal?: AbortSignal) => Promise<{ content: string; details: object }>;
-  renderResult?: (result: object) => string;
+export const subagentToolSchemas = {
+  spawn_agent: spawnAgentSchema,
+  send_input: sendInputSchema,
+  receive_agent: receiveAgentSchema,
+  stop_agent: stopAgentSchema,
+} as const;
+
+export type SubagentToolName = keyof typeof subagentToolSchemas;
+export type SubagentToolInput<K extends SubagentToolName> =
+  Static<(typeof subagentToolSchemas)[K]>;
+
+export interface SubagentTool<K extends SubagentToolName> {
+  readonly name: K;
+  readonly description: string;
+  readonly parameters: (typeof subagentToolSchemas)[K];
+  execute(
+    input: SubagentToolInput<K>,
+    signal?: AbortSignal,
+  ): Promise<{ content: string; details: object }>;
+  renderResult?(result: object): string;
 }
 
-export function createSubagentTools(controller: SubagentController): SubagentTool[] {
-  return [
-    tool("spawn_agent", "Start an isolated child agent assignment.", spawnAgentSchema,
-      async (input: SpawnAgentInput) => executeSpawn(() => controller.spawn(input)), projectSpawnStart, renderStart, undefined,
-      { preservePublicPreflight: true }),
-    tool("send_input", "Start a literal assignment on a stopped child agent.", sendInputSchema,
-      async (input: SendInputInput) => executeStart(() => controller.sendInput(agentId(input.agentId), input.message), AgentErrorCode.SessionUnavailable), projectStart, renderStart),
-    tool("receive_agent", "Receive ready completions and the complete owned-agent inventory.", receiveAgentSchema,
-      async (input: ReceiveAgentInput, signal?: AbortSignal) => controller.receive({
+export type SubagentToolRegistry = {
+  readonly [K in SubagentToolName]: SubagentTool<K>;
+};
+
+/** The controller surface required by public subagent tools. */
+export type SubagentToolController = Pick<SubagentController, "spawn" | "sendInput" | "receive" | "stop">;
+
+export function createSubagentTools(controller: SubagentToolController): SubagentToolRegistry {
+  return {
+    spawn_agent: tool("spawn_agent", "Start an isolated child agent assignment.", spawnAgentSchema,
+      async (input) => executeSpawn(() => controller.spawn(input)), projectSpawnStart, renderStart,
+      undefined, { preservePublicPreflight: true }),
+    send_input: tool("send_input", "Start a literal assignment on a stopped child agent.", sendInputSchema,
+      async (input) => executeStart(() => controller.sendInput(agentId(input.agentId), input.message),
+        AgentErrorCode.SessionUnavailable), projectStart, renderStart),
+    receive_agent: tool("receive_agent", "Receive ready completions and the complete owned-agent inventory.", receiveAgentSchema,
+      async (input, signal) => controller.receive({
         ...(input.timeoutMs === undefined ? {} : { timeoutMs: milliseconds(input.timeoutMs) }),
         ...(signal === undefined ? {} : { signal }),
       }), projectReceive, renderReceive, boundReceiveContent),
-    tool("stop_agent", "Stop one or more owned child agents.", stopAgentSchema,
-      async (input: StopAgentInput) => {
+    stop_agent: tool("stop_agent", "Stop one or more owned child agents.", stopAgentSchema,
+      async (input) => {
         const outcomes = await Promise.all(input.agentIds.map(async (raw) => {
           let id: AgentId;
           try { id = agentId(raw); }
@@ -84,26 +107,26 @@ export function createSubagentTools(controller: SubagentController): SubagentToo
         }));
         return { outcomes };
       }, projectStop, renderStop),
-  ];
+  };
 }
 
-function tool<TInput extends object, TResult extends object>(
-  name: SubagentTool["name"],
+function tool<K extends SubagentToolName, TResult extends object>(
+  name: K,
   description: string,
-  parameters: TSchema,
-  execute: (input: TInput, signal?: AbortSignal) => Promise<TResult>,
+  parameters: (typeof subagentToolSchemas)[K],
+  execute: (input: SubagentToolInput<K>, signal?: AbortSignal) => Promise<TResult>,
   project: (result: TResult) => object,
   renderResult: (result: object) => string,
   projectContent?: (details: object) => object,
   options: { preservePublicPreflight?: boolean } = {},
-): SubagentTool {
+): SubagentTool<K> {
   return {
     name,
     description,
     parameters,
     execute: async (input, signal) => {
-      let safeInput: TInput;
-      try { safeInput = copyPublicInput(input) as TInput; }
+      let safeInput: SubagentToolInput<K>;
+      try { safeInput = copyPublicInput(input) as SubagentToolInput<K>; }
       catch { throw invalidPublicResult(); }
       let result: TResult;
       try { result = await execute(safeInput, signal); }
@@ -190,7 +213,7 @@ function projectSpawnStart(value: SpawnStartResult): object {
     runId: requiredRunId(source, "runId"),
     state,
     model: requiredCanonicalModelReference(source, "model"),
-    thinkingLevel: requiredLiteral(source, "thinkingLevel", ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const),
+    thinkingLevel: requiredLiteral(source, "thinkingLevel", THINKING_LEVELS),
     tools: requiredToolArray(source, "tools"),
     ...(source.warning === undefined ? {} : { warning: requiredBoundedString(source, "warning", MAX_ERROR_MESSAGE_BYTES) }),
   };

@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Value } from "typebox/value";
 
-import type { DiagnosticsPath } from "../src/domain.ts";
 import {
   AgentErrorCode,
   AgentEventType,
@@ -23,6 +22,7 @@ import {
   retainUtf8Tail,
   utf8Bytes,
 } from "../src/domain.ts";
+import { diagnosticsPath } from "../src/paths.ts";
 import {
   AgentCompletionSchema,
   AgentErrorSchema,
@@ -290,9 +290,9 @@ describe("toAgentError", () => {
     const withPath = toAgentError(
       new Error("x"),
       AgentErrorCode.ProtocolError,
-      "/tmp/diag.log" as unknown as DiagnosticsPath,
+      diagnosticsPath("/tmp", "diag.log"),
     );
-    expect(withPath.diagnosticsPath as unknown as string).toBe("/tmp/diag.log");
+    expect(String(withPath.diagnosticsPath)).toBe("/tmp/diag.log");
     const withoutPath = toAgentError(new Error("x"), AgentErrorCode.ProtocolError);
     expect(withoutPath.diagnosticsPath).toBeUndefined();
   });

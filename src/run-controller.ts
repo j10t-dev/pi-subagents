@@ -34,7 +34,7 @@ interface LiveRecord extends RunRecord {
   launching?: boolean;
   launchDone?: Promise<void>;
   resolveLaunchDone?: () => void;
-  stopAfterLaunch?: CancellationReason | string;
+  stopAfterLaunch?: CancellationReason;
   runtime?: RunRuntime;
   reservation?: RunReservation;
   terminal?: Promise<StopResult>;
@@ -48,7 +48,7 @@ interface TerminalOwner {
   record: LiveRecord;
   settlement: Settlement;
   abort: boolean;
-  reason?: CancellationReason | string;
+  reason?: CancellationReason;
   resolve(result: StopResult): void;
 }
 
@@ -99,7 +99,7 @@ export function classifyTerminal(observation: TerminalObservation, controllerSto
 export interface RunControllerOptions {
   capacity: number;
   onReserve?: () => void;
-  onStopping?: (record: Readonly<RunRecord>, reason: CancellationReason | string) => void | Promise<void>;
+  onStopping?: (record: Readonly<RunRecord>, reason: CancellationReason) => void | Promise<void>;
   onTerminal?: (record: Readonly<RunRecord>, settlement: Settlement) => RunId | void | Promise<RunId | void>;
   onRelease?: (agentId: AgentId) => void;
 }
@@ -458,7 +458,7 @@ export class RunController {
     return this.terminalise(agentId, AgentState.Settling, settlement, false, undefined, expectedRunId);
   }
 
-  async stop(agentId: AgentId, reason: CancellationReason | string): Promise<StopResult> {
+  async stop(agentId: AgentId, reason: CancellationReason): Promise<StopResult> {
     const record = this.require(agentId);
     let launchDone: Promise<void> | undefined;
     if (record.launching === true) {
@@ -476,10 +476,7 @@ export class RunController {
       const result = await this.terminalise(agentId, AgentState.Settling, record.terminalCandidate ?? { kind: "failed", cause: terminalFailureCause(AgentErrorCode.RunInterrupted) }, false);
       return result.status === "stopped" ? { status: "already_stopped", agentId } : result;
     }
-    const cancellationReason = reason === CancellationReason.ParentShutdown
-      ? CancellationReason.ParentShutdown
-      : CancellationReason.StopRequested;
-    return this.terminalise(agentId, AgentState.Stopping, { kind: "cancelled", reason: cancellationReason }, true, reason);
+    return this.terminalise(agentId, AgentState.Stopping, { kind: "cancelled", reason }, true, reason);
   }
 
   snapshot(agentId: AgentId): RunRecord | undefined {
@@ -496,7 +493,7 @@ export class RunController {
   snapshots(): RunRecord[] { return [...this.agents.keys()].map((id) => this.snapshot(id)!); }
   activeCount(): number { return this.semaphore.activeCount; }
 
-  private async terminalise(agentId: AgentId, transition: typeof AgentState.Settling | typeof AgentState.Stopping, settlement: Settlement, abort: boolean, reason?: CancellationReason | string, expectedRunId?: RunId): Promise<StopResult> {
+  private async terminalise(agentId: AgentId, transition: typeof AgentState.Settling | typeof AgentState.Stopping, settlement: Settlement, abort: boolean, reason?: CancellationReason, expectedRunId?: RunId): Promise<StopResult> {
     const record = this.require(agentId);
     let owner: TerminalOwner | undefined;
     let existing: Promise<StopResult> | undefined;
@@ -520,7 +517,7 @@ export class RunController {
     transition: typeof AgentState.Settling | typeof AgentState.Stopping,
     settlement: Settlement,
     abort = false,
-    reason?: CancellationReason | string,
+    reason?: CancellationReason,
   ): TerminalOwner {
     if (record.state === AgentState.Running) record.state = transition;
     if (record.terminalCandidate === undefined) record.terminalCandidate = settlement;

@@ -3,11 +3,14 @@ import { closeSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { MAX_SESSION_RECOVERY_BYTES } from "../src/constants.ts";
 import { createRunAttemptId, runId as brandRunId } from "../src/domain.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 import type { RunAttemptId, RunId, SessionPath } from "../src/domain.ts";
 import { OutputStore, type TranscriptFileSystem } from "../src/output-store.ts";
+import { sessionPath as toSessionPath } from "../src/paths.ts";
 import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-fs.ts";
-import type { WireAssistantMessage } from "../src/rpc-wire.ts";
+import type { WireAssistantMessage } from "../src/schemas.ts";
 
 const RUN: RunId = brandRunId("b2c3d4e5");
 const OTHER_RUN: RunId = brandRunId("c3d4e5f6");
@@ -558,6 +561,45 @@ describe("OutputStore", () => {
     const sessionPath = join(workDir, "bounded-miss.jsonl") as SessionPath;
     writeFileSync(sessionPath, sessionLine(userEntry(OTHER_RUN)) + sessionLine({ type: "metadata", padding: "x".repeat(200) }));
     expect(() => boundedStore.ensureDurable(OTHER_RUN, sessionPath)).toThrow(/no matching assignment cursor|no complete record/);
+  });
+
+  test("recovers evidence that straddles the production recovery window and discards the partial leading record", () => {
+    const sessionRoot = temporaryStateRoot("output-store-tail-boundary-");
+    try {
+      store.restoreRun(RUN);
+      const sessionPath = toSessionPath(sessionRoot.path, "tail-boundary.jsonl");
+      const suffix = sessionLine(userEntry(RUN)) + sessionLine(assistantEntry("aaaaaaaa", "inside bounded tail"));
+      const crossingPaddingBytes = MAX_SESSION_RECOVERY_BYTES - Buffer.byteLength(suffix) + 1_024;
+      const crossing = sessionLine({ type: "metadata", padding: "x".repeat(crossingPaddingBytes) });
+      writeFileSync(sessionPath, sessionLine({ type: "metadata", side: "before" }) + crossing + suffix);
+
+      expect(statSync(sessionPath).size).toBeGreaterThan(MAX_SESSION_RECOVERY_BYTES);
+      expect(store.ensureDurable(RUN, sessionPath).output.text).toBe("inside bounded tail");
+      expect(readdirSync(workDir).filter((name) => name.startsWith(".tmp-"))).toEqual([]);
+    } finally {
+      sessionRoot.cleanup();
+    }
+  });
+
+  test("rejects evidence whose matching cursor precedes the production recovery window", () => {
+    const sessionRoot = temporaryStateRoot("output-store-tail-boundary-miss-");
+    try {
+      store.restoreRun(RUN);
+      const sessionPath = toSessionPath(sessionRoot.path, "tail-boundary-miss.jsonl");
+      const suffix = sessionLine(assistantEntry("aaaaaaaa", "outside bounded tail"));
+      const crossingPaddingBytes = MAX_SESSION_RECOVERY_BYTES - Buffer.byteLength(suffix) + 1_024;
+      const crossing = sessionLine({ type: "metadata", padding: "x".repeat(crossingPaddingBytes) });
+      writeFileSync(sessionPath, sessionLine(userEntry(RUN)) + crossing + suffix);
+
+      expect(statSync(sessionPath).size).toBeGreaterThan(MAX_SESSION_RECOVERY_BYTES);
+      expect(() => store.ensureDurable(RUN, sessionPath)).toThrow(
+        `output_error: no matching assignment cursor within the last ${MAX_SESSION_RECOVERY_BYTES} bytes`,
+      );
+      expect(store.currentOutput(RUN).output.text).toBe("");
+      expect(readdirSync(workDir).filter((name) => name.startsWith(".tmp-"))).toEqual([]);
+    } finally {
+      sessionRoot.cleanup();
+    }
   });
 
   test("loops over legal short transcript reads and parses only the bytes actually read", () => {

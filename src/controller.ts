@@ -93,7 +93,7 @@ export interface PiControllerComposition {
   prepareSpawn(input: SpawnAgentRequest, scope: PreparationScope): Promise<SpawnPreparation>;
   prepareSend(agentId: AgentId, literalMessage: string, scope: PreparationScope): Promise<SendPreparation>;
   /** Persists RunStopping before abort. */
-  persistStopping?(record: Readonly<RunRecord>, reason: CancellationReason | string): Promise<void>;
+  persistStopping?(record: Readonly<RunRecord>, reason: CancellationReason): Promise<void>;
   /** Performs output recovery, persists RunCompleted, then returns the durable DTO. */
   finaliseRun?(record: Readonly<RunRecord>, settlement: Settlement): Promise<AgentCompletion>;
   restore?(): Promise<void>;

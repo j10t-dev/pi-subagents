@@ -1,7 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { AgentErrorCode, AgentState, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8, verifiedContainmentReceiptPath } from "../src/domain.ts";
-import { SubagentController, type LaunchSession, type LaunchTransport, type PreparationScope } from "../src/controller.ts";
+import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PreparationScope } from "../src/controller.ts";
 import type { RunRuntime } from "../src/run-controller.ts";
+import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testEntryId, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
+import { completedCompletion } from "./support/messages.ts";
+import { launchSession, runningTransport, testRuntime } from "./support/launches.ts";
+import { deferred } from "./support/async.ts";
+import { testBarrier } from "./support/barriers.ts";
+import { testRestorationPort } from "./support/restoration.ts";
+
+/** Post-native-identity seams, each of which must own settlement against a stop/shutdown contender. */
+const postIdentitySeams = ["bindRun", "persistRunStarted", "waitSettled"] as const;
 
 const TEST_SELECTION = Object.freeze({
   model: modelSpec("mock-provider/luna"),
@@ -33,8 +42,8 @@ describe("parent lifecycle wiring", () => {
         },
       },
     });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/shutdown-complete" as never,
-      runtime: { abort: async () => {}, contain: async () => { containments++; return "/tmp/shutdown-complete.receipt" as never; } } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/shutdown-complete"),
+      runtime: { abort: async () => {}, contain: async () => { containments++; return testVerifiedReceiptPath("/tmp/pi-subagents-test/shutdown-complete.receipt"); } } }]);
 
     await expect(c.shutdown()).rejects.toThrow("cleanup failed");
     expect(cleanups).toBe(1);
@@ -53,7 +62,7 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownComplete: async () => { cleanups++; },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/shutdown-complete-retained" as never,
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/shutdown-complete-retained"),
       runtime: { abort: async () => {}, contain: async () => { throw new Error("still populated"); } } }]);
 
     await expect(c.shutdown()).rejects.toThrow("containment_failed:");
@@ -98,9 +107,9 @@ describe("parent lifecycle wiring", () => {
     const entered = deferred<void>();
     let createSessions = 0;
     const c = new SubagentController({ restoration: {
-      stateRoot: "/tmp" as never, getBranch: () => [], resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
+      stateRoot: testAbsolutePath("/tmp"), getBranch: () => [], resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
       finaliseContained: async () => { throw new Error("unused"); },
-      appender: { appendRunStarted: async () => {}, appendRunCompleted: async () => {} } as never,
+      appender: testRestorationPort().appender,
     }, composition: {
       prepareSpawn: async () => {
         entered.resolve();
@@ -159,10 +168,10 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => {
         await Promise.resolve();
         await expect(c.shutdown()).rejects.toThrow("invalid_state: agent is not in a valid state for this operation");
-        return { session: { agentId: id, transcriptPath: "/tmp/existing" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never }, createLaunch: async () => { createLaunches++; throw new Error("must not launch"); } };
+        return { session: { agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing"), previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r") }, createLaunch: async () => { createLaunches++; throw new Error("must not launch"); } };
       },
     } });
-    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: "/tmp/existing" as never });
+    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing") });
 
     await expect(c.sendInput(id, "next")).rejects.toThrow("invalid_state: agent is not in a valid state for this operation");
     expect(createLaunches).toBe(0);
@@ -176,10 +185,10 @@ describe("parent lifecycle wiring", () => {
       prepareSpawn: async () => { throw new Error("unused"); },
       prepareSend: async () => {
         await expect(c.shutdown()).rejects.toThrow("invalid_state: agent is not in a valid state for this operation");
-        return { session: { agentId: id, transcriptPath: "/tmp/existing-sync" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never }, createLaunch: async () => { createLaunches++; throw new Error("must not launch"); } };
+        return { session: { agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing-sync"), previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r") }, createLaunch: async () => { createLaunches++; throw new Error("must not launch"); } };
       },
     } });
-    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: "/tmp/existing-sync" as never });
+    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing-sync") });
 
     await expect(c.sendInput(id, "next")).rejects.toThrow("invalid_state: agent is not in a valid state for this operation");
     expect(createLaunches).toBe(0);
@@ -201,7 +210,7 @@ describe("parent lifecycle wiring", () => {
         } else {
           await releaseConcurrent.promise;
         }
-        const session: LaunchSession = { agentId: agentId(task), transcriptPath: `/tmp/${task}` as never, previousLeafId: null, attemptId: `attempt-${task}` as never, containmentReceiptPath: `/tmp/${task}.receipt` as never };
+        const session: LaunchSession = { agentId: agentId(task), transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${task}`), previousLeafId: null, attemptId: testAttemptId(`attempt-${task}`), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${task}.receipt`) };
         return { selection: TEST_SELECTION, createSession: async () => { createSessions++; return session; }, persistSpawned: async () => {}, createLaunch: async () => transport(session, () => {}) };
       },
       prepareSend: async () => { throw new Error("unused"); },
@@ -224,7 +233,7 @@ describe("parent lifecycle wiring", () => {
     let shutdownResolved = false;
     let containments = 0;
     let c!: SubagentController;
-    const session: LaunchSession = { agentId: agentId("detached-spawn"), transcriptPath: "/tmp/detached-spawn" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never };
+    const session: LaunchSession = { agentId: agentId("detached-spawn"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/detached-spawn"), previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r") };
     c = new SubagentController({ composition: {
       prepareSpawn: async (_input, scope) => {
         scope.scheduleExternal(() => { void (async () => { await fireShutdown.promise; shutdownStarted.resolve(); await c.shutdown(); shutdownResolved = true; })(); });
@@ -251,7 +260,7 @@ describe("parent lifecycle wiring", () => {
     let shutdownResolved = false;
     let containments = 0;
     let c!: SubagentController;
-    const session: LaunchSession = { agentId: agentId("detached-send"), transcriptPath: "/tmp/detached-send" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never };
+    const session: LaunchSession = { agentId: agentId("detached-send"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/detached-send"), previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r") };
     c = new SubagentController({ composition: {
       prepareSpawn: async () => { throw new Error("unused"); },
       prepareSend: async (_agentId, _message, scope) => {
@@ -273,7 +282,7 @@ describe("parent lifecycle wiring", () => {
     const shutdownFinished = deferred<void>();
     let containments = 0;
     let c!: SubagentController;
-    const session: LaunchSession = { agentId: agentId("released-token"), transcriptPath: "/tmp/released-token" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never };
+    const session: LaunchSession = { agentId: agentId("released-token"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/released-token"), previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r") };
     c = new SubagentController({ composition: {
       prepareSpawn: async () => {
         void (async () => { await fireShutdown.promise; await c.shutdown(); shutdownFinished.resolve(); })();
@@ -299,10 +308,10 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => {
         entered.resolve();
         await prepared.promise;
-        return { session: { agentId: id, transcriptPath: "/tmp/existing" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never }, createLaunch: async () => { createLaunches++; throw new Error("must not launch"); } };
+        return { session: { agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing"), previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r") }, createLaunch: async () => { createLaunches++; throw new Error("must not launch"); } };
       },
     } });
-    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: "/tmp/existing" as never });
+    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing") });
 
     const sending = c.sendInput(id, "next");
     await entered.promise;
@@ -313,6 +322,195 @@ describe("parent lifecycle wiring", () => {
     expect(createLaunches).toBe(0);
   });
 
+  test("shutdown drains asynchronous spawn preparation and cancels before launch", async () => {
+    const preparing = testBarrier("spawn-preparation");
+    let createLaunches = 0;
+    const session = surrenderSession("drained-spawn-preparation");
+    const c = new SubagentController({ composition: {
+      prepareSpawn: async () => {
+        await preparing.enterAndWait();
+        return { selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {},
+          createLaunch: async () => { createLaunches++; throw new Error("must not launch"); } };
+      },
+      prepareSend: async () => { throw new Error("unused"); },
+    } });
+
+    const spawning = c.spawn({ task: "one" });
+    await preparing.entered;
+    const shutdown = c.shutdown();
+    preparing.release();
+
+    await expect(spawning).rejects.toThrow("invalid_state:");
+    await expect(shutdown).resolves.toBeUndefined();
+    expect(createLaunches).toBe(0);
+  });
+
+  test("spawn launch is accepted before shutdown", async () => {
+    const preparing = testBarrier("spawn-launch-ready");
+    let containments = 0;
+    const session = surrenderSession("spawn-admission-first");
+    const c = new SubagentController({ capacity: 1, composition: {
+      // Ownership is accepted at launch, not at preparation entry: a preparation still
+      // blocked when shutdown starts is cancelled instead of contained.
+      prepareSpawn: async () => ({
+        selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {},
+        createLaunch: async () => {
+          const base = transport(session, () => { containments++; });
+          return { ...base, ready: async () => { await preparing.enterAndWait(); } };
+        },
+      }),
+      prepareSend: async () => { throw new Error("unused"); },
+    } });
+
+    const spawning = c.spawn({ task: "one" });
+    await preparing.entered;
+    let shutdownSettled = false;
+    const shuttingDown = c.shutdown().then(() => { shutdownSettled = true; });
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+    preparing.release();
+
+    await expect(spawning).resolves.toMatchObject({ state: AgentState.Running });
+    await expect(shuttingDown).resolves.toBeUndefined();
+    expect(containments).toBe(1);
+    expect(c.runs.snapshot(session.agentId)).toMatchObject({ state: AgentState.Stopped });
+    expect(c.runs.activeCount()).toBe(0);
+  });
+
+  test("shutdown closes admission before spawn", async () => {
+    const containing = testBarrier("shutdown-containment");
+    const counters = { prepare: 0, createSession: 0, createLaunch: 0 };
+    const id = agentId("closed-before-spawn");
+    const c = new SubagentController({ capacity: 1, composition: {
+      prepareSpawn: async () => {
+        counters.prepare++;
+        return { selection: TEST_SELECTION, createSession: async () => { counters.createSession++; throw new Error("must not create a session"); },
+          persistSpawned: async () => {}, createLaunch: async () => { counters.createLaunch++; throw new Error("must not launch"); } };
+      },
+      prepareSend: async () => { throw new Error("unused"); },
+    } });
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/closed-before-spawn"),
+      runtime: { abort: async () => {}, contain: async () => { await containing.enterAndWait(); return testVerifiedReceiptPath("/tmp/pi-subagents-test/closed-before-spawn.receipt"); } } }]);
+
+    const shuttingDown = c.shutdown();
+    await containing.entered;
+    await expect(c.spawn({ task: "one" })).rejects.toThrow("invalid_state:");
+    containing.release();
+
+    await expect(shuttingDown).resolves.toBeUndefined();
+    expect(counters).toEqual({ prepare: 0, createSession: 0, createLaunch: 0 });
+    expect(c.runs.activeCount()).toBe(0);
+  });
+
+  test("send admission enters before shutdown", async () => {
+    const admitting = testBarrier("send-admission");
+    let containments = 0;
+    const id = agentId("send-admission-first");
+    const session = surrenderSession("send-admission-first");
+    const c = new SubagentController({ capacity: 1, composition: {
+      prepareSpawn: async () => { throw new Error("unused"); },
+      prepareSend: async () => ({ session: { ...session, agentId: id }, createLaunch: async () => {
+        const base = transport({ ...session, agentId: id }, () => { containments++; });
+        return { ...base, ready: async () => { await admitting.enterAndWait(); } };
+      } }),
+    } });
+    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: session.transcriptPath });
+
+    const sending = c.sendInput(id, "next");
+    await admitting.entered;
+    let shutdownSettled = false;
+    const shuttingDown = c.shutdown().then(() => { shutdownSettled = true; });
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+    admitting.release();
+
+    await expect(sending).resolves.toMatchObject({ state: AgentState.Running });
+    await expect(shuttingDown).resolves.toBeUndefined();
+    expect(containments).toBe(1);
+    expect(c.runs.snapshot(id)).toMatchObject({ state: AgentState.Stopped });
+    expect(c.runs.activeCount()).toBe(0);
+  });
+
+  test("shutdown closes admission before send", async () => {
+    const containing = testBarrier("shutdown-containment-before-send");
+    const counters = { prepare: 0, createLaunch: 0 };
+    const id = agentId("closed-before-send");
+    const idle = agentId("idle-before-send");
+    const c = new SubagentController({ capacity: 2, composition: {
+      prepareSpawn: async () => { throw new Error("unused"); },
+      prepareSend: async () => {
+        counters.prepare++;
+        return { session: surrenderSession("closed-before-send"), createLaunch: async () => { counters.createLaunch++; throw new Error("must not launch"); } };
+      },
+    } });
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/closed-before-send"),
+      runtime: { abort: async () => {}, contain: async () => { await containing.enterAndWait(); return testVerifiedReceiptPath("/tmp/pi-subagents-test/closed-before-send.receipt"); } } }]);
+    c.runs.register({ agentId: idle, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/idle-before-send") });
+
+    const shuttingDown = c.shutdown();
+    await containing.entered;
+    await expect(c.sendInput(idle, "next")).rejects.toThrow("invalid_state:");
+    containing.release();
+
+    await expect(shuttingDown).resolves.toBeUndefined();
+    expect(counters).toEqual({ prepare: 0, createLaunch: 0 });
+    expect(c.runs.activeCount()).toBe(0);
+  });
+
+  test("native identity is adopted before shutdown", async () => {
+    const adopted = testBarrier("post-identity-adoption");
+    let containments = 0;
+    const session = surrenderSession("identity-before-shutdown");
+    const c = new SubagentController({ capacity: 1, composition: {
+      prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {},
+        createLaunch: async () => {
+          const base = transport(session, () => { containments++; });
+          return { ...base, persistRunStarted: async () => { await adopted.enterAndWait(); } };
+        } }),
+      prepareSend: async () => { throw new Error("unused"); },
+    } });
+
+    const spawning = c.spawn({ task: "one" });
+    await adopted.entered;
+    const shuttingDown = c.shutdown();
+    adopted.release();
+
+    const started = await spawning;
+    if (started.state !== AgentState.Running) throw new Error(`expected a running spawn, got ${started.state}`);
+    await expect(shuttingDown).resolves.toBeUndefined();
+    expect(c.runs.snapshot(session.agentId)).toMatchObject({ state: AgentState.Stopped, runId: started.runId });
+    expect(containments).toBe(1);
+    expect(c.runs.activeCount()).toBe(0);
+  });
+
+  test("shutdown begins before native identity adoption", async () => {
+    const identifying = testBarrier("pre-identity-adoption");
+    let containments = 0;
+    const session = surrenderSession("shutdown-before-identity");
+    const c = new SubagentController({ capacity: 1, composition: {
+      prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {},
+        createLaunch: async () => {
+          const base = transport(session, () => { containments++; });
+          return { ...base, getEntries: async (since?: string | null) => {
+            if (since !== undefined) await identifying.enterAndWait();
+            return base.getEntries(since);
+          } };
+        } }),
+      prepareSend: async () => { throw new Error("unused"); },
+    } });
+
+    const spawning = c.spawn({ task: "one" });
+    await identifying.entered;
+    const shuttingDown = c.shutdown();
+    identifying.release();
+
+    await expect(spawning).resolves.toMatchObject({ state: AgentState.Running });
+    await expect(shuttingDown).resolves.toBeUndefined();
+    expect(c.runs.snapshot(session.agentId)).toMatchObject({ state: AgentState.Stopped });
+    expect(containments).toBe(1);
+    expect(c.runs.activeCount()).toBe(0);
+  });
+
   test("shutdownStart runs before active runtime abort and containment", async () => {
     const trace: string[] = [];
     const id = agentId("shutdown-hook-order");
@@ -321,8 +519,8 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { trace.push("shutdownStart"); },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/hook-order" as never,
-      runtime: { abort: async () => { trace.push("abort"); }, contain: async () => { trace.push("contain"); return "/tmp/hook-order.receipt" as never; } } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-order"),
+      runtime: { abort: async () => { trace.push("abort"); }, contain: async () => { trace.push("contain"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-order.receipt"); } } }]);
 
     await c.shutdown();
 
@@ -338,8 +536,8 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { starts++; },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/hook-concurrent" as never,
-      runtime: { abort: async () => {}, contain: async () => { await contain.promise; return "/tmp/hook-concurrent.receipt" as never; } } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-concurrent"),
+      runtime: { abort: async () => {}, contain: async () => { await contain.promise; return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-concurrent.receipt"); } } }]);
 
     const first = c.shutdown();
     const second = c.shutdown();
@@ -359,8 +557,8 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { starts++; },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/hook-retry" as never,
-      runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("still alive"); return "/tmp/hook-retry.receipt" as never; } } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-retry"),
+      runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("still alive"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-retry.receipt"); } } }]);
 
     await expect(c.shutdown()).rejects.toThrow("containment_failed:");
     await expect(c.shutdown()).resolves.toBeUndefined();
@@ -377,8 +575,8 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { trace.push("shutdownStart"); throw new Error("UI cleanup failed"); },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/hook-throws" as never,
-      runtime: { abort: async () => { trace.push("abort"); }, contain: async () => { trace.push("contain"); return "/tmp/hook-throws.receipt" as never; } } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-throws"),
+      runtime: { abort: async () => { trace.push("abort"); }, contain: async () => { trace.push("contain"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-throws.receipt"); } } }]);
 
     await expect(c.shutdown()).resolves.toBeUndefined();
     expect(trace).toEqual(["shutdownStart", "abort", "contain"]);
@@ -406,8 +604,8 @@ describe("parent lifecycle wiring", () => {
     let containments = 0;
     const id = agentId("shutdown-retry");
     const c = new SubagentController({ capacity: 1 });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/retry" as never,
-      runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("raw containment detail"); return "/tmp/retry.receipt" as never; } } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/retry"),
+      runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("raw containment detail"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/retry.receipt"); } } }]);
 
     const first = c.shutdown();
     const concurrent = c.shutdown();
@@ -429,10 +627,10 @@ describe("parent lifecycle wiring", () => {
     let rejected = false;
     const c = new SubagentController({ capacity: 2 });
     c.runs.restore([
-      { agentId: agentId("shutdown-fails"), runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/fails" as never,
+      { agentId: agentId("shutdown-fails"), runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/fails"),
         runtime: { abort: async () => {}, contain: async () => { throw new Error("raw failure"); } } },
-      { agentId: agentId("shutdown-waits"), runId: runId("cafebabe"), state: AgentState.Running, transcriptPath: "/tmp/waits" as never,
-        runtime: { abort: async () => {}, contain: async () => { await gate.promise; return "/tmp/waits.receipt" as never; } } },
+      { agentId: agentId("shutdown-waits"), runId: runId("cafebabe"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/waits"),
+        runtime: { abort: async () => {}, contain: async () => { await gate.promise; return testVerifiedReceiptPath("/tmp/pi-subagents-test/waits.receipt"); } } },
     ]);
 
     const shutdown = c.shutdown().catch((error: Error) => { rejected = true; throw error; });
@@ -451,11 +649,11 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       finaliseRun: async (record) => {
         if (++terminalAttempts === 1) throw new Error("raw append detail");
-        return { agentId: record.agentId, runId: record.runId!, state: CompletionState.Cancelled, reason: "parent_shutdown" as const, output: truncateUtf8("", 50_000), outputPath: "/tmp/result.md" as never, transcriptPath: record.transcriptPath };
+        return { agentId: record.agentId, runId: record.runId!, state: CompletionState.Cancelled, reason: "parent_shutdown" as const, output: truncateUtf8("", 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/result.md"), transcriptPath: record.transcriptPath };
       },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Settling, transcriptPath: "/tmp/terminal" as never,
-      runtime: { abort: async () => {}, contain: async () => "/tmp/terminal.receipt" as never } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/terminal"),
+      runtime: testRuntime({ contain: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/terminal.receipt") }) }]);
 
     await expect(c.shutdown()).rejects.toThrow("terminal_persistence_failed: child was contained but its terminal record could not be persisted");
     expect(c.runs.snapshot(id)?.state).toBe(AgentState.Settling);
@@ -473,8 +671,8 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       finaliseRun: async () => { throw new Error("raw append detail"); },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: "/tmp/terminal-code" as never,
-      runtime: { abort: async () => {}, contain: async () => { containments++; return "/tmp/terminal-code.receipt" as never; } } }]);
+    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/terminal-code"),
+      runtime: { abort: async () => {}, contain: async () => { containments++; return testVerifiedReceiptPath("/tmp/pi-subagents-test/terminal-code.receipt"); } } }]);
 
     const outcome = await c.stop(id);
 
@@ -512,24 +710,24 @@ describe("parent lifecycle wiring", () => {
     const launchGate = deferred<void>();
     const launchEntered = deferred<void>();
     const session: LaunchSession = {
-      agentId: agentId("admitted"), transcriptPath: "/tmp/admitted" as never,
-      previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never,
+      agentId: agentId("admitted"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/admitted"),
+      previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r"),
     };
     const c = new SubagentController({ capacity: 1, restoration: {
-      stateRoot: "/tmp" as never, getBranch: () => [], resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
+      stateRoot: testAbsolutePath("/tmp"), getBranch: () => [], resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
       finaliseContained: async () => { throw new Error("unused"); },
-      appender: { appendRunStarted: async () => {}, appendRunCompleted: async () => {} } as never,
+      appender: testRestorationPort().appender,
     }, composition: {
       prepareSpawn: async () => ({
         selection: TEST_SELECTION,
         createSession: async () => session,
         persistSpawned: async () => {},
         createLaunch: async () => ({
-          containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+          containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
           ready: async () => { launchEntered.resolve(); await launchGate.promise; throw new Error("launch failed"); },
           persistLaunchRequested: async () => {}, start: async () => {}, getEntries: async () => ({ entries: [], leafId: null }),
           prompt: async () => {}, waitForAgentStart: async () => {}, bindRun: () => {}, persistRunStarted: async () => {}, waitSettled: () => new Promise<never>(() => {}),
-          runtime: { abort: async () => {}, contain: async () => "/tmp/r" as never },
+          runtime: testRuntime({ contain: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/r") }),
         }),
       }),
       prepareSend: async () => { throw new Error("unused"); },
@@ -546,33 +744,6 @@ describe("parent lifecycle wiring", () => {
     expect(c.runs.activeCount()).toBe(0);
   });
 
-  test("shutdown joins an admitted send before stopping its accepted run", async () => {
-    const gate = deferred<void>();
-    const entered = deferred<void>();
-    const id = agentId("existing");
-    const session: LaunchSession = { agentId: id, transcriptPath: "/tmp/existing" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never };
-    const c = new SubagentController({ composition: {
-      prepareSpawn: async () => { throw new Error("unused"); },
-      prepareSend: async () => ({ session, createLaunch: async () => ({
-        containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
-        ready: async () => { entered.resolve(); await gate.promise; }, persistLaunchRequested: async () => {}, start: async () => {},
-        getEntries: async (since?: string | null) => since === undefined ? { entries: [], leafId: null } : { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: "next" } }], leafId: "deadbeef" },
-        prompt: async () => {}, waitForAgentStart: async () => {}, bindRun: () => {}, persistRunStarted: async () => {}, waitSettled: () => new Promise<never>(() => {}),
-        runtime: { abort: async () => {}, contain: async () => "/tmp/r" as never },
-      }) }),
-    } });
-    c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: session.transcriptPath });
-    const sending = c.sendInput(id, "next");
-    await entered.promise;
-    let shutDown = false;
-    const shutdown = c.shutdown().then(() => { shutDown = true; });
-    await Promise.resolve();
-    expect(shutDown).toBeFalse();
-    gate.resolve();
-    await Promise.all([sending, shutdown]);
-    expect(c.runs.activeCount()).toBe(0);
-  });
-
   test("controller owns the exact launch transaction and returns running before immediate settlement", async () => {
     const trace: string[] = [];
     let statusRefreshed!: () => void;
@@ -580,11 +751,11 @@ describe("parent lifecycle wiring", () => {
     let settle!: (value: { reason: "agent_settled"; stopReason: "stop" }) => void;
     const settled = new Promise<{ reason: "agent_settled"; stopReason: "stop" }>((resolve) => { settle = resolve; });
     const session: LaunchSession = {
-      agentId: agentId("agent-a"), transcriptPath: "/tmp/a" as never,
-      previousLeafId: null, attemptId: "attempt-a" as never,
-      containmentReceiptPath: "/tmp/receipt" as never,
+      agentId: agentId("agent-a"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"),
+      previousLeafId: null, attemptId: testAttemptId("attempt-a"),
+      containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/receipt"),
     };
-    const containment = { backend: "cgroup-v2" as const, scopePath: "/tmp/cgroups/attempt-a" as never };
+    const containment = { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/cgroups/attempt-a") };
     const transport: LaunchTransport = {
       containment,
       ready: async () => { trace.push("watchdog:ready"); },
@@ -604,7 +775,7 @@ describe("parent lifecycle wiring", () => {
       bindRun: () => { trace.push("output:bind_run"); },
       persistRunStarted: async () => { trace.push("persist:run_started"); settle({ reason: "agent_settled", stopReason: "stop" }); },
       waitSettled: () => settled,
-      runtime: { abort: async () => {}, contain: async () => "/tmp/receipt" as never },
+      runtime: testRuntime({ contain: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/receipt") }),
     };
     const c = new SubagentController({ composition: {
       prepareSpawn: async () => ({
@@ -646,7 +817,7 @@ describe("parent lifecycle wiring", () => {
     let literal = "";
     const session = surrenderSession("strict-identity");
     const transport: LaunchTransport = {
-      containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+      containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
       ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
       getEntries: async (since?: string | null) => {
         if (since === undefined) return { entries: [], leafId: "baseline" };
@@ -688,7 +859,7 @@ describe("parent lifecycle wiring", () => {
     let started = false;
     const c = new SubagentController({ composition: {
       prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {}, createLaunch: async () => ({
-        containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+        containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
         ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
         getEntries: async (since?: string | null) => since === undefined ? { entries: [], leafId: "baseline" } : {
           entries: [
@@ -720,7 +891,7 @@ describe("parent lifecycle wiring", () => {
       let containments = 0;
       const block = (): Promise<never> => new Promise<never>(() => {});
       const transport: LaunchTransport = {
-        containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+        containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
         ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
         getEntries: async (since?: string | null) => {
           if (since === undefined) {
@@ -773,14 +944,14 @@ describe("parent lifecycle wiring", () => {
     const composition = {
       prepareSpawn: async () => ({
         selection: TEST_SELECTION,
-        createSession: async () => ({ agentId: agentId(`agent-${++creations}`), transcriptPath: "/tmp/a" as never, previousLeafId: null, attemptId: "attempt" as never, containmentReceiptPath: "/tmp/r" as never }),
+        createSession: async () => ({ agentId: agentId(`agent-${++creations}`), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r") }),
         persistSpawned: async () => {},
         createLaunch: async () => ({
-          containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+          containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
           ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
           getEntries: async (since?: string | null) => since === undefined ? { entries: [], leafId: null } : { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: "one" } }], leafId: "deadbeef" },
           prompt: async () => {}, waitForAgentStart: async () => {}, bindRun: () => {}, persistRunStarted: async () => {}, waitSettled: () => new Promise<never>(() => {}),
-          runtime: { abort: async () => {}, contain: async () => "/tmp/r" as never },
+          runtime: testRuntime({ contain: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/r") }),
         }),
       }),
       prepareSend: async () => { throw new Error("unused"); },
@@ -797,14 +968,14 @@ describe("parent lifecycle wiring", () => {
 
   test("failure before native user identity contains, returns stopped, creates no completion, and releases once", async () => {
     const trace: string[] = [];
-    const session: LaunchSession = { agentId: agentId("agent-failed"), transcriptPath: "/tmp/f" as never, previousLeafId: null, attemptId: "attempt-f" as never, containmentReceiptPath: "/tmp/f.receipt" as never };
+    const session: LaunchSession = { agentId: agentId("agent-failed"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/f"), previousLeafId: null, attemptId: testAttemptId("attempt-f"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/f.receipt") };
     const c = new SubagentController({ capacity: 1, composition: {
       prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {}, createLaunch: async () => ({
-        containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+        containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
         ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
         getEntries: async () => { throw new Error("transport detail must not escape"); }, prompt: async () => {}, waitForAgentStart: async () => {}, bindRun: () => {}, persistRunStarted: async () => {},
         waitSettled: () => new Promise<never>(() => {}),
-        runtime: { abort: async () => {}, contain: async () => { trace.push("contain"); return "/tmp/f.receipt" as never; } },
+        runtime: { abort: async () => {}, contain: async () => { trace.push("contain"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/f.receipt"); } },
       }) }), prepareSend: async () => { throw new Error("unused"); },
     } });
 
@@ -818,14 +989,14 @@ describe("parent lifecycle wiring", () => {
 
   test("pre-native-ID containment failure retains ownership and capacity for receipt retry", async () => {
     let containments = 0;
-    const session: LaunchSession = { agentId: agentId("agent-retained"), transcriptPath: "/tmp/f" as never, previousLeafId: null, attemptId: "attempt-f" as never, containmentReceiptPath: "/tmp/f.receipt" as never };
+    const session: LaunchSession = { agentId: agentId("agent-retained"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/f"), previousLeafId: null, attemptId: testAttemptId("attempt-f"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/f.receipt") };
     const c = new SubagentController({ capacity: 1, composition: {
       prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {}, createLaunch: async () => ({
-        containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+        containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
         ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
         getEntries: async () => { throw new Error("raw transport detail"); }, prompt: async () => {}, waitForAgentStart: async () => {}, bindRun: () => {}, persistRunStarted: async () => {},
         waitSettled: () => new Promise<never>(() => {}),
-        runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("still alive"); return "/tmp/f.receipt" as never; } },
+        runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("still alive"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/f.receipt"); } },
       }) }), prepareSend: async () => { throw new Error("unused"); },
     } });
     const failed = await c.spawn({ task: "assignment" });
@@ -843,7 +1014,7 @@ describe("parent lifecycle wiring", () => {
       const createLaunch = (surrender: (runtime: RunRuntime) => void): Promise<LaunchTransport> => {
         surrender({ abort: async () => {}, contain: async () => {
           if (++containments === 1) throw new Error("process group still alive");
-          return session.containmentReceiptPath as never;
+          return testVerifiedReceiptPath(String(session.containmentReceiptPath));
         } });
         throw new Error("raw spawn detail after process-group creation");
       };
@@ -871,7 +1042,7 @@ describe("parent lifecycle wiring", () => {
       const trace: string[] = [];
       const session = surrenderSession(`contained-${operation}`);
       const createLaunch = (surrender: (runtime: RunRuntime) => void): Promise<LaunchTransport> => {
-        surrender({ abort: async () => {}, contain: async () => { trace.push("contain"); return session.containmentReceiptPath as never; } });
+        surrender({ abort: async () => {}, contain: async () => { trace.push("contain"); return testVerifiedReceiptPath(String(session.containmentReceiptPath)); } });
         throw new Error("raw spawn detail after process-group creation");
       };
       const c = new SubagentController({ capacity: 1, composition: {
@@ -894,14 +1065,14 @@ describe("parent lifecycle wiring", () => {
       const trace: string[] = [];
       let startedAttempts = 0;
       let launchNumber = 0;
-      const session: LaunchSession = { agentId: agentId(`post-id-${seam}`), transcriptPath: "/tmp/post-id" as never,
-        previousLeafId: null, attemptId: "attempt-post-id" as never, containmentReceiptPath: "/tmp/post-id.receipt" as never };
+      const session: LaunchSession = { agentId: agentId(`post-id-${seam}`), transcriptPath: testSessionPath("/tmp/pi-subagents-test/post-id"),
+        previousLeafId: null, attemptId: testAttemptId("attempt-post-id"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/post-id.receipt") };
       const makeTransport = (): LaunchTransport => {
         const current = launchNumber++;
         const currentRunId = current === 0 ? "deadbeef" : "cafebabe";
         let assignment = "";
         return {
-          containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+          containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
           ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
           getEntries: async (since?: string | null) => since === undefined
             ? { entries: [], leafId: null }
@@ -917,18 +1088,18 @@ describe("parent lifecycle wiring", () => {
             if (current === 0 && seam === "waitSettled") throw new Error("raw callback secret");
             return new Promise<never>(() => {});
           },
-          runtime: { abort: async () => {}, contain: async () => { trace.push(`contain:${currentRunId}`); return session.containmentReceiptPath as never; } },
+          runtime: { abort: async () => {}, contain: async () => { trace.push(`contain:${currentRunId}`); return testVerifiedReceiptPath(String(session.containmentReceiptPath)); } },
         };
       };
       const c = new SubagentController({ composition: {
         prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {}, createLaunch: async () => makeTransport() }),
-        prepareSend: async () => ({ session: { ...session, previousLeafId: "deadbeef" as never, attemptId: "attempt-next" as never }, createLaunch: async () => makeTransport() }),
+        prepareSend: async () => ({ session: { ...session, previousLeafId: testEntryId("deadbeef"), attemptId: testAttemptId("attempt-next") }, createLaunch: async () => makeTransport() }),
         finaliseRun: async (record, settlement) => {
           trace.push(`completed:${record.runId}:${settlement.kind}`);
           if (settlement.kind !== "failed") throw new Error("expected failed settlement");
           return { agentId: record.agentId, runId: record.runId!, state: CompletionState.Failed,
             error: settlement.cause, output: truncateUtf8("", 50_000),
-            outputPath: "/tmp/post-id.output.md" as never, transcriptPath: record.transcriptPath };
+            outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/post-id.output.md"), transcriptPath: record.transcriptPath };
         },
       } });
 
@@ -954,18 +1125,18 @@ describe("parent lifecycle wiring", () => {
     let completions = 0;
     let containments = 0;
     const trace: string[] = [];
-    const session: LaunchSession = { agentId: agentId("post-id-retry"), transcriptPath: "/tmp/post-id-retry" as never,
-      previousLeafId: null, attemptId: "attempt-post-id-retry" as never, containmentReceiptPath: "/tmp/post-id-retry.receipt" as never };
+    const session: LaunchSession = { agentId: agentId("post-id-retry"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/post-id-retry"),
+      previousLeafId: null, attemptId: testAttemptId("attempt-post-id-retry"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/post-id-retry.receipt") };
     const c = new SubagentController({ composition: {
       prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {}, createLaunch: async () => ({
-        containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+        containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
         ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
         getEntries: async (since?: string | null) => since === undefined ? { entries: [], leafId: null }
           : { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: "first" } }], leafId: "deadbeef" },
         prompt: async () => {}, waitForAgentStart: async () => {}, bindRun: () => {},
         persistRunStarted: async () => { trace.push("started"); if (++persistAttempts < 3) throw new Error("raw persistence detail"); },
         waitSettled: () => new Promise<never>(() => {}),
-        runtime: { abort: async () => {}, contain: async () => { trace.push("contain"); containments++; return session.containmentReceiptPath as never; } },
+        runtime: { abort: async () => {}, contain: async () => { trace.push("contain"); containments++; return testVerifiedReceiptPath(String(session.containmentReceiptPath)); } },
       }) }),
       prepareSend: async () => { throw new Error("unused"); },
       finaliseRun: async (record, settlement) => {
@@ -973,7 +1144,7 @@ describe("parent lifecycle wiring", () => {
         completions++;
         if (settlement.kind !== "failed") throw new Error("expected failure");
         return { agentId: record.agentId, runId: record.runId!, state: CompletionState.Failed, error: settlement.cause,
-          output: truncateUtf8("", 50_000), outputPath: "/tmp/post-id-retry.output.md" as never, transcriptPath: record.transcriptPath };
+          output: truncateUtf8("", 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/post-id-retry.output.md"), transcriptPath: record.transcriptPath };
       },
     } });
 
@@ -991,18 +1162,18 @@ describe("parent lifecycle wiring", () => {
 
   test("permanent post-identity RunStarted failure contains once and retains the terminal obligation", async () => {
     const trace: string[] = [];
-    const session: LaunchSession = { agentId: agentId("post-id-permanent"), transcriptPath: "/tmp/post-id-permanent" as never,
-      previousLeafId: null, attemptId: "attempt-post-id-permanent" as never, containmentReceiptPath: "/tmp/post-id-permanent.receipt" as never };
+    const session: LaunchSession = { agentId: agentId("post-id-permanent"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/post-id-permanent"),
+      previousLeafId: null, attemptId: testAttemptId("attempt-post-id-permanent"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/post-id-permanent.receipt") };
     const c = new SubagentController({ composition: {
       prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {}, createLaunch: async () => ({
-        containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+        containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
         ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
         getEntries: async (since?: string | null) => since === undefined ? { entries: [], leafId: null }
           : { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: "first" } }], leafId: "deadbeef" },
         prompt: async () => {}, waitForAgentStart: async () => {}, bindRun: () => {},
         persistRunStarted: async () => { trace.push("started"); throw new Error("permanent append failure"); },
         waitSettled: () => new Promise<never>(() => {}),
-        runtime: { abort: async () => {}, contain: async () => { trace.push("contain"); return session.containmentReceiptPath as never; } },
+        runtime: { abort: async () => {}, contain: async () => { trace.push("contain"); return testVerifiedReceiptPath(String(session.containmentReceiptPath)); } },
       }) }),
       prepareSend: async () => { throw new Error("unused"); },
       finaliseRun: async () => { trace.push("completed"); throw new Error("must not finalise"); },
@@ -1019,27 +1190,24 @@ describe("parent lifecycle wiring", () => {
     expect(c.completions.queuedCount()).toBe(0);
   });
 
-  test("post-ID failures beat spawn/send stop/shutdown races in 120 deterministic schedules", async () => {
-    const seams = ["bindRun", "persistRunStarted", "waitSettled"] as const;
-    for (const seam of seams) for (const operation of ["spawn", "send"] as const) {
-      for (const contender of ["stop", "shutdown"] as const) for (let repeat = 0; repeat < 10; repeat++) {
-        const suffix = `${seam}-${operation}-${contender}-${repeat}`;
+  for (const seam of postIdentitySeams) for (const operation of ["spawn", "send"] as const) {
+    for (const contender of ["stop", "shutdown"] as const) {
+      test(`post-identity ${seam} failure owns settlement before the ${operation} ${contender} contender`, async () => {
+        const suffix = `${seam}-${operation}-${contender}`;
         const id = agentId(`race-${suffix}`);
-        const session: LaunchSession = { agentId: id, transcriptPath: `/tmp/${suffix}` as never,
-          previousLeafId: null, attemptId: `attempt-${suffix}` as never, containmentReceiptPath: `/tmp/${suffix}.receipt` as never };
-        const entered = deferred<void>();
-        const release = deferred<void>();
+        const session: LaunchSession = { agentId: id, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${suffix}`),
+          previousLeafId: null, attemptId: testAttemptId(`attempt-${suffix}`), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${suffix}.receipt`) };
+        const admitted = testBarrier(`post-identity-${suffix}`);
         const trace: string[] = [];
         let startedAttempts = 0;
         const makeTransport = (): LaunchTransport => {
           let assignment = "";
           return {
-          containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+          containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
           ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
           getEntries: async (since?: string | null) => {
             if (since === undefined) return { entries: [], leafId: null };
-            entered.resolve();
-            await release.promise;
+            await admitted.enterAndWait();
             return { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: assignment } }], leafId: "deadbeef" };
           },
           prompt: async (message) => { assignment = message; },
@@ -1052,7 +1220,7 @@ describe("parent lifecycle wiring", () => {
           waitSettled: () => { if (seam === "waitSettled") throw new Error("subscription failed"); return new Promise<never>(() => {}); },
           runtime: {
             abort: async () => { trace.push("abort"); },
-            contain: async () => { trace.push("contain"); return session.containmentReceiptPath as never; },
+            contain: async () => { trace.push("contain"); return testVerifiedReceiptPath(String(session.containmentReceiptPath)); },
           },
         };
         };
@@ -1064,14 +1232,14 @@ describe("parent lifecycle wiring", () => {
             trace.push(`completed:${settlement.kind}`);
             if (settlement.kind !== "failed") throw new Error("expected failed settlement");
             return { agentId: record.agentId, runId: record.runId!, state: CompletionState.Failed, error: settlement.cause,
-              output: truncateUtf8("", 50_000), outputPath: `/tmp/${suffix}.output.md` as never, transcriptPath: record.transcriptPath };
+              output: truncateUtf8("", 50_000), outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${suffix}.output.md`), transcriptPath: record.transcriptPath };
           },
         } });
         if (operation === "send") c.runs.register({ agentId: id, state: AgentState.Stopped, transcriptPath: session.transcriptPath });
         const launching = operation === "spawn" ? c.spawn({ task: "first" }) : c.sendInput(id, "next");
-        await entered.promise;
+        await admitted.entered;
         const competing = contender === "stop" ? c.stop(id) : c.shutdown();
-        release.resolve();
+        admitted.release();
 
         await expect(launching).resolves.toMatchObject({ agentId: id, runId: runId("deadbeef"), state: AgentState.Settling, error: { code: "spawn_failed" } });
         if (contender === "stop") await expect(competing).resolves.toMatchObject({ agentId: id, state: "already_stopped" });
@@ -1084,9 +1252,9 @@ describe("parent lifecycle wiring", () => {
         expect(c.runs.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
         expect(c.runs.activeCount()).toBe(0);
         expect((await c.receive()).completions).toEqual([expect.objectContaining({ runId: runId("deadbeef"), state: CompletionState.Failed })]);
-      }
+      });
     }
-  });
+  }
 
   test("runtime back-pings use followUp while busy and triggerTurn while idle, once per epoch", async () => {
     const sent: object[] = [];
@@ -1115,7 +1283,7 @@ describe("parent lifecycle wiring", () => {
   test("restoration emits nextTurn without triggering a turn", async () => {
     const sent: object[] = [];
     const c = new SubagentController({ parent: { isBusy: () => false, sendMessage: async (_text, options) => { sent.push(options); } } });
-    c.completions.restore([{ agentId: agentId("a"), state: AgentState.Stopped, sessionPath: "/tmp/a" as never, latestCompletion: completion("deadbeef") }]);
+    c.completions.restore([{ agentId: agentId("a"), state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion("deadbeef") }]);
     await c.notifyRestored(1);
     expect(sent).toEqual([{ deliverAs: "nextTurn", triggerTurn: false }]);
   });
@@ -1123,7 +1291,7 @@ describe("parent lifecycle wiring", () => {
   test("tree blocks active ownership and switch/fork warn", async () => {
     const warnings: string[] = [];
     const c = new SubagentController({ parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => { warnings.push(message); } } });
-    c.runs.restore([{ agentId: agentId("a"), state: AgentState.Running, transcriptPath: "/tmp/a" as never, runId: runId("deadbeef") }]);
+    c.runs.restore([{ agentId: agentId("a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: runId("deadbeef") }]);
     expect(c.beforeTree()).toBeFalse();
     expect(c.beforeSwitch()).toBeTrue();
     expect(c.beforeFork()).toBeTrue();
@@ -1132,9 +1300,14 @@ describe("parent lifecycle wiring", () => {
 });
 
 function completion(id: string) {
-  return { agentId: agentId("a"), runId: runId(id), state: CompletionState.Completed, output: truncateUtf8("ok", 50_000), outputPath: `/tmp/${id}.md` as never, transcriptPath: "/tmp/a" as never };
+  return completedCompletion({
+    agentId: testAgentId("a"),
+    runId: testRunId(id),
+    output: truncateUtf8("ok", 50_000),
+    outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${id}.md`),
+    transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"),
+  });
 }
-function deferred<T>() { let resolve!: (value: T | PromiseLike<T>) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }
 function unresolvedContainment() {
   return {
     kind: "unresolved-historical" as const,
@@ -1143,16 +1316,17 @@ function unresolvedContainment() {
 }
 
 function surrenderSession(suffix: string): LaunchSession {
-  return { agentId: agentId(`agent-${suffix}`), transcriptPath: `/tmp/${suffix}` as never, previousLeafId: null,
-    attemptId: `attempt-${suffix}` as never, containmentReceiptPath: `/tmp/${suffix}.receipt` as never };
+  return launchSession(suffix, {
+    transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${suffix}`),
+    containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${suffix}.receipt`),
+  });
 }
 function transport(session: LaunchSession, contained: () => void): LaunchTransport {
-  let assignment = "";
-  return {
-    containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
-    ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
-    getEntries: async (since?: string | null) => since === undefined ? { entries: [], leafId: null } : { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: assignment } }], leafId: "deadbeef" },
-    prompt: async (message) => { assignment = message; }, waitForAgentStart: async () => {}, bindRun: () => {}, persistRunStarted: async () => {}, waitSettled: () => new Promise<never>(() => {}),
-    runtime: { abort: async () => {}, contain: async () => { contained(); return verifiedContainmentReceiptPath(session.containmentReceiptPath); } },
-  };
+  return runningTransport(session, {
+    waitSettled: () => new Promise<never>(() => {}),
+    runtime: testRuntime({ contain: async () => {
+      contained();
+      return testVerifiedReceiptPath(String(session.containmentReceiptPath));
+    } }),
+  });
 }

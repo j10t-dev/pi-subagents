@@ -11,17 +11,20 @@
  * this module to Pi's internal implementation layout instead of its published surface.
  */
 import { Type } from "typebox";
-import type { Static, TLiteral, TSchema, TUnion } from "typebox";
+import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
 
-import { UsageSchema } from "./schemas.ts";
-
-type LiteralSchemas<T extends readonly string[]> = {
-  -readonly [K in keyof T]: TLiteral<T[K]>;
-};
-
-const literalUnion = <const T extends readonly string[]>(values: T): TUnion<LiteralSchemas<T>> =>
-  Type.Union(values.map((value) => Type.Literal(value)) as TSchema[]) as TUnion<LiteralSchemas<T>>;
+import {
+  AssistantMessageSchema,
+  ExtensionUIDialogSchema,
+  ExtensionUINotificationSchema,
+  literalUnion,
+} from "./schemas.ts";
+import type {
+  WireAssistantMessage,
+  WireExtensionUIDialog,
+  WireExtensionUINotification,
+} from "./schemas.ts";
 
 // --- Commands this extension issues, and their correlated responses -------
 
@@ -66,22 +69,7 @@ const FailureResponseSchema = Type.Object({
 
 const ResponseSchema = Type.Union([SuccessResponseSchema, FailureResponseSchema]);
 
-// --- Assistant message shape (only the fields output/usage recovery need) -
-
-const TextContentSchema = Type.Object({
-  type: Type.Literal("text"),
-  text: Type.String(),
-});
-
-const AssistantMessageSchema = Type.Object({
-  role: Type.Literal("assistant"),
-  content: Type.Array(Type.Record(Type.String(), Type.Unknown())),
-  usage: UsageSchema,
-  stopReason: Type.String(),
-  errorMessage: Type.Optional(Type.String()),
-  timestamp: Type.Optional(Type.Number()),
-});
-export type WireAssistantMessage = Static<typeof AssistantMessageSchema>;
+// --- Assistant messages and UI requests use schemas owned by schemas.ts ------
 
 const MessageStartEventSchema = Type.Object({
   type: Type.Literal("message_start"),
@@ -115,95 +103,6 @@ const AgentStartEventSchema = Type.Object(
   { type: Type.Literal("agent_start") },
   { additionalProperties: false },
 );
-
-// --- Extension UI requests this extension can forward or must cancel ------
-
-const SelectUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("select"),
-  title: Type.String(),
-  options: Type.Array(Type.String()),
-  timeout: Type.Optional(Type.Number()),
-});
-
-const ConfirmUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("confirm"),
-  title: Type.String(),
-  message: Type.String(),
-  timeout: Type.Optional(Type.Number()),
-});
-
-const InputUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("input"),
-  title: Type.String(),
-  placeholder: Type.Optional(Type.String()),
-  timeout: Type.Optional(Type.Number()),
-});
-
-// Pi exposes editor on the public `ExtensionContext.ui`; no internal import is needed.
-const EditorUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("editor"),
-  title: Type.String(),
-  prefill: Type.Optional(Type.String()),
-});
-
-const ExtensionUIDialogSchema = Type.Union([
-  SelectUIRequestSchema,
-  ConfirmUIRequestSchema,
-  InputUIRequestSchema,
-  EditorUIRequestSchema,
-]);
-export type WireExtensionUIDialog = Static<typeof ExtensionUIDialogSchema>;
-
-const NotifyUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("notify"),
-  message: Type.String(),
-  notifyType: Type.Optional(literalUnion(["info", "warning", "error"] as const)),
-});
-const SetStatusUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("setStatus"),
-  statusKey: Type.String(),
-  statusText: Type.Optional(Type.String()),
-});
-const SetWidgetUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("setWidget"),
-  widgetKey: Type.String(),
-  widgetLines: Type.Optional(Type.Array(Type.String())),
-  widgetPlacement: Type.Optional(literalUnion(["aboveEditor", "belowEditor"] as const)),
-});
-const SetTitleUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("setTitle"),
-  title: Type.String(),
-});
-const SetEditorTextUIRequestSchema = Type.Object({
-  type: Type.Literal("extension_ui_request"),
-  id: CorrelationIdSchema,
-  method: Type.Literal("set_editor_text"),
-  text: Type.String(),
-});
-const ExtensionUINotificationSchema = Type.Union([
-  NotifyUIRequestSchema,
-  SetStatusUIRequestSchema,
-  SetWidgetUIRequestSchema,
-  SetTitleUIRequestSchema,
-  SetEditorTextUIRequestSchema,
-]);
-export type WireExtensionUINotification = Static<typeof ExtensionUINotificationSchema>;
 
 // --- Discriminant recognition (before detailed validation) ----------------
 

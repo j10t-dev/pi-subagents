@@ -12,7 +12,7 @@ import {
   type RunId,
   type SessionPath,
 } from "./domain.ts";
-import type { WireAssistantMessage } from "./rpc-wire.ts";
+import type { WireAssistantMessage } from "./schemas.ts";
 import { MAX_COMPLETION_OUTPUT_BYTES, MAX_SESSION_RECOVERY_BYTES, MAX_STDERR_TAIL_BYTES } from "./constants.ts";
 import { outputPath } from "./paths.ts";
 import {

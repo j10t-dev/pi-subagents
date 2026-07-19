@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { AgentEventType, AgentState, RestorationActionType, agentId, modelSpec } from "../src/domain.ts";
-import { absolutePath, sessionPath } from "../src/paths.ts";
+import {
+  AgentEventType, AgentState, RestorationActionType, agentId, modelSpec,
+  utf8Bytes, type PersistedAgentEvent, type RunCompletedPayload,
+  type RunLaunchRequestedPayload, type RunStartedPayload, type RunStoppingPayload,
+  type SpawnedPayload,
+} from "../src/domain.ts";
+import { absolutePath, containmentReceiptPath, outputPath, sessionPath } from "../src/paths.ts";
+import { testAgentId, testAttemptId, testCommittedOutputPath, testRunId } from "./support/brands.ts";
+import { testBarrier } from "./support/barriers.ts";
 import { decodePersistedAgentEvent } from "../src/schemas.ts";
 import type { Usage } from "../src/domain.ts";
 import {
@@ -15,11 +22,11 @@ const AGENT = "a1b2c3d4";
 const OTHER_AGENT = "e5f6a7b8";
 const RUN = "b2c3d4e5";
 const ATTEMPT = "attempt-1";
-const SESSION_PATH = "/tmp/pi-subagents/sessions/child.jsonl";
-const CWD = "/tmp/pi-subagents/work";
-const RECEIPT_PATH = "/tmp/pi-subagents/receipts/run-1.json";
-const OUTPUT_PATH = "/tmp/pi-subagents/output/run-1.txt";
-const STATE_ROOT = "/tmp/pi-subagents";
+const STATE_ROOT = "/tmp/pi-subagents-test";
+const SESSION_PATH = `${STATE_ROOT}/sessions/child.jsonl`;
+const CWD = `${STATE_ROOT}/work`;
+const RECEIPT_PATH = `${STATE_ROOT}/receipts/run-1.json`;
+const OUTPUT_PATH = `${STATE_ROOT}/output/run-1.txt`;
 const descriptor = {
   backend: "cgroup-v2" as const,
   scopePath: "/tmp/pi-subagents/cgroups/parent/attempt",
@@ -132,6 +139,30 @@ function completedEntry(agentId = AGENT, runId = RUN) {
       },
     },
   };
+}
+
+function spawnedPayload(id = AGENT): SpawnedPayload {
+  return { agentId: testAgentId(id), sessionPath: sessionPath(STATE_ROOT, SESSION_PATH), cwd: absolutePath(CWD), provider: "anthropic", modelId: modelSpec("claude-sonnet-5"), thinkingLevel: "medium", tools: ["bash", "read"] };
+}
+
+function launchPayload(id = AGENT, attempt = ATTEMPT): RunLaunchRequestedPayload {
+  return { agentId: testAgentId(id), previousLeafId: null, attemptId: testAttemptId(attempt), containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH), containment: { ...descriptor, scopePath: absolutePath(descriptor.scopePath) } };
+}
+
+function startedPayload(id = AGENT, run = RUN): RunStartedPayload {
+  return { agentId: testAgentId(id), runId: testRunId(run), attemptId: testAttemptId(ATTEMPT) };
+}
+
+function stoppingPayload(id = AGENT, run = RUN): RunStoppingPayload {
+  return { agentId: testAgentId(id), runId: testRunId(run), reason: "stop_requested", containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH) };
+}
+
+function completedPayload(id = AGENT, run = RUN): RunCompletedPayload {
+  return { state: "completed", agentId: testAgentId(id), runId: testRunId(run), output: { text: "done", originalBytes: utf8Bytes(4), retainedBytes: utf8Bytes(4), truncated: false }, outputPath: testCommittedOutputPath(OUTPUT_PATH), transcriptPath: sessionPath(STATE_ROOT, SESSION_PATH) };
+}
+
+function cancelledPayload(id = AGENT, run = RUN): RunCompletedPayload {
+  return { state: "cancelled", agentId: testAgentId(id), runId: testRunId(run), reason: "stop_requested", output: { text: "", originalBytes: utf8Bytes(0), retainedBytes: utf8Bytes(0), truncated: false }, outputPath: testCommittedOutputPath(OUTPUT_PATH), transcriptPath: sessionPath(STATE_ROOT, SESSION_PATH) };
 }
 
 function cancelledEntry(agentId = AGENT, runId = RUN) {
@@ -248,12 +279,7 @@ describe("decodeAgentEvent", () => {
     const decoded = decodeAgentEvent(launchV2);
     expect(decoded.schemaVersion).toBe(2);
     expect(decoded.eventType).toBe(AgentEventType.RunLaunchRequested);
-    expect(decoded.payload).toEqual({
-      ...launchV2.payload,
-      agentId: agentId(AGENT),
-      containmentReceiptPath: RECEIPT_PATH,
-      containment: { ...descriptor, scopePath: absolutePath(descriptor.scopePath) },
-    } as never);
+    expect(decoded.payload).toEqual(launchPayload());
   });
 
   test.each([
@@ -344,7 +370,7 @@ describe("foldAgentEvents", () => {
     },
   ])("diagnoses $name without mutating prior state or producing the rejected transition's action", ({ entries, prior, pendingAttempt, action }) => {
     const restored = foldAgentEvents(entries);
-    const record = restored.agents.get(AGENT as never);
+    const record = restored.agents.get(testAgentId(AGENT));
     expect(record).toMatchObject(prior);
     expect(record?.pendingLaunch?.attemptId as string | undefined).toBe(pendingAttempt);
     expect(restored.invalidEvents.length).toBeGreaterThan(0);
@@ -376,7 +402,7 @@ describe("foldAgentEvents", () => {
 
   test("a lone Spawned event produces a stopped agent with no actions", () => {
     const restored = foldAgentEvents([spawnedEntry()]);
-    const record = restored.agents.get(AGENT as never);
+    const record = restored.agents.get(testAgentId(AGENT));
     expect(record?.state).toBe(AgentState.Stopped);
     expect(restored.actions).toEqual([]);
     expect(restored.invalidEvents).toEqual([]);
@@ -389,19 +415,19 @@ describe("foldAgentEvents", () => {
       startedEntry(),
       completedEntry(),
     ]);
-    const record = restored.agents.get(AGENT as never);
+    const record = restored.agents.get(testAgentId(AGENT));
     expect(record?.state).toBe(AgentState.Stopped);
     expect(record?.latestCompletion?.state).toBe("completed");
     expect(restored.invalidEvents).toEqual([]);
     expect(restored.actions).toEqual([
       {
         type: RestorationActionType.ValidateCompletedReceipt,
-        agentId: AGENT,
-        containmentReceiptPath: RECEIPT_PATH,
-        attemptId: ATTEMPT,
+        agentId: testAgentId(AGENT),
+        containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH),
+        attemptId: testAttemptId(ATTEMPT),
         eventVersion: 1,
       },
-    ] as unknown as RestorationAction[]);
+    ]);
   });
 
   test("a post-launch failure folds RunStarted then failed RunCompleted without RunStopping diagnostics", () => {
@@ -412,7 +438,7 @@ describe("foldAgentEvents", () => {
       failedEntry(),
     ]);
 
-    expect(restored.agents.get(AGENT as never)).toMatchObject({
+    expect(restored.agents.get(testAgentId(AGENT))).toMatchObject({
       state: AgentState.Stopped,
       latestCompletion: { state: "failed", runId: RUN },
     });
@@ -430,7 +456,7 @@ describe("foldAgentEvents", () => {
       stoppingEntry(),
       cancelledEntry(),
     ]);
-    const record = restored.agents.get(AGENT as never);
+    const record = restored.agents.get(testAgentId(AGENT));
     expect(record?.state).toBe(AgentState.Stopped);
     expect(record?.latestCompletion?.state).toBe("cancelled");
     expect(restored.invalidEvents).toEqual([]);
@@ -443,13 +469,13 @@ describe("foldAgentEvents", () => {
     expect(restored.actions).toEqual([
       {
         type: RestorationActionType.ReconcileLaunch,
-        agentId: AGENT,
-        attemptId: ATTEMPT,
+        agentId: testAgentId(AGENT),
+        attemptId: testAttemptId(ATTEMPT),
         previousLeafId: null,
-        containmentReceiptPath: RECEIPT_PATH,
+        containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH),
         eventVersion: 1,
       },
-    ] as unknown as RestorationAction[]);
+    ]);
     expect(restored.invalidEvents).toEqual([]);
   });
 
@@ -458,13 +484,13 @@ describe("foldAgentEvents", () => {
     expect(restored.actions).toEqual([
       {
         type: RestorationActionType.ReconcileStarted,
-        agentId: AGENT,
-        runId: RUN,
-        containmentReceiptPath: RECEIPT_PATH,
-        attemptId: ATTEMPT,
+        agentId: testAgentId(AGENT),
+        runId: testRunId(RUN),
+        containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH),
+        attemptId: testAttemptId(ATTEMPT),
         eventVersion: 1,
       },
-    ] as unknown as RestorationAction[]);
+    ]);
     expect(restored.invalidEvents).toEqual([]);
   });
 
@@ -478,14 +504,14 @@ describe("foldAgentEvents", () => {
     expect(restored.actions).toEqual([
       {
         type: RestorationActionType.ReconcileStopping,
-        agentId: AGENT,
-        runId: RUN,
+        agentId: testAgentId(AGENT),
+        runId: testRunId(RUN),
         reason: "stop_requested",
-        containmentReceiptPath: RECEIPT_PATH,
-        attemptId: ATTEMPT,
+        containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH),
+        attemptId: testAttemptId(ATTEMPT),
         eventVersion: 1,
       },
-    ] as unknown as RestorationAction[]);
+    ]);
     expect(restored.invalidEvents).toEqual([]);
   });
 
@@ -497,7 +523,7 @@ describe("foldAgentEvents", () => {
       completedEntry(),
       completedEntry(),
     ]);
-    const record = restored.agents.get(AGENT as never);
+    const record = restored.agents.get(testAgentId(AGENT));
     expect(record?.state).toBe(AgentState.Stopped);
     expect(restored.invalidEvents.length).toBe(1);
   });
@@ -546,7 +572,7 @@ describe("foldAgentEvents", () => {
 
     const restored = foldAgentEvents(fullBranchWithPreCompactionSpawn);
 
-    expect(restored.agents.get(AGENT as never)?.sessionPath as unknown as string).toBe(
+    expect(String(restored.agents.get(testAgentId(AGENT))?.sessionPath)).toBe(
       SESSION_PATH,
     );
     expect(restored.invalidEvents).toEqual([]);
@@ -560,8 +586,8 @@ describe("foldAgentEvents", () => {
       startedEntry(AGENT),
       completedEntry(AGENT),
     ]);
-    expect(restored.agents.get(AGENT as never)?.state).toBe(AgentState.Stopped);
-    expect(restored.agents.get(OTHER_AGENT as never)?.state).toBe(AgentState.Stopped);
+    expect(restored.agents.get(testAgentId(AGENT))?.state).toBe(AgentState.Stopped);
+    expect(restored.agents.get(testAgentId(OTHER_AGENT))?.state).toBe(AgentState.Stopped);
     expect(restored.actions.some((a) => a.agentId === OTHER_AGENT)).toBe(false);
   });
 });
@@ -574,8 +600,8 @@ describe("AgentEventAppender ordering", () => {
     await appender.appendRunLaunchRequested({
       ...launchV2.payload,
       agentId: agentId(AGENT),
-      attemptId: ATTEMPT as never,
-      containmentReceiptPath: RECEIPT_PATH as never,
+      attemptId: testAttemptId(ATTEMPT),
+      containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH),
       containment: { ...descriptor, scopePath: absolutePath(descriptor.scopePath) },
     });
 
@@ -585,7 +611,7 @@ describe("AgentEventAppender ordering", () => {
   test("RunStarted append is idempotent across concurrent and later retries", async () => {
     const written: unknown[] = [];
     const appender = new AgentEventAppender((_type, event) => { written.push(event); });
-    const started = startedEntry(AGENT, RUN).data.payload as never;
+    const started = startedPayload(AGENT, RUN);
 
     await Promise.all([appender.appendRunStarted(started), appender.appendRunStarted(started)]);
     await appender.appendRunStarted(started);
@@ -596,47 +622,70 @@ describe("AgentEventAppender ordering", () => {
   test("same native run ID on two agents appends each completion exactly once", async () => {
     const written: unknown[] = [];
     const appender = new AgentEventAppender((_type, event) => { written.push(event); });
-    const a = completedEntry(AGENT, RUN).data.payload as never;
-    const b = completedEntry(OTHER_AGENT, RUN).data.payload as never;
+    const a = completedPayload(AGENT, RUN);
+    const b = completedPayload(OTHER_AGENT, RUN);
     await Promise.all([appender.appendRunCompleted(a), appender.appendRunCompleted(b), appender.appendRunCompleted(a)]);
     expect(written).toHaveLength(2);
   });
   test("append() calls from concurrent callers are serialized in submission order per caller", async () => {
-    const written: unknown[] = [];
+    const written: PersistedAgentEvent[] = [];
     const appender = new AgentEventAppender((_customType, data) => {
-      written.push(data);
+      written.push(decodeAgentEvent(data, STATE_ROOT));
     });
+    const spawnedByA = testBarrier("caller-a-spawned-appended");
 
     const callerA = async () => {
-      await appender.appendSpawned(spawnedEntry(AGENT).data.payload as never);
-      await appender.appendRunLaunchRequested(launchEntry(AGENT).data.payload as never);
+      await appender.appendSpawned(spawnedPayload(AGENT));
+      await spawnedByA.enterAndWait();
+      await appender.appendRunLaunchRequested(launchPayload(AGENT));
     };
     const callerB = async () => {
-      await appender.appendSpawned(spawnedEntry(OTHER_AGENT).data.payload as never);
+      await spawnedByA.entered;
+      await appender.appendSpawned(spawnedPayload(OTHER_AGENT));
+      spawnedByA.release();
     };
 
     await Promise.all([callerA(), callerB()]);
 
-    expect(written.length).toBe(3);
+    expect(written.map(({ eventType, payload }) => `${payload.agentId}:${eventType}`)).toEqual([
+      `${AGENT}:${AgentEventType.Spawned}`,
+      `${OTHER_AGENT}:${AgentEventType.Spawned}`,
+      `${AGENT}:${AgentEventType.RunLaunchRequested}`,
+    ]);
+    expect(written
+      .filter(({ payload }) => payload.agentId === agentId(AGENT))
+      .map(({ eventType }) => eventType)).toEqual([
+        AgentEventType.Spawned,
+        AgentEventType.RunLaunchRequested,
+      ]);
   });
 
   test("withGroup() keeps a multi-event transition contiguous under a concurrent caller", async () => {
-    const written: Array<{ eventType: string }> = [];
+    const written: PersistedAgentEvent[] = [];
     const appender = new AgentEventAppender((_customType, data) => {
-      written.push(data as { eventType: string });
+      written.push(decodeAgentEvent(data, STATE_ROOT));
     });
+    const stoppingAppended = testBarrier("grouped-run-stopping");
+    let confirmOtherSpawnQueued!: () => void;
+    const otherSpawnQueued = new Promise<void>((resolve) => { confirmOtherSpawnQueued = resolve; });
 
     const stopThenComplete = appender.withGroup(async (append) => {
-      await append(AgentEventType.RunStopping, stoppingEntry().data.payload as never);
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      await append(AgentEventType.RunCompleted, cancelledEntry().data.payload as never);
+      await append(AgentEventType.RunStopping, stoppingPayload());
+      await stoppingAppended.enterAndWait();
+      await otherSpawnQueued;
+      await append(AgentEventType.RunCompleted, cancelledPayload());
     });
-    const otherSpawn = appender.appendSpawned(spawnedEntry(OTHER_AGENT).data.payload as never);
+    await stoppingAppended.entered;
+    const otherSpawn = appender.appendSpawned(spawnedPayload(OTHER_AGENT));
+    confirmOtherSpawnQueued();
+    stoppingAppended.release();
 
     await Promise.all([stopThenComplete, otherSpawn]);
 
-    const stopIndex = written.findIndex((e) => e.eventType === AgentEventType.RunStopping);
-    const completeIndex = written.findIndex((e) => e.eventType === AgentEventType.RunCompleted);
-    expect(completeIndex).toBe(stopIndex + 1);
+    expect(written.map((event) => event.eventType)).toEqual([
+      AgentEventType.RunStopping,
+      AgentEventType.RunCompleted,
+      AgentEventType.Spawned,
+    ]);
   });
 });

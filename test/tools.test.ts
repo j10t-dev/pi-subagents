@@ -3,13 +3,46 @@ import { Value } from "typebox/value";
 import { AgentErrorCode, AgentState, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8 } from "../src/domain.ts";
 import { CompletionService } from "../src/completion-service.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition } from "../src/controller.ts";
+import { deferred } from "./support/async.ts";
+import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
+import { launchSession, runningTransport as sharedRunningTransport, testRuntime } from "./support/launches.ts";
 import {
   createSubagentTools,
+  type SubagentToolController,
+  type SubagentToolInput,
+  type SubagentToolName,
+  type SubagentToolRegistry,
+  type SpawnAgentInput,
+  type SendInputInput,
+  type ReceiveAgentInput,
+  type StopAgentInput,
   receiveAgentSchema,
   sendInputSchema,
   spawnAgentSchema,
   stopAgentSchema,
 } from "../src/tools.ts";
+
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+type Assert<T extends true> = T;
+
+type _SpawnInput = Assert<Equal<SubagentToolInput<"spawn_agent">, SpawnAgentInput>>;
+type _SendInput = Assert<Equal<SubagentToolInput<"send_input">, SendInputInput>>;
+type _ReceiveInput = Assert<Equal<SubagentToolInput<"receive_agent">, ReceiveAgentInput>>;
+type _StopInput = Assert<Equal<SubagentToolInput<"stop_agent">, StopAgentInput>>;
+type _RegistryKeys = Assert<Equal<keyof SubagentToolRegistry,
+  "spawn_agent" | "send_input" | "receive_agent" | "stop_agent">>;
+type ToolControllerFake = Partial<Record<keyof SubagentToolController, (...args: never[]) => unknown>>;
+
+/**
+ * Malformed tool-result fixtures cross this internal trust boundary once. Tool tests only invoke
+ * supplied methods; production's concrete controller has unrelated state and lifecycle members.
+ */
+function fakeToolController(value: ToolControllerFake): SubagentToolController {
+  // malformed trust-boundary fixture: fake tool methods may return deliberately invalid DTOs.
+  return value as unknown as SubagentToolController;
+}
 
 const TEST_SELECTION = Object.freeze({
   model: modelSpec("mock-provider/luna"),
@@ -18,6 +51,14 @@ const TEST_SELECTION = Object.freeze({
 });
 
 describe("exact tool contracts", () => {
+  test("returns each exported input schema by identity", () => {
+    const tools = createSubagentTools(new SubagentController());
+    expect(tools.spawn_agent.parameters).toBe(spawnAgentSchema);
+    expect(tools.send_input.parameters).toBe(sendInputSchema);
+    expect(tools.receive_agent.parameters).toBe(receiveAgentSchema);
+    expect(tools.stop_agent.parameters).toBe(stopAgentSchema);
+  });
+
   test("schemas use the design field names and reject inferred aliases", () => {
     expect(Value.Check(spawnAgentSchema, { task: "work", model: "p/m:high", cwd: "/tmp", tools: ["read"] })).toBeTrue();
     expect(Value.Check(spawnAgentSchema, { task: "work", thinking: "high" })).toBeFalse();
@@ -56,12 +97,12 @@ describe("exact tool contracts", () => {
 
   test("spawn and send execute through production composition without wrapping literal input", async () => {
     const messages: string[] = [];
-    const controller = {
+    const controller = fakeToolController({
       spawn: async (input: { task: string }) => ({ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: AgentState.Running,
         model: modelSpec("mock-provider/luna"), thinkingLevel: "high", tools: ["web_fetch", "read"] }),
       sendInput: async (_id: unknown, message: string) => { messages.push(message); return { agentId: agentId("agent-a"), runId: runId("cafebabe"), state: AgentState.Running }; },
-    } as never;
-    const [spawn, send] = createSubagentTools(controller);
+    });
+    const { spawn_agent: spawn, send_input: send } = createSubagentTools(controller);
     expect((await spawn!.execute({ task: "work" })).details).toEqual({ agentId: "agent-a", runId: "deadbeef", state: "running",
       model: "mock-provider/luna", thinkingLevel: "high", tools: ["web_fetch", "read"] });
     expect((await send!.execute({ agentId: "agent-a", message: "literal" })).details).toEqual({ agentId: "agent-a", runId: "cafebabe", state: "running" });
@@ -70,7 +111,7 @@ describe("exact tool contracts", () => {
 
   test("every execute result is a fresh recursively exact public DTO", async () => {
     const secret = "boundary-secret";
-    const controller = {
+    const controller = fakeToolController({
       spawn: async () => ({
         agentId: "agent-a", runId: "deadbeef", state: "running",
         model: "mock-provider/luna", thinkingLevel: "high", tools: ["web_fetch", "read"], warning: "bounded warning",
@@ -93,8 +134,8 @@ describe("exact tool contracts", () => {
       stop: async (id: string) => id === "agent-a"
         ? { agentId: id, runId: "deadbeef", state: "cancelled", process: secret }
         : { agentId: id, runId: "cafebabe", state: "failed", agentState: "stopping", error: { code: "containment_failed", message: "could not confirm child process termination", diagnosticsPath: "/tmp/stop-diag", raw: secret }, exception: secret },
-    } as never;
-    const [spawn, send, receive, stop] = createSubagentTools(controller);
+    });
+    const { spawn_agent: spawn, send_input: send, receive_agent: receive, stop_agent: stop } = createSubagentTools(controller);
 
     const results = await Promise.all([
       spawn!.execute({ task: "work" }),
@@ -133,12 +174,12 @@ describe("exact tool contracts", () => {
   });
 
   test("canonicalises stored error messages from known codes", async () => {
-    const controller = { sendInput: async () => ({
+    const controller = fakeToolController({ sendInput: async () => ({
       agentId: "agent-a", state: "stopped",
       error: { code: "protocol_error", message: "stored-secret-message", diagnosticsPath: "/tmp/diagnostic" },
-    }) } as never;
+    }) });
 
-    const result = await createSubagentTools(controller)[1]!.execute({ agentId: "agent-a", message: "next" });
+    const result = await createSubagentTools(controller).send_input.execute({ agentId: "agent-a", message: "next" });
 
     expect(result.details).toEqual({ agentId: "agent-a", state: "stopped", error: {
       code: "protocol_error", message: "child process protocol error", diagnosticsPath: "/tmp/diagnostic",
@@ -147,11 +188,11 @@ describe("exact tool contracts", () => {
   });
 
   test("projects and renders an exact post-native settling launch failure", async () => {
-    const controller = { sendInput: async () => ({
+    const controller = fakeToolController({ sendInput: async () => ({
       agentId: "agent-a", runId: "deadbeef", state: "settling",
       error: { code: "spawn_failed", message: "raw-secret" }, extra: "secret",
-    }) } as never;
-    const tool = createSubagentTools(controller)[1]!;
+    }) });
+    const tool = createSubagentTools(controller).send_input;
 
     const result = await tool.execute({ agentId: "agent-a", message: "next" });
 
@@ -162,9 +203,9 @@ describe("exact tool contracts", () => {
 
   test("preserves only typed public preflight detail at the spawn tool boundary", async () => {
     const message = 'invalid_input: child tool "web_fetch" is not active in the parent';
-    const controller = { spawn: async () => { throw new PublicPreflightError(AgentErrorCode.InvalidInput, message.slice("invalid_input: ".length)); } } as never;
+    const controller = fakeToolController({ spawn: async () => { throw new PublicPreflightError(AgentErrorCode.InvalidInput, message.slice("invalid_input: ".length)); } });
 
-    const failure = await createSubagentTools(controller)[0]!.execute({ task: "work" }).catch((error: Error) => error);
+    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
 
     expect(failure).toBeInstanceOf(PublicPreflightError);
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
@@ -178,9 +219,9 @@ describe("exact tool contracts", () => {
     ["control characters", new Error("transport\u0000THROW_SECRET\nvalue"), "spawn_failed: failed to spawn child agent"],
     ["transport failure", new Error("transport failed: THROW_SECRET"), "spawn_failed: failed to spawn child agent"],
   ] as const)("canonicalises %s without exposing hostile detail", async (_name, thrown, expected) => {
-    const controller = { spawn: async () => { throw thrown; } } as never;
+    const controller = fakeToolController({ spawn: async () => { throw thrown; } });
 
-    const failure = await createSubagentTools(controller)[0]!.execute({ task: "work" }).catch((error: Error) => error);
+    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
 
     expect(failure).toBeInstanceOf(Error);
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
@@ -199,7 +240,7 @@ describe("exact tool contracts", () => {
       prepareSend: async () => { throw new Error("unused"); },
     } });
 
-    const failure = await createSubagentTools(controller)[0]!.execute({ task: "work" }).catch((error: Error) => error);
+    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
 
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
     expect(failure.message).toBe("spawn_failed: failed to spawn child agent");
@@ -222,10 +263,17 @@ describe("exact tool contracts", () => {
     const controller = isStop ? { stop: async () => malformed.outcomes[0] } : isStart
       ? { sendInput: async () => malformed }
       : { receive: async () => malformed };
-    const tool = createSubagentTools(controller as never)[isStop ? 3 : isStart ? 1 : 2]!;
-    const input = isStop ? { agentIds: ["agent-a"] } : isStart ? { agentId: "agent-a", message: "next" } : {};
-
-    await expect(tool.execute(input)).rejects.toThrow("internal_error: internal agent result is invalid");
+    const tools = createSubagentTools(fakeToolController(controller));
+    if (isStop) {
+      await expect(tools.stop_agent.execute({ agentIds: ["agent-a"] }))
+        .rejects.toThrow("internal_error: internal agent result is invalid");
+    } else if (isStart) {
+      await expect(tools.send_input.execute({ agentId: "agent-a", message: "next" }))
+        .rejects.toThrow("internal_error: internal agent result is invalid");
+    } else {
+      await expect(tools.receive_agent.execute({}))
+        .rejects.toThrow("internal_error: internal agent result is invalid");
+    }
   });
 
   for (const operation of ["spawn", "send"] as const) {
@@ -241,13 +289,12 @@ describe("exact tool contracts", () => {
         const composition = {
           prepareSpawn: async () => { throw thrown; },
           prepareSend: async () => { throw thrown; },
-        } as unknown as PiControllerComposition;
+        } satisfies PiControllerComposition;
         const controller = new SubagentController({ composition });
-        controller.runs.register({ agentId: existing, state: AgentState.Stopped, transcriptPath: "/tmp/existing.jsonl" as never });
-        const tool = createSubagentTools(controller)[operation === "spawn" ? 0 : 1]!;
-        const input = operation === "spawn" ? { task: "work" } : { agentId: existing, message: "literal" };
-
-        const failure = await tool.execute(input).catch((error: Error) => error);
+        controller.runs.register({ agentId: existing, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing.jsonl") });
+        const failure = operation === "spawn"
+          ? await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error)
+          : await createSubagentTools(controller).send_input.execute({ agentId: existing, message: "literal" }).catch((error: Error) => error);
 
         expect(failure).toBeInstanceOf(Error);
         expect((failure as Error).message).toBe(expected);
@@ -269,7 +316,7 @@ describe("exact tool contracts", () => {
         prepareSend: async () => { throw new Error("unused"); },
       } });
 
-      const failure = await createSubagentTools(controller)[0]!.execute({ task: "work" }).catch((error: Error) => error);
+      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe(expected);
@@ -285,7 +332,7 @@ describe("exact tool contracts", () => {
         prepareSend: async () => { throw new Error("unused"); },
       } });
 
-      const failure = await createSubagentTools(controller)[0]!.execute({ task: "work" }).catch((error: Error) => error);
+      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe(thrown.message.startsWith("raw")
@@ -308,7 +355,7 @@ describe("exact tool contracts", () => {
         },
         prepareSend: async () => { preparations++; return { session: idle, createLaunch: async () => runningTransport(idle) }; },
       } });
-      const [spawn, send] = createSubagentTools(controller);
+      const { spawn_agent: spawn, send_input: send } = createSubagentTools(controller);
       await expect(spawn!.execute({ task: "occupy" })).resolves.toMatchObject({ details: { state: "running" } });
       controller.runs.register({ agentId: idle.agentId, state: AgentState.Stopped, transcriptPath: idle.transcriptPath });
       const preparedBefore = preparations;
@@ -331,7 +378,7 @@ describe("exact tool contracts", () => {
       prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => session, persistSpawned: async () => {}, createLaunch: async () => runningTransport(session) }),
       prepareSend: async () => ({ session, createLaunch: async () => runningTransport(session) }),
     } });
-    const [spawn, send] = createSubagentTools(controller);
+    const { spawn_agent: spawn, send_input: send } = createSubagentTools(controller);
     await expect(spawn!.execute({ task: "occupy" })).resolves.toMatchObject({ details: { state: "running" } });
 
     const failure = await send!.execute({ agentId: session.agentId, message: "next" }).catch((error: Error) => error);
@@ -343,21 +390,21 @@ describe("exact tool contracts", () => {
 
   test("receive times out at the tool boundary and dequeues nothing", async () => {
     const completions = new CompletionService();
-    completions.upsertAgent({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: "/tmp/a.jsonl" as never, currentRunId: runId("deadbeef") });
+    completions.upsertAgent({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), currentRunId: runId("deadbeef") });
     const controller = new SubagentController({ completions });
-    const receive = createSubagentTools(controller)[2]!;
+    const receive = createSubagentTools(controller).receive_agent;
 
     const result = await receive.execute({ timeoutMs: 5 });
 
-    expect(result.details).toEqual({ completions: [], agents: [{ agentId: "agent-a", state: "running", transcriptPath: "/tmp/a.jsonl", currentRunId: "deadbeef" }], timedOut: true });
+    expect(result.details).toEqual({ completions: [], agents: [{ agentId: "agent-a", state: "running", transcriptPath: "/tmp/pi-subagents-test/a.jsonl", currentRunId: "deadbeef" }], timedOut: true });
     expect(controller.completions.queuedCount()).toBe(0);
   });
 
   test("receive cancellation rethrows the host abort and dequeues no completion", async () => {
     const completions = new CompletionService();
-    completions.upsertAgent({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: "/tmp/a.jsonl" as never, currentRunId: runId("deadbeef") });
+    completions.upsertAgent({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), currentRunId: runId("deadbeef") });
     const controller = new SubagentController({ completions });
-    const receive = createSubagentTools(controller)[2]!;
+    const receive = createSubagentTools(controller).receive_agent;
     const abort = new AbortController();
 
     const pending = receive.execute({}, abort.signal).catch((error: Error) => error);
@@ -369,7 +416,7 @@ describe("exact tool contracts", () => {
     expect((failure as Error).name).toBe("AbortError");
     expect((failure as Error).message).not.toContain("internal_error");
     await controller.publish({ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: CompletionState.Completed,
-      output: truncateUtf8("done", 50_000), outputPath: "/tmp/a.md" as never, transcriptPath: "/tmp/a.jsonl" as never });
+      output: truncateUtf8("done", 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/a.md"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl") });
     expect(controller.completions.queuedCount()).toBe(1);
     expect((await receive.execute({})).details).toMatchObject({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed" }] });
   });
@@ -388,10 +435,9 @@ describe("exact tool contracts", () => {
             prepareSend: async () => ({ session, createLaunch }),
           } });
           if (operation === "send") controller.runs.register({ agentId: session.agentId, state: AgentState.Stopped, transcriptPath: session.transcriptPath });
-          const tool = createSubagentTools(controller)[operation === "spawn" ? 0 : 1]!;
-          const input = operation === "spawn" ? { task: "work" } : { agentId: session.agentId, message: "next" };
-
-          const result = await tool.execute(input);
+          const result = operation === "spawn"
+            ? await createSubagentTools(controller).spawn_agent.execute({ task: "work" })
+            : await createSubagentTools(controller).send_input.execute({ agentId: session.agentId, message: "next" });
 
           const postNative = seam === "bindRun" || seam === "persistRunStarted";
           expect(result.details).toEqual(postNative
@@ -416,10 +462,9 @@ describe("exact tool contracts", () => {
           prepareSend: async () => ({ session, createLaunch }),
         } });
         if (operation === "send") controller.runs.register({ agentId: session.agentId, state: AgentState.Stopped, transcriptPath: session.transcriptPath });
-        const tool = createSubagentTools(controller)[operation === "spawn" ? 0 : 1]!;
-        const input = operation === "spawn" ? { task: "work" } : { agentId: session.agentId, message: "next" };
-
-        const result = await tool.execute(input);
+        const result = operation === "spawn"
+          ? await createSubagentTools(controller).spawn_agent.execute({ task: "work" })
+          : await createSubagentTools(controller).send_input.execute({ agentId: session.agentId, message: "next" });
 
         expect(result.details).toEqual({ agentId: session.agentId, state: "stopping", error: { code: "containment_failed", message: "could not confirm child process termination" } });
         expect(result.content).not.toContain("secret");
@@ -431,7 +476,7 @@ describe("exact tool contracts", () => {
 
   test("tool renderers expose compact contract fields without output, errors, messages, or raw DTO text", async () => {
     const secret = "MODEL_OUTPUT_SECRET".repeat(10_000);
-    const controller = {
+    const controller = fakeToolController({
       spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running",
         model: "mock-provider/family/luna", thinkingLevel: "off", tools: [], message: secret, process: { secret } }),
       sendInput: async () => ({ agentId: "agent-a", runId: "cafebabe", state: "running", message: secret, client: { secret } }),
@@ -453,17 +498,20 @@ describe("exact tool contracts", () => {
         agentId: id, runId: "deadbeef", state: "failed", agentState: "stopping",
         error: { code: "containment_failed", message: secret }, process: { secret },
       }),
-    } as never;
+    });
     const tools = createSubagentTools(controller);
-    const inputs = [
-      { task: "prompt-secret" },
-      { agentId: "agent-a", message: "message-secret" },
-      {},
-      { agentIds: ["agent-a"] },
+    const results = await Promise.all([
+      tools.spawn_agent.execute({ task: "prompt-secret" }),
+      tools.send_input.execute({ agentId: "agent-a", message: "message-secret" }),
+      tools.receive_agent.execute({}),
+      tools.stop_agent.execute({ agentIds: ["agent-a"] }),
+    ]);
+    const rendered = [
+      tools.spawn_agent.renderResult!(results[0]!),
+      tools.send_input.renderResult!(results[1]!),
+      tools.receive_agent.renderResult!(results[2]!),
+      tools.stop_agent.renderResult!(results[3]!),
     ];
-
-    const results = await Promise.all(tools.map((tool, index) => tool.execute(inputs[index]!)));
-    const rendered = results.map((result, index) => tools[index]!.renderResult!(result));
 
     expect(rendered[0]).toBe(
       "agentId=agent-a runId=deadbeef state=running model=family/luna reasoning=off",
@@ -505,8 +553,8 @@ describe("exact tool contracts", () => {
       state: AgentState.Stopped,
       transcriptPath: `/tmp/${"path/".repeat(500)}${index}.jsonl`,
     }));
-    const controller = { receive: async () => ({ completions: [], agents, timedOut: false }) } as never;
-    const receive = createSubagentTools(controller)[2]!;
+    const controller = fakeToolController({ receive: async () => ({ completions: [], agents, timedOut: false }) });
+    const receive = createSubagentTools(controller).receive_agent;
 
     const rendered = receive.renderResult!(await receive.execute({}));
 
@@ -519,13 +567,13 @@ describe("exact tool contracts", () => {
   test("receive execute retains the complete inventory and CompletionService-bounded output", async () => {
     const completions = new CompletionService();
     for (let index = 0; index < 1_000; index++) completions.upsertAgent({
-      agentId: agentId(`agent-${index}`), state: AgentState.Stopped, transcriptPath: `/tmp/${index}.jsonl` as never,
+      agentId: agentId(`agent-${index}`), state: AgentState.Stopped, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${index}.jsonl`),
     });
     await completions.publish({ agentId: agentId("agent-0"), runId: runId("deadbeef"), state: CompletionState.Completed,
-      output: truncateUtf8("a".repeat(40_000), 50_000), outputPath: "/tmp/a.md" as never, transcriptPath: "/tmp/0.jsonl" as never });
+      output: truncateUtf8("a".repeat(40_000), 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/a.md"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/0.jsonl") });
     await completions.publish({ agentId: agentId("agent-1"), runId: runId("cafebabe"), state: CompletionState.Completed,
-      output: truncateUtf8("b".repeat(40_000), 50_000), outputPath: "/tmp/b.md" as never, transcriptPath: "/tmp/1.jsonl" as never });
-    const receive = createSubagentTools(new SubagentController({ completions }))[2]!;
+      output: truncateUtf8("b".repeat(40_000), 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/b.md"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/1.jsonl") });
+    const receive = createSubagentTools(new SubagentController({ completions })).receive_agent;
 
     const result = await receive.execute({});
     const details = result.details as { agents: object[]; completions: Array<{ output: { text: string; retainedBytes: number; truncated: boolean } }> };
@@ -540,10 +588,10 @@ describe("exact tool contracts", () => {
 
   test("stop is set-valued, preserves duplicates, and isolates invalid members", async () => {
     const calls: string[] = [];
-    const controller = {
+    const controller = fakeToolController({
       stop: async (id: string) => { calls.push(id); return { agentId: id, state: "already_stopped" }; },
-    } as never;
-    const stop = createSubagentTools(controller)[3]!;
+    });
+    const stop = createSubagentTools(controller).stop_agent;
     const result = await stop.execute({ agentIds: ["agent-a", "!", "agent-a"] });
     expect(result.details).toEqual({ outcomes: [
       { agentId: "agent-a", state: "already_stopped" },
@@ -555,7 +603,7 @@ describe("exact tool contracts", () => {
 
   test("stop preserves one bounded failed outcome for every malformed identifier", async () => {
     const huge = "TOP_SECRET".repeat(100_000);
-    const tool = createSubagentTools(new SubagentController())[3]!;
+    const tool = createSubagentTools(new SubagentController()).stop_agent;
 
     const result = await tool.execute({ agentIds: ["", huge, "", huge] });
     const outcomes = (result.details as { outcomes: Array<{ agentId: string; state: string }> }).outcomes;
@@ -569,19 +617,19 @@ describe("exact tool contracts", () => {
     expect(result.content).not.toContain("TOP_SECRET");
   });
 
-  for (const toolIndex of [0, 1, 2, 3] as const) {
-    test(`tool ${toolIndex} fails closed when a public DTO getter throws`, async () => {
-      const secret = `DTO_GETTER_SECRET_${toolIndex}`;
-      const controller = {
+  for (const name of HOSTILE_TOOL_NAMES) {
+    test(`${name} fails closed when a public DTO getter throws`, async () => {
+      const secret = `DTO_GETTER_SECRET_${name}`;
+      const controller = fakeToolController({
         spawn: async () => Object.defineProperty({}, "state", { get: () => { throw new Error(secret); } }),
         sendInput: async () => Object.defineProperty({}, "state", { get: () => { throw new Error(secret); } }),
         receive: async () => Object.defineProperty({}, "completions", { get: () => { throw new Error(secret); } }),
         stop: async () => Object.defineProperty({}, "state", { get: () => { throw new Error(secret); } }),
-      } as never;
-      const tool = createSubagentTools(controller)[toolIndex]!;
-      const input = [{ task: "x" }, { agentId: "agent-a", message: "x" }, {}, { agentIds: ["agent-a"] }][toolIndex]!;
+      });
+      const tools = createSubagentTools(controller);
 
-      const failure = await tool.execute(input).catch((error: Error) => error);
+      const failure = await executeTool(tools, name, HOSTILE_TOOL_CASES[name].validInput)
+        .catch((error: Error) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe("internal_error: internal agent result is invalid");
@@ -589,13 +637,16 @@ describe("exact tool contracts", () => {
     });
   }
 
-  for (const toolIndex of [0, 1, 2, 3] as const) {
-    test(`tool ${toolIndex} fails closed when an input getter throws`, async () => {
-      const secret = `INPUT_GETTER_SECRET_${toolIndex}`;
-      const key = ["task", "agentId", "timeoutMs", "agentIds"][toolIndex]!;
-      const input = Object.defineProperty({}, key, { enumerable: true, get: () => { throw new Error(secret); } });
+  for (const name of HOSTILE_TOOL_NAMES) {
+    test(`${name} fails closed when an input getter throws`, async () => {
+      const secret = `INPUT_GETTER_SECRET_${name}`;
+      const input = Object.defineProperty({}, HOSTILE_TOOL_CASES[name].inputKey, {
+        enumerable: true,
+        get: () => { throw new Error(secret); },
+      });
+      const tools = createSubagentTools(new SubagentController());
 
-      const failure = await createSubagentTools(new SubagentController())[toolIndex]!.execute(input).catch((error: Error) => error);
+      const failure = await executeTool(tools, name, input).catch((error: Error) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe("internal_error: internal agent result is invalid");
@@ -604,11 +655,11 @@ describe("exact tool contracts", () => {
   }
 
   test("tool serialisation fails closed when JSON conversion throws", async () => {
-    const controller = { spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running" }) } as never;
+    const controller = fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running" }) });
     const original = JSON.stringify;
     JSON.stringify = () => { throw new Error("JSON_SECRET"); };
     try {
-      const failure = await createSubagentTools(controller)[0]!.execute({ task: "x" }).catch((error: Error) => error);
+      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "x" }).catch((error: Error) => error);
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe("internal_error: internal agent result is invalid");
     } finally {
@@ -618,8 +669,8 @@ describe("exact tool contracts", () => {
 
   test("multi-agent stop starts every valid target concurrently", async () => {
     const entered: string[] = []; const release = deferred<void>();
-    const controller = { stop: async (id: string) => { entered.push(id); await release.promise; return { agentId: id, runId: "deadbeef", state: "cancelled" }; } } as never;
-    const operation = createSubagentTools(controller)[3]!.execute({ agentIds: ["agent-a", "agent-b", "agent-c"] });
+    const controller = fakeToolController({ stop: async (id: string) => { entered.push(id); await release.promise; return { agentId: id, runId: "deadbeef", state: "cancelled" }; } });
+    const operation = createSubagentTools(controller).stop_agent.execute({ agentIds: ["agent-a", "agent-b", "agent-c"] });
     await eventually(() => entered.length === 3);
     expect(entered).toEqual(["agent-a", "agent-b", "agent-c"]);
     release.resolve();
@@ -638,8 +689,8 @@ describe("exact tool contracts", () => {
       stopped: { agentId: "stopped", state: "already_stopped" },
       failed: { agentId: "failed", runId: "feedface", state: "failed", agentState: "stopping", error: { code: "containment_failed", message: "could not confirm child process termination" } },
     };
-    const controller = { stop: async (id: string) => outcomes[id]! } as never;
-    const stop = createSubagentTools(controller)[3]!;
+    const controller = fakeToolController({ stop: async (id: string) => outcomes[id]! });
+    const stop = createSubagentTools(controller).stop_agent;
     const details = (await stop.execute({ agentIds: ["running", "settling", "stopping", "stopped", "failed", "running", "!"] })).details as { outcomes: object[] };
     expect(details.outcomes).toEqual([
       outcomes.running!, outcomes.settling!, outcomes.stopping!, outcomes.stopped!, outcomes.failed!, outcomes.running!,
@@ -654,24 +705,49 @@ function schemaDescription(schema: object): string | undefined {
   return typeof schema.description === "string" ? schema.description : undefined;
 }
 
-function deferred<T>() { let resolve!: (value: T | PromiseLike<T>) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }
-async function eventually(condition: () => boolean) { for (let i = 0; i < 100 && !condition(); i++) await Promise.resolve(); expect(condition()).toBeTrue(); }
-
-function launchSession(suffix: string): LaunchSession {
-  return { agentId: agentId(`agent-${suffix}`), transcriptPath: `/tmp/${suffix}` as never, previousLeafId: null, attemptId: `attempt-${suffix}` as never, containmentReceiptPath: `/tmp/${suffix}.receipt` as never };
+/**
+ * Dispatches to one named tool. Each branch casts the untrusted object to that tool's declared
+ * input type: this is the documented public-tool trust boundary, and the point of these tests is
+ * that a malformed value crossing it fails closed rather than leaking.
+ */
+function executeTool(tools: SubagentToolRegistry, name: SubagentToolName, input: object) {
+  switch (name) {
+    case "spawn_agent":
+      // Deliberately malformed hostile input: this cast crosses the public-tool trust boundary.
+      return tools.spawn_agent.execute(input as SpawnAgentInput);
+    case "send_input":
+      // Deliberately malformed hostile input: this cast crosses the public-tool trust boundary.
+      return tools.send_input.execute(input as SendInputInput);
+    case "receive_agent":
+      // Deliberately malformed hostile input: this cast crosses the public-tool trust boundary.
+      return tools.receive_agent.execute(input as ReceiveAgentInput);
+    case "stop_agent":
+      // Deliberately malformed hostile input: this cast crosses the public-tool trust boundary.
+      return tools.stop_agent.execute(input as StopAgentInput);
+  }
 }
 
+/** Per-tool fixtures: a well-formed input, and the input key each hostile-getter case attacks. */
+const HOSTILE_TOOL_CASES = {
+  spawn_agent: { validInput: { task: "x" }, inputKey: "task" },
+  send_input: { validInput: { agentId: "agent-a", message: "x" }, inputKey: "agentId" },
+  receive_agent: { validInput: {}, inputKey: "timeoutMs" },
+  stop_agent: { validInput: { agentIds: ["agent-a"] }, inputKey: "agentIds" },
+} as const satisfies Record<SubagentToolName, { validInput: object; inputKey: string }>;
+
+const HOSTILE_TOOL_NAMES = Object.keys(HOSTILE_TOOL_CASES) as SubagentToolName[];
+
+async function eventually(condition: () => boolean) { for (let i = 0; i < 100 && !condition(); i++) await Promise.resolve(); expect(condition()).toBeTrue(); }
+
+/**
+ * The shared launch transport, specialised for tool tests: the run never settles on its own, and
+ * containment resolves to this session's own receipt path.
+ */
 function runningTransport(session: LaunchSession): LaunchTransport {
-  let assignment = "";
-  return {
-    containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
-    ready: async () => {}, persistLaunchRequested: async () => {}, start: async () => {},
-    getEntries: async (since?: string | null) => since === undefined
-      ? { entries: [], leafId: null }
-      : { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: assignment } }], leafId: "deadbeef" },
-    prompt: async (message) => { assignment = message; }, waitForAgentStart: async () => {}, bindRun: () => {}, persistRunStarted: async () => {}, waitSettled: () => new Promise<never>(() => {}),
-    runtime: { abort: async () => {}, contain: async () => session.containmentReceiptPath as never },
-  };
+  return sharedRunningTransport(session, {
+    runtime: testRuntime({ contain: async () => testVerifiedReceiptPath(session.containmentReceiptPath) }),
+    waitSettled: () => new Promise<never>(() => {}),
+  });
 }
 
 function failingTransport(
@@ -680,22 +756,30 @@ function failingTransport(
   thrown: Error,
   containmentError?: Error,
 ): LaunchTransport {
-  let assignment = "";
+  const base = sharedRunningTransport(session, {
+    runtime: testRuntime({
+      contain: async () => {
+        if (containmentError !== undefined) throw containmentError;
+        return testVerifiedReceiptPath(session.containmentReceiptPath);
+      },
+    }),
+  });
+  // Each override throws at exactly one launch seam; everything else delegates to the shared
+  // transport. `getEntries` still discriminates on `since` because the two launch calls (before
+  // the prompt, and after it) are distinguishable only by that argument.
   return {
-    containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+    ...base,
     ready: async () => { if (seam === "ready") throw thrown; },
     persistLaunchRequested: async () => { if (seam === "persistLaunchRequested") throw thrown; },
     start: async () => { if (seam === "start") throw thrown; },
     getEntries: async (since?: string | null) => {
       if (since === undefined && seam === "getEntriesBefore") throw thrown;
       if (since !== undefined && seam === "getEntriesAfter") throw thrown;
-      return since === undefined ? { entries: [], leafId: null } : { entries: [{ id: "deadbeef", type: "message", message: { role: "user", content: assignment } }], leafId: "deadbeef" };
+      return base.getEntries(since);
     },
-    prompt: async (message) => { if (seam === "prompt") throw thrown; assignment = message; },
-    waitForAgentStart: async () => {},
+    prompt: async (message) => { if (seam === "prompt") throw thrown; await base.prompt(message); },
     bindRun: () => { if (seam === "bindRun") throw thrown; },
     persistRunStarted: async () => { if (seam === "persistRunStarted") throw thrown; },
     waitSettled: () => new Promise<never>(() => {}),
-    runtime: { abort: async () => {}, contain: async () => { if (containmentError !== undefined) throw containmentError; return session.containmentReceiptPath as never; } },
   };
 }

@@ -7,9 +7,11 @@
 // none of those tests need to spawn a real Pi process.
 
 import { createInterface } from "node:readline";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 const scenario = process.env.FAKE_RPC_SCENARIO ?? "normal";
+const handshakeDir = process.env.FAKE_RPC_HANDSHAKE_DIR;
 const launchMarker = process.env.FAKE_RPC_LAUNCH_MARKER;
 const commandMarker = process.env.FAKE_RPC_COMMAND_MARKER;
 const terminationMarker = process.env.FAKE_RPC_TERMINATION_MARKER;
@@ -94,6 +96,17 @@ rl.on("line", (line) => {
       return;
     case "get_entries":
       if (scenario === "pending-command") return;
+      if (scenario === "exit-pending-get-entries") {
+        // Two-way file handshake: announce the outstanding evidence request, then exit without
+        // ever answering it once the test releases us.
+        appendFileSync(join(handshakeDir, "get-entries-received"), "received\n");
+        const release = setInterval(() => {
+          if (!existsSync(join(handshakeDir, "release-pending-get-entries"))) return;
+          clearInterval(release);
+          process.exit(0);
+        }, 5);
+        return;
+      }
       if (!oversizedResponseSent && scenario.startsWith("oversized-response-")) {
         oversizedResponseSent = true;
         const huge = "x".repeat(16 * 1024 * 1024 + 1);
@@ -136,6 +149,12 @@ rl.on("line", (line) => {
       if (scenario === "agent-start-before-ack") {
         write({ type: "agent_start" });
         respond("prompt", command.id, {});
+        return;
+      }
+      if (scenario === "exit-immediate") {
+        // Acknowledge, then die without agent_settled and without answering any later request.
+        respond("prompt", command.id, {});
+        process.stdout.write("", () => process.exit(0));
         return;
       }
       if (scenario === "agent-start-after-ack") {
@@ -268,6 +287,26 @@ function runScenario() {
       process.stdout.write(`${JSON.stringify({ type: "extension_ui_request", id: "huge-ui", method: "confirm", title: huge, message: huge })}\n`);
       break;
     }
+    case "poison-text-end":
+      write({ type: "message_start", message: assistantMessage("") });
+      write({
+        type: "message_update",
+        message: assistantMessage(""),
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "trusted delta", partial: assistantMessage("") },
+      });
+      write({
+        type: "message_update",
+        message: assistantMessage(""),
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          content: "POISONED_TEXT_END_CONTENT",
+          partial: assistantMessage("POISONED_PARTIAL"),
+        },
+      });
+      write({ type: "message_end", message: assistantMessage("authoritative final") });
+      write({ type: "agent_settled" });
+      break;
     case "malformed-ordinary":
       write({ type: "ordinary_event", malformed: { unexpected: true } });
       emitTurn("recovered ordinary");
@@ -284,6 +323,7 @@ function runScenario() {
       break;
     }
     case "settlement-invalid-usage":
+    case "exit-pending-get-entries":
       write({ type: "agent_settled" });
       break;
     case "multi-turn-usage": {

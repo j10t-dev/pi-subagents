@@ -234,6 +234,20 @@ export type Cost = Usage["cost"];
 /** Pi's public thinking-level union, including `off`. */
 export type ThinkingLevel = NonNullable<ResolveCliModelResult["thinkingLevel"]>;
 
+/**
+ * Single source of the thinking levels as runtime values. The tripwire below breaks
+ * `bun tsc --noEmit` if this list ever drifts from Pi's `ThinkingLevel` union.
+ */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+type _ThinkingLevelsMatchPi = (typeof THINKING_LEVELS)[number] extends ThinkingLevel
+  ? ThinkingLevel extends (typeof THINKING_LEVELS)[number]
+    ? true
+    : never
+  : never;
+const _thinkingLevelsMatchPi: _ThinkingLevelsMatchPi = true;
+void _thinkingLevelsMatchPi;
+
 export interface AgentUsage {
   turns: number;
   usage: Usage;

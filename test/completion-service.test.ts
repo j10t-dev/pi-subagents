@@ -1,25 +1,34 @@
 import { describe, expect, spyOn, test } from "bun:test";
 
-import { AgentState } from "../src/domain.ts";
+import { AgentState, utf8Bytes } from "../src/domain.ts";
 import { CompletionService, type AgentSummary } from "../src/completion-service.ts";
 import type { AgentCompletion } from "../src/domain.ts";
+import {
+  testAgentId,
+  testCommittedOutputPath,
+  testRunId,
+  testSessionPath,
+  testMilliseconds,
+} from "./support/brands.ts";
 
-const AGENT = "agent-1" as never;
-const OTHER_AGENT = "agent-2" as never;
-const RUN = "run-1" as never;
-const SESSION_PATH = "/tmp/pi-subagents/sessions/child.jsonl" as never;
-const OUTPUT_PATH = "/tmp/pi-subagents/output/run-1.txt" as never;
+const AGENT = testAgentId("agent-1");
+const OTHER_AGENT = testAgentId("agent-2");
+const RUN = testRunId("deadbeef");
+const SESSION_PATH = testSessionPath();
+const OUTPUT_PATH = testCommittedOutputPath();
 
-function completion(overrides: Partial<AgentCompletion> = {}): AgentCompletion {
+function completion(
+  overrides: Partial<Extract<AgentCompletion, { state: "completed" }>> = {},
+): Extract<AgentCompletion, { state: "completed" }> {
   return {
     agentId: AGENT,
     runId: RUN,
     state: "completed",
-    output: { text: "hello", originalBytes: 5 as never, retainedBytes: 5 as never, truncated: false },
+    output: { text: "hello", originalBytes: utf8Bytes(5), retainedBytes: utf8Bytes(5), truncated: false },
     outputPath: OUTPUT_PATH,
     transcriptPath: SESSION_PATH,
     ...overrides,
-  } as AgentCompletion;
+  } satisfies Extract<AgentCompletion, { state: "completed" }>;
 }
 
 function running(agentId = AGENT): AgentSummary {
@@ -65,7 +74,7 @@ describe("CompletionService.receive", () => {
     service.upsertAgent(running());
 
     const waiting = service.receive();
-    await expect(service.receive({ timeoutMs: 0 as never })).resolves.toMatchObject({
+    await expect(service.receive({ timeoutMs: testMilliseconds(0) })).resolves.toMatchObject({
       completions: [],
       timedOut: true,
     });
@@ -90,7 +99,7 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    const result = await service.receive({ timeoutMs: 10 as never });
+    const result = await service.receive({ timeoutMs: testMilliseconds(10) });
     expect(result.completions).toEqual([]);
     expect(result.timedOut).toBe(true);
 
@@ -103,14 +112,14 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    await expect(service.receive({ timeoutMs: 1 as never })).resolves.toMatchObject({ timedOut: true });
+    await expect(service.receive({ timeoutMs: testMilliseconds(1) })).resolves.toMatchObject({ timedOut: true });
     const later = service.receive();
     await service.publish(completion());
 
     await expect(later).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
   });
 
-  test("abort cannot clear a later waiter", async () => {
+  test("an aborted waiter cannot clear the waiter installed after it", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
     const controller = new AbortController();
@@ -122,13 +131,14 @@ describe("CompletionService.receive", () => {
     const later = service.receive();
     await service.publish(completion());
     await expect(later).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    expect(service.queuedCount()).toBe(0);
   });
 
   test("publication before timeout delivers exactly one completion and leaves none queued", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    const waiting = service.receive({ timeoutMs: 10 as never });
+    const waiting = service.receive({ timeoutMs: testMilliseconds(10) });
     await service.publish(completion());
 
     await expect(waiting).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
@@ -139,7 +149,7 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    await expect(service.receive({ timeoutMs: 1 as never })).resolves.toMatchObject({ completions: [], timedOut: true });
+    await expect(service.receive({ timeoutMs: testMilliseconds(1) })).resolves.toMatchObject({ completions: [], timedOut: true });
     await service.publish(completion());
 
     await expect(service.receive()).resolves.toMatchObject({ completions: [expect.any(Object)] });
@@ -160,7 +170,7 @@ describe("CompletionService.receive", () => {
     expect(service.queuedCount()).toBe(0);
   });
 
-  test("abort before publication leaves the completion for the next receiver", async () => {
+  test("abort rejects only that waiter and leaves the completion for the next receive", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
     const controller = new AbortController();
@@ -169,8 +179,10 @@ describe("CompletionService.receive", () => {
     controller.abort();
     await expect(waiting).rejects.toBeInstanceOf(Error);
     await service.publish(completion());
+    expect(service.queuedCount()).toBe(1);
 
-    await expect(service.receive()).resolves.toMatchObject({ completions: [expect.any(Object)] });
+    await expect(service.receive()).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    expect(service.queuedCount()).toBe(0);
   });
 
   test("an already-aborted signal rejects its installed waiter without disturbing a subsequent waiter", async () => {
@@ -184,6 +196,7 @@ describe("CompletionService.receive", () => {
     await service.publish(completion());
 
     await expect(later).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    expect(service.queuedCount()).toBe(0);
   });
 
   test("recomputes retainedBytes/truncated against the aggregate budget in queue order", async () => {
@@ -191,13 +204,13 @@ describe("CompletionService.receive", () => {
     await service.publish(
       completion({
         agentId: AGENT,
-        output: { text: "0123456789", originalBytes: 10 as never, retainedBytes: 10 as never, truncated: false },
+        output: { text: "0123456789", originalBytes: utf8Bytes(10), retainedBytes: utf8Bytes(10), truncated: false },
       }),
     );
     await service.publish(
       completion({
         agentId: OTHER_AGENT,
-        output: { text: "abcdefghij", originalBytes: 10 as never, retainedBytes: 10 as never, truncated: false },
+        output: { text: "abcdefghij", originalBytes: utf8Bytes(10), retainedBytes: utf8Bytes(10), truncated: false },
       }),
     );
 
@@ -211,7 +224,7 @@ describe("CompletionService.receive", () => {
   test("never mutates the persisted completion object", async () => {
     const service = new CompletionService(3);
     const original = completion({
-      output: { text: "hello", originalBytes: 5 as never, retainedBytes: 5 as never, truncated: false },
+      output: { text: "hello", originalBytes: utf8Bytes(5), retainedBytes: utf8Bytes(5), truncated: false },
     });
     await service.publish(original);
 
@@ -223,22 +236,22 @@ describe("CompletionService.receive", () => {
 
   test("aggregate rebudget preserves persisted original size and truncation history", async () => {
     const persisted = completion({
-      output: { text: "x".repeat(50_000), originalBytes: 100_000 as never, retainedBytes: 50_000 as never, truncated: true },
+      output: { text: "x".repeat(50_000), originalBytes: utf8Bytes(100_000), retainedBytes: utf8Bytes(50_000), truncated: true },
     });
     const fullAllowance = new CompletionService(50_000);
     await fullAllowance.publish(persisted);
     const fullyAdmitted = (await fullAllowance.receive()).completions[0]!.output;
     expect(fullyAdmitted.text).toBe("x".repeat(50_000));
-    expect(fullyAdmitted.originalBytes).toBe(100_000 as never);
-    expect(fullyAdmitted.retainedBytes).toBe(50_000 as never);
+    expect(fullyAdmitted.originalBytes).toBe(utf8Bytes(100_000));
+    expect(fullyAdmitted.retainedBytes).toBe(utf8Bytes(50_000));
     expect(fullyAdmitted.truncated).toBeTrue();
 
     const laterTruncation = new CompletionService(20_000);
     await laterTruncation.publish(persisted);
     const rebudgeted = (await laterTruncation.receive()).completions[0]!.output;
     expect(rebudgeted.text).toBe("x".repeat(20_000));
-    expect(rebudgeted.originalBytes).toBe(100_000 as never);
-    expect(rebudgeted.retainedBytes).toBe(20_000 as never);
+    expect(rebudgeted.originalBytes).toBe(utf8Bytes(100_000));
+    expect(rebudgeted.retainedBytes).toBe(utf8Bytes(20_000));
     expect(rebudgeted.truncated).toBeTrue();
   });
 
@@ -255,10 +268,10 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     await service.publish(completion());
 
-    service.upsertAgent({ ...running(), currentRunId: "cafebabe" as never });
+    service.upsertAgent({ ...running(), currentRunId: testRunId("cafebabe") });
 
     expect(service.snapshotAgents()).toEqual([{
-      ...running(), currentRunId: "cafebabe" as never,
+      ...running(), currentRunId: testRunId("cafebabe"),
       latestCompletionState: "completed",
       latestOutputPath: OUTPUT_PATH,
     }]);

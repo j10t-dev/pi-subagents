@@ -18,12 +18,12 @@
   },
   "scripts": {
     "test": "bun scripts/run-tests.ts",
-    "test:unit": "bun test test/domain.test.ts test/settings.test.ts test/persistence.test.ts test/completion-service.test.ts",
-    "test:transport": "bun test test/jsonl.test.ts test/rpc-wire.test.ts test/rpc-client.test.ts test/output-store.test.ts test/ui-spike.test.ts",
+    "test:unit": "bun scripts/run-tests.ts --group unit",
+    "test:transport": "bun scripts/run-tests.ts --group transport",
     "check:cgroup": "bun scripts/check-cgroup-v2.ts",
-    "test:process": "bun test test/watchdog.test.ts test/pi-launcher.test.ts test/launcher.test.ts test/cgroup-process.test.ts",
-    "test:controller": "bun test test/run-controller.test.ts test/controller.test.ts test/tools.test.ts test/restoration.test.ts test/extension.test.ts",
-    "test:integration": "bun test test/pi-integration.test.ts test/e2e.test.ts test/context-safety.test.ts",
+    "test:process": "bun scripts/run-tests.ts --group process",
+    "test:controller": "bun scripts/run-tests.ts --group controller",
+    "test:integration": "bun scripts/run-tests.ts --group integration",
     "test:live-model": "PI_SUBAGENTS_LIVE_SMOKE=1 bun test test/live-model-smoke.test.ts --timeout 120000",
     "typecheck": "tsc --noEmit"
   }

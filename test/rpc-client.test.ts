@@ -7,20 +7,38 @@ import { createHash } from "node:crypto";
 import { PassThrough } from "node:stream";
 
 import { AgentErrorCode, agentId, createRunAttemptId, runId as brandRunId, terminalFailureCause } from "../src/domain.ts";
-import type { AgentId, RunId, SessionPath } from "../src/domain.ts";
+import type { AgentId, RunId, SessionPath, Usage } from "../src/domain.ts";
 import { OutputStore } from "../src/output-store.ts";
 import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-fs.ts";
 import { authoritativeSettlement, RpcRunClient } from "../src/rpc-client.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
+import { deferred } from "./support/async.ts";
 import type { ExtensionUIContextLike } from "../src/ui-forwarder.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-rpc-child.mjs");
 const AGENT: AgentId = agentId("agent-1");
 
-const evidenceUsage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+const validUsage: Usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 1, reasoning: 1, totalTokens: 2,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const evidenceUsage = validUsage;
+const invalidUsageCases = [
+  ["negative token", (usage: Usage) => ({ ...usage, input: -1 })],
+  ["NaN token", (usage: Usage) => ({ ...usage, output: Number.NaN })],
+  ["infinite token", (usage: Usage) => ({ ...usage, cacheRead: Number.POSITIVE_INFINITY })],
+  ["negative optional", (usage: Usage) => ({ ...usage, reasoning: -1 })],
+  ["missing totalTokens", (usage: Usage) => { const { totalTokens: _removed, ...rest } = usage; return rest; }],
+  ["missing cost field", (usage: Usage) => { const { cacheWrite: _removed, ...cost } = usage.cost; return { ...usage, cost }; }],
+] as const;
 
 describe("authoritativeSettlement", () => {
+  test.each(invalidUsageCases)("rejects shared invalid usage: %s", (_label, mutate) => {
+    expect(authoritativeSettlement([{ type: "message", message: { role: "assistant", stopReason: "stop", usage: mutate(validUsage), content: [] } }])).toEqual({ kind: "invalid" });
+  });
+
+  test("accepts the shared valid usage fixture", () => {
+    expect(authoritativeSettlement([{ type: "message", message: { role: "assistant", stopReason: "stop", usage: validUsage, content: [] } }])).toMatchObject({ kind: "found" });
+  });
+
   const assistant = (overrides: Record<string, unknown> = {}) => ({
     type: "message",
     message: { role: "assistant", stopReason: "stop", usage: evidenceUsage, content: [], ...overrides },
@@ -90,11 +108,6 @@ class ReentrantDiscardOutputStore extends OutputStore {
   }
 }
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
-}
 
 function makeClient(
   scenario: string,
@@ -421,6 +434,21 @@ describe("RpcRunClient", () => {
     await client.waitSettled();
     expect(outputStore.currentOutput(runId).output.text).toBe("hello world");
     expect(outputStore.currentOutput(runId).transportIncomplete).toBe(false);
+    await client.shutdown();
+  });
+
+  test("a poisoned text_end reaches neither current output, committed output, diagnostics nor settlement", async () => {
+    const runId: RunId = brandRunId("aaaaaaaa");
+    const { client, outputStore: store } = makeClient("poison-text-end", workDir);
+    client.start();
+    client.bindRun(runId);
+    await client.prompt("hello");
+
+    await expect(client.waitSettled()).resolves.toEqual({ reason: "agent_settled", stopReason: "stop" });
+    expect(store.currentOutput(runId).output.text).toBe("authoritative final");
+    expect(readFileSync(store.restoreRun(runId), "utf8")).toBe("authoritative final");
+    expect(store.currentOutput(runId).output.text).not.toContain("POISONED");
+    expect(store.getDiagnosticsTail()).not.toContain("POISONED");
     await client.shutdown();
   });
 
@@ -952,6 +980,50 @@ describe("RpcRunClient", () => {
     expect(readFileSync(terminationMarker, "utf8")).toBe("terminated\n");
     expect(client.getUsage()).toBeUndefined();
     await client.shutdown();
+  });
+
+  test("immediate exit after acknowledgement settles once as process_exited with no pending command", async () => {
+    const { client } = makeClient("exit-immediate", workDir);
+    client.start();
+    await client.prompt("hello");
+
+    const first = client.waitSettled();
+    const second = client.waitSettled();
+    expect(await first).toMatchObject({
+      reason: "process_exited",
+      failureCause: { code: AgentErrorCode.ProcessExited },
+    });
+    expect(await second).toEqual(await first);
+    await expect(client.getEntries()).rejects.toThrow("rpc child has exited");
+    await expect(client.shutdown()).resolves.toBeUndefined();
+  });
+
+  test("exit while the correlated get_entries is outstanding terminates settlement recovery", async () => {
+    const runId: RunId = brandRunId("aaaaaaaa");
+    const { client, outputStore } = makeClient("exit-pending-get-entries", workDir, {}, process.execPath, {
+      FAKE_RPC_HANDSHAKE_DIR: workDir,
+    });
+    client.start();
+    client.bindRun(runId);
+    await client.prompt("hello");
+    await waitForFixtureMarker(join(workDir, "get-entries-received"));
+
+    const settlement = client.waitSettled();
+    const alsoSettlement = client.waitSettled();
+    const stillPending = Symbol("still-pending");
+    expect(await Promise.race([settlement, Promise.resolve().then().then(() => stillPending)]))
+      .toBe(stillPending);
+
+    writeFileSync(join(workDir, "release-pending-get-entries"), "release\n");
+
+    expect(await settlement).toEqual({
+      reason: "agent_settled",
+      stopReason: "error",
+      failureCause: terminalFailureCause(AgentErrorCode.ProtocolError),
+    });
+    expect(await alsoSettlement).toEqual(await settlement);
+    expect(outputStore.currentOutput(runId).transportIncomplete).toBeTrue();
+    await expect(client.shutdown()).resolves.toBeUndefined();
   });
 
   test("aggregates optional usage counters across finalised assistant messages", async () => {

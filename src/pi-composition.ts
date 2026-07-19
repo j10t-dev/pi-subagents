@@ -116,7 +116,7 @@ export function createProductionController(
       await appender.appendRunStopping({
         agentId: record.agentId,
         runId: record.runId,
-        reason: reason === CancellationReason.ParentShutdown ? reason : CancellationReason.StopRequested,
+        reason,
         containmentReceiptPath: child.session.containmentReceiptPath,
       });
     },

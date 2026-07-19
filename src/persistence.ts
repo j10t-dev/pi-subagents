@@ -33,7 +33,8 @@ import {
 } from "./domain.ts";
 import { absolutePath, restoredStatePath } from "./paths.ts";
 import { PersistenceSequencer } from "./async-primitives.ts";
-import { decodePersistedAgentEvent, type AgentCompletionDto } from "./schemas.ts";
+import { Value } from "typebox/value";
+import { AgentUsageSchema, decodePersistedAgentEvent, type AgentCompletionDto } from "./schemas.ts";
 import type { ContainmentDescriptor } from "./containment.ts";
 
 /** Matches Pi's `ExtensionAPI.appendEntry<T>(customType, data)` shape so it can be injected in tests. */
@@ -163,17 +164,11 @@ function restoredDiagnosticsPath(value: string, root: string): AbsolutePath {
 }
 
 function validateUsage(value: NonNullable<AgentCompletionDto["usage"]>): AgentUsage {
-  if (!isRecord(value) || !Number.isSafeInteger(value.turns) || Number(value.turns) < 0 || !isFiniteTree(value)) {
+  try {
+    return Value.Parse(AgentUsageSchema, value);
+  } catch {
     throw new Error("invalid_input: invalid persisted completion usage");
   }
-  return value;
-}
-
-function isFiniteTree(value: unknown): boolean {
-  if (typeof value === "number") return Number.isFinite(value);
-  if (Array.isArray(value)) return value.every(isFiniteTree);
-  if (isRecord(value)) return Object.values(value).every(isFiniteTree);
-  return true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -72,7 +72,7 @@ Parent shutdown contains every active process group before returning. There is n
 bun install --frozen-lockfile
 bun test test/extension.test.ts
 bun test test/pi-integration.test.ts
-bun test test/e2e.test.ts
+bun test test/controller-scenarios.test.ts
 bun test test/context-safety.test.ts
 bun tsc --noEmit
 bun run check:cgroup

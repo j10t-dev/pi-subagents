@@ -1,11 +1,42 @@
 import { describe, expect, test } from "bun:test";
-import { AgentErrorCode, AgentState, CancellationReason, agentId, runId, terminalFailureCause } from "../src/domain.ts";
-import { RunController, classifyTerminal, type RunControllerOptions } from "../src/run-controller.ts";
+import { AgentErrorCode, AgentState, CancellationReason, terminalFailureCause, type RunId } from "../src/domain.ts";
+import {
+  classifyTerminal,
+  type LaunchFailedResult,
+  type LaunchResult,
+  type RunRuntime,
+  type StopResult,
+} from "../src/run-controller.ts";
+import { testBarrier } from "./support/barriers.ts";
+import { testAgentId, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
+import { deferred } from "./support/async.ts";
+import { registerStopped, testRunController } from "./support/controllers.ts";
+import { testRuntime } from "./support/launches.ts";
+
+type AdoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>) => void;
+
+/** Each row forces one post-native-identity failure seam against one waiting contender. */
+const postNativeFailureCases = [
+  { operation: "send", failure: "launch-body", contender: "stop" },
+  { operation: "send", failure: "launch-body", contender: "shutdown" },
+  { operation: "spawn", failure: "launch-body", contender: "stop" },
+  { operation: "spawn", failure: "launch-body", contender: "shutdown" },
+  { operation: "send", failure: "accepted-callback", contender: "stop" },
+  { operation: "send", failure: "accepted-callback", contender: "shutdown" },
+  { operation: "spawn", failure: "accepted-callback", contender: "stop" },
+  { operation: "spawn", failure: "accepted-callback", contender: "shutdown" },
+] as const;
+
+const terminalOrderings = [
+  { name: "settlement claims terminal ownership before stop", first: "settlement" },
+  { name: "stop persists intent before settlement evidence", first: "stop" },
+] as const;
 
 describe("RunController arbitration", () => {
+
   test("restore admission joins an in-flight launch and excludes later launches until commit", async () => {
-    const c = controller({ capacity: 1 });
-    const existing = register(c);
+    const c = testRunController({ capacity: 1 });
+    const existing = registerStopped(c);
     const launchGate = deferred<void>();
     const launching = c.launch(existing, async () => {
       await launchGate.promise;
@@ -17,7 +48,7 @@ describe("RunController arbitration", () => {
     launchGate.resolve();
     await launching;
     const restore = await admission;
-    restore.reserve([{ agentId: agentId("restored"), state: AgentState.Settling, transcriptPath: "/tmp/restored" as never, runId: runId("deadbeef") }]);
+    restore.reserve([{ agentId: testAgentId("restored"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/restored"), runId: testRunId("deadbeef") }]);
     restore.commit();
     await expect(c.spawnNew(async () => { throw new Error("must not run"); })).rejects.toThrow("invalid_state:");
     restore.release();
@@ -25,28 +56,28 @@ describe("RunController arbitration", () => {
   });
 
   test("restore admission inherits obligations above current capacity and blocks new launches", async () => {
-    const c = controller({ capacity: 1 });
+    const c = testRunController({ capacity: 1 });
     const restore = await c.beginRestore();
     restore.reserve([
-      { agentId: agentId("one"), state: AgentState.Settling, transcriptPath: "/tmp/one" as never, runId: runId("deadbeef"), runtime: runtime() },
-      { agentId: agentId("two"), state: AgentState.Stopping, transcriptPath: "/tmp/two" as never, runId: runId("cafebabe"), runtime: runtime() },
+      { agentId: testAgentId("one"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/one"), runId: testRunId("deadbeef"), runtime: testRuntime() },
+      { agentId: testAgentId("two"), state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/two"), runId: testRunId("cafebabe"), runtime: testRuntime() },
     ]);
     restore.commit();
     restore.release();
     expect(c.activeCount()).toBe(2);
     await expect(c.spawnNew(async () => { throw new Error("must not run"); })).rejects.toThrow("capacity_exceeded:");
-    await c.stop(agentId("one"), CancellationReason.StopRequested);
+    await c.stop(testAgentId("one"), CancellationReason.StopRequested);
     expect(c.activeCount()).toBe(1);
     await expect(c.spawnNew(async () => { throw new Error("must not run"); })).rejects.toThrow("capacity_exceeded:");
-    await c.stop(agentId("two"), CancellationReason.StopRequested);
+    await c.stop(testAgentId("two"), CancellationReason.StopRequested);
     expect(c.activeCount()).toBe(0);
   });
 
   test("direct restore inherits every prior-session obligation above capacity", () => {
-    const c = controller({ capacity: 1 });
+    const c = testRunController({ capacity: 1 });
     const records = [
-      { agentId: agentId("first"), state: AgentState.Settling, transcriptPath: "/tmp/first" as never, runId: runId("deadbeef"), runtime: runtime() },
-      { agentId: agentId("second"), state: AgentState.Stopping, transcriptPath: "/tmp/second" as never, runId: runId("cafebabe"), runtime: runtime() },
+      { agentId: testAgentId("first"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/first"), runId: testRunId("deadbeef"), runtime: testRuntime() },
+      { agentId: testAgentId("second"), state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/second"), runId: testRunId("cafebabe"), runtime: testRuntime() },
     ];
     c.restore(records);
     expect(c.snapshots()).toHaveLength(2);
@@ -54,8 +85,8 @@ describe("RunController arbitration", () => {
   });
 
   test("restore cannot overwrite an existing record or leak its reservation", () => {
-    const c = controller({ capacity: 2 });
-    const existing = { agentId: agentId("existing"), state: AgentState.Settling, transcriptPath: "/tmp/existing" as never, runId: runId("deadbeef") };
+    const c = testRunController({ capacity: 2 });
+    const existing = { agentId: testAgentId("existing"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing"), runId: testRunId("deadbeef") };
     c.restore([existing]);
 
     expect(() => c.restore([{ ...existing, state: AgentState.Stopped }])).toThrow("invalid_agent:");
@@ -66,13 +97,13 @@ describe("RunController arbitration", () => {
   test("a natural candidate survives publication failure and stop retries that same candidate", async () => {
     const seen: string[] = [];
     let attempts = 0;
-    const c = controller({ onTerminal: async (_record, settlement) => {
+    const c = testRunController({ onTerminal: async (_record, settlement) => {
       seen.push(settlement.kind);
       if (++attempts === 1) throw new Error("publication failed");
     } });
-    const id = register(c);
-    await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime() }));
-    expect((await c.settle(id, runId("deadbeef"), { kind: "completed" })).status).toBe("containment_failed");
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
+    expect((await c.settle(id, testRunId("deadbeef"), { kind: "completed" })).status).toBe("containment_failed");
     expect(await c.stop(id, CancellationReason.StopRequested)).toMatchObject({ status: "already_stopped" });
     expect(seen).toEqual(["completed", "completed"]);
   });
@@ -80,39 +111,39 @@ describe("RunController arbitration", () => {
   test("pre-run containment retry releases ownership without creating a terminal run", async () => {
     let contains = 0;
     let terminals = 0;
-    const c = controller({ onTerminal: async () => { terminals++; } });
+    const c = testRunController({ onTerminal: async () => { terminals++; } });
     await c.spawnNew(async (register) => {
-      register({ agentId: agentId("pre-run"), transcriptPath: "/tmp/pre" as never });
-      return { status: "containment_failed", agentId: agentId("pre-run"), transcriptPath: "/tmp/pre" as never,
-        runtime: { abort: async () => {}, contain: async () => { contains++; return "/tmp/pre.receipt" as never; } } };
+      register({ agentId: testAgentId("pre-run"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre") });
+      return { status: "containment_failed", agentId: testAgentId("pre-run"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre"),
+        runtime: { abort: async () => {}, contain: async () => { contains++; return testVerifiedReceiptPath("/tmp/pi-subagents-test/receipts/pre.receipt"); } } };
     });
-    expect(await c.stop(agentId("pre-run"), CancellationReason.StopRequested)).toEqual({ status: "already_stopped", agentId: agentId("pre-run") });
+    expect(await c.stop(testAgentId("pre-run"), CancellationReason.StopRequested)).toEqual({ status: "already_stopped", agentId: testAgentId("pre-run") });
     expect(terminals).toBe(0);
     expect(contains).toBe(1);
     expect(c.activeCount()).toBe(0);
   });
   test("restored historical-unresolved receipt retries join one pre-run owner", async () => {
     let valid = false, contains = 0, terminals = 0, stoppings = 0, releases = 0;
-    const c = controller({
+    const c = testRunController({
       onStopping: () => { stoppings++; },
       onTerminal: () => { terminals++; },
       onRelease: () => { releases++; },
     });
-    const id = agentId("restored-pre-run");
+    const id = testAgentId("restored-pre-run");
     c.restore([{
-      agentId: id, state: AgentState.Stopping, transcriptPath: "/tmp/pre" as never,
+      agentId: id, state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre"),
       containmentResponsibility: "historical-unresolved",
       runtime: { abort: async () => { throw new Error("must not abort"); }, contain: async () => {
         contains++;
         if (!valid) throw new Error("receipt unavailable");
-        return "/tmp/pre.receipt" as never;
+        return testVerifiedReceiptPath("/tmp/pi-subagents-test/receipts/pre.receipt");
       } },
     }]);
 
-    expect(await c.stop(id, "stop")).toMatchObject({ status: "containment_failed", agentState: AgentState.Stopping });
+    expect(await c.stop(id, CancellationReason.StopRequested)).toMatchObject({ status: "containment_failed", agentState: AgentState.Stopping });
     expect(c.snapshot(id)?.containmentResponsibility).toBe("historical-unresolved");
     valid = true;
-    const results = await Promise.all([c.stop(id, "stop"), c.stop(id, "shutdown")]);
+    const results = await Promise.all([c.stop(id, CancellationReason.StopRequested), c.stop(id, CancellationReason.ParentShutdown)]);
     expect(results).toEqual([
       { status: "already_stopped", agentId: id },
       { status: "already_stopped", agentId: id },
@@ -121,27 +152,67 @@ describe("RunController arbitration", () => {
       contains: 2, terminals: 0, stoppings: 0, releases: 1, active: 0, runId: undefined,
     });
   });
-  test("pre-run containment has one joinable owner across 100 success and failure/retry schedules", async () => {
-    for (let schedule = 0; schedule < 100; schedule++) {
-      let attempts = 0, releases = 0;
-      const gate = deferred<void>();
-      const c = controller({ onRelease: () => { releases++; } });
-      const id = agentId(`pre-${schedule}`);
-      await c.spawnNew(async (register) => {
-        register({ agentId: id, transcriptPath: "/tmp/pre" as never });
-        return { status: "containment_failed", agentId: id, transcriptPath: "/tmp/pre" as never,
-          runtime: { abort: async () => {}, contain: async () => { attempts++; await gate.promise; if (schedule % 2 === 1 && attempts === 1) throw new Error("still alive"); return "/tmp/r" as never; } } };
-      });
-      const callers = [c.stop(id, "shutdown"), c.stop(id, "retry"), c.stop(id, "stop")];
-      gate.resolve();
-      const first = await Promise.all(callers);
-      expect(attempts).toBe(1);
-      expect(new Set(first.map((value) => value.status)).size).toBe(1);
-      if (schedule % 2 === 1) expect((await c.stop(id, "retry")).status).toBe("already_stopped");
-      expect(releases).toBe(1);
-      expect((await c.stop(id, "late")).status).toBe("already_stopped");
-      expect(attempts).toBe(schedule % 2 === 1 ? 2 : 1);
-    }
+  test("concurrent stop callers enter pre-run containment before it completes and join one owner", async () => {
+    let attempts = 0, releases = 0;
+    const gate = testBarrier("pre-run-containment");
+    const c = testRunController({ onRelease: () => { releases++; } });
+    const id = testAgentId("pre-join");
+    await c.spawnNew(async (register) => {
+      register({ agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre") });
+      return { status: "containment_failed", agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre"),
+        runtime: { abort: async () => {}, contain: async () => { attempts++; await gate.enterAndWait(); return testVerifiedReceiptPath("/tmp/pi-subagents-test/receipts/r"); } } };
+    });
+
+    const callers = [c.stop(id, CancellationReason.ParentShutdown), c.stop(id, CancellationReason.StopRequested), c.stop(id, CancellationReason.StopRequested)];
+    await gate.entered;
+    expect(attempts).toBe(1);
+    gate.release();
+
+    expect(await Promise.all(callers)).toEqual([
+      { status: "already_stopped", agentId: id },
+      { status: "already_stopped", agentId: id },
+      { status: "already_stopped", agentId: id },
+    ]);
+    expect(releases).toBe(1);
+    expect((await c.stop(id, CancellationReason.StopRequested)).status).toBe("already_stopped");
+    expect(attempts).toBe(1);
+    expect(c.activeCount()).toBe(0);
+  });
+
+  test("first pre-run containment failure retains state and capacity, then explicit retry contains once more", async () => {
+    let attempts = 0, releases = 0;
+    const failing = testBarrier("pre-run-containment-failure");
+    const c = testRunController({ onRelease: () => { releases++; } });
+    const id = testAgentId("pre-retry");
+    await c.spawnNew(async (register) => {
+      register({ agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre") });
+      return { status: "containment_failed", agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre"),
+        runtime: { abort: async () => {}, contain: async () => {
+          if (++attempts === 1) { await failing.enterAndWait(); throw new Error("still alive"); }
+          return testVerifiedReceiptPath("/tmp/pi-subagents-test/receipts/r");
+        } } };
+    });
+
+    const callers = [c.stop(id, CancellationReason.ParentShutdown), c.stop(id, CancellationReason.StopRequested), c.stop(id, CancellationReason.StopRequested)];
+    await failing.entered;
+    failing.release();
+    const failures = await Promise.all(callers);
+
+    expect(failures).toEqual([
+      { status: "containment_failed", agentId: id, agentState: AgentState.Stopping, code: AgentErrorCode.ContainmentFailed },
+      { status: "containment_failed", agentId: id, agentState: AgentState.Stopping, code: AgentErrorCode.ContainmentFailed },
+      { status: "containment_failed", agentId: id, agentState: AgentState.Stopping, code: AgentErrorCode.ContainmentFailed },
+    ]);
+    expect(attempts).toBe(1);
+    expect(releases).toBe(0);
+    expect(c.activeCount()).toBe(1);
+
+    expect((await c.stop(id, CancellationReason.StopRequested)).status).toBe("already_stopped");
+    expect(attempts).toBe(2);
+    expect(releases).toBe(1);
+    expect((await c.stop(id, CancellationReason.StopRequested)).status).toBe("already_stopped");
+    expect(attempts).toBe(2);
+    expect(c.activeCount()).toBe(0);
   });
   test("classifies native terminal observations without treating an uncorrelated abort as cancellation", () => {
     expect(classifyTerminal({ kind: "settled", stopReason: "stop" })).toEqual({ kind: "completed" });
@@ -156,10 +227,10 @@ describe("RunController arbitration", () => {
 
   test("a restored nonterminal record without containment responsibility cannot finalise", async () => {
     let publications = 0;
-    const c = controller({ onTerminal: () => { publications++; } });
-    const id = agentId("restored");
-    c.restore([{ agentId: id, state: AgentState.Settling, transcriptPath: "/tmp/a" as never, runId: runId("deadbeef") }]);
-    const result = await c.settle(id, runId("deadbeef"), { kind: "completed" });
+    const c = testRunController({ onTerminal: () => { publications++; } });
+    const id = testAgentId("restored");
+    c.restore([{ agentId: id, state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: testRunId("deadbeef") }]);
+    const result = await c.settle(id, testRunId("deadbeef"), { kind: "completed" });
     expect(result).toMatchObject({ status: "containment_failed", agentState: AgentState.Settling });
     expect(c.snapshot(id)?.state).toBe(AgentState.Settling);
     expect(c.activeCount()).toBe(1);
@@ -168,13 +239,13 @@ describe("RunController arbitration", () => {
 
   test("terminal persistence rejection resolves every waiter and permits one later retry", async () => {
     let attempts = 0, publications = 0, releases = 0;
-    const c = controller({
+    const c = testRunController({
       onTerminal: () => { publications++; if (++attempts === 1) throw new Error("disk detail"); },
       onRelease: () => { releases++; },
     });
-    const id = register(c);
-    await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime() }));
-    const natural = c.settle(id, runId("deadbeef"), { kind: "completed" });
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
+    const natural = c.settle(id, testRunId("deadbeef"), { kind: "completed" });
     const waiter = c.stop(id, CancellationReason.StopRequested);
     await expect(Promise.all([natural, waiter])).resolves.toEqual([
       expect.objectContaining({ status: "containment_failed", agentState: AgentState.Settling }),
@@ -182,162 +253,117 @@ describe("RunController arbitration", () => {
     ]);
     expect(c.activeCount()).toBe(1);
     expect(c.snapshot(id)?.state).toBe(AgentState.Settling);
-    expect((await c.settle(id, runId("deadbeef"), { kind: "completed" })).status).toBe("stopped");
+    expect((await c.settle(id, testRunId("deadbeef"), { kind: "completed" })).status).toBe("stopped");
     expect(publications).toBe(2);
     expect(releases).toBe(1);
   });
   test("accepted native identity excludes overlapping send", async () => {
-    const c = controller(); const id = register(c);
-    const accepted = await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime() }));
-    expect(accepted).toEqual({ status: "running", agentId: id, runId: runId("deadbeef") });
-    await expect(c.launch(id, async () => ({ status: "accepted", runId: runId("cafebabe"), runtime: runtime() }))).rejects.toThrow("invalid_state:");
+    const c = testRunController(); const id = registerStopped(c);
+    const accepted = await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
+    expect(accepted).toEqual({ status: "running", agentId: id, runId: testRunId("deadbeef") });
+    await expect(c.launch(id, async () => ({ status: "accepted", runId: testRunId("cafebabe"), runtime: testRuntime() }))).rejects.toThrow("invalid_state:");
   });
 
   test("an unexpected throw after native identity adoption terminalises the retained run", async () => {
     const seen: string[] = [];
-    const c = controller({ onTerminal: (_record, settlement) => {
+    const c = testRunController({ onTerminal: (_record, settlement) => {
       seen.push(settlement.kind === "failed" ? settlement.cause.code : settlement.kind);
     } });
-    const id = register(c);
+    const id = registerStopped(c);
 
     const result = await c.launch(id, async (adoptIdentity) => {
-      adoptIdentity(runId("deadbeef"), runtime());
+      adoptIdentity(testRunId("deadbeef"), testRuntime());
       throw new Error("raw post-identity detail");
     });
 
-    expect(result).toEqual({ status: "settling", agentId: id, runId: runId("deadbeef") });
+    expect(result).toEqual({ status: "settling", agentId: id, runId: testRunId("deadbeef") });
     await c.stop(id, CancellationReason.StopRequested);
-    expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
+    expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: testRunId("deadbeef") });
     expect(seen).toEqual([AgentErrorCode.SpawnFailed]);
     expect(c.activeCount()).toBe(0);
   });
 
-  test("post-identity launch failure owns settlement before waiting stops resume in 100 schedules", async () => {
-    for (let schedule = 0; schedule < 100; schedule++) {
+  for (const testCase of postNativeFailureCases) {
+    const { operation, failure, contender } = testCase;
+    test(`${operation} ${failure} failure owns settlement before the waiting ${contender} contender`, async () => {
       const trace: string[] = [];
-      const failed = deferred<void>();
-      const releaseFailure = deferred<void>();
-      const c = controller({
+      const id = testAgentId(`${operation}-${failure}-${contender}`);
+      const transcriptPath = testSessionPath("/tmp/pi-subagents-test/post-native");
+      const reason = contender === "stop" ? CancellationReason.StopRequested : CancellationReason.ParentShutdown;
+      const c = testRunController({
         onStopping: () => { trace.push("persist:stopping"); },
         onTerminal: (_record, settlement) => { trace.push(`publish:${settlement.kind}`); },
       });
-      const id = register(c, schedule);
-      const launching = c.launch(id, async (adoptIdentity) => {
-        adoptIdentity(runId("deadbeef"), {
-          abort: async () => { trace.push("abort"); },
-          contain: async () => { trace.push("contain"); return "/tmp/receipt" as never; },
-        });
-        failed.resolve();
-        await releaseFailure.promise;
-        throw new Error("post-ID launch failure");
-      });
-      await failed.promise;
-      const stopping = c.stop(id, schedule % 2 === 0 ? CancellationReason.StopRequested : CancellationReason.ParentShutdown);
-      releaseFailure.resolve();
+      if (operation === "send") c.register({ agentId: id, state: AgentState.Stopped, transcriptPath });
+      const runtime = testRuntime({ trace });
 
-      expect(await launching).toEqual({ status: "settling", agentId: id, runId: runId("deadbeef") });
-      expect(await stopping).toEqual({ status: "already_stopped", agentId: id });
-      expect(trace).toEqual(["contain", "publish:failed"]);
-      expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
-      expect(c.activeCount()).toBe(0);
-    }
-  });
-
-  test("post-identity spawn failure owns settlement before waiting shutdown stops resume in 100 schedules", async () => {
-    for (let schedule = 0; schedule < 100; schedule++) {
-      const trace: string[] = [];
-      const failed = deferred<void>();
-      const releaseFailure = deferred<void>();
-      const id = agentId(`spawn-failure-${schedule}`);
-      const c = controller({
-        onStopping: () => { trace.push("persist:stopping"); },
-        onTerminal: (_record, settlement) => { trace.push(`publish:${settlement.kind}`); },
-      });
-      const spawning = c.spawnNew(async (register, adoptIdentity) => {
-        register({ agentId: id, transcriptPath: "/tmp/spawn-failure" as never });
-        adoptIdentity(runId("deadbeef"), {
-          abort: async () => { trace.push("abort"); },
-          contain: async () => { trace.push("contain"); return "/tmp/receipt" as never; },
-        });
-        failed.resolve();
-        await releaseFailure.promise;
-        throw new Error("post-ID spawn failure");
-      });
-      await failed.promise;
-      const stopping = c.stop(id, CancellationReason.ParentShutdown);
-      releaseFailure.resolve();
-
-      expect(await spawning).toEqual({ status: "settling", agentId: id, runId: runId("deadbeef") });
-      expect(await stopping).toEqual({ status: "already_stopped", agentId: id });
-      expect(trace).toEqual(["contain", "publish:failed"]);
-      expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
-      expect(c.activeCount()).toBe(0);
-    }
-  });
-
-  for (const operation of ["send", "spawn"] as const) {
-    test(`${operation} callback-subscription failure owns settlement before 100 waiting stop/shutdown contenders`, async () => {
-      for (let schedule = 0; schedule < 100; schedule++) {
-        const trace: string[] = [];
-        const id = operation === "send" ? agentId(`accepted-send-${schedule}`) : agentId(`accepted-spawn-${schedule}`);
-        const c = controller({
-          onStopping: () => { trace.push("persist:stopping"); },
-          onTerminal: (_record, settlement) => { trace.push(`publish:${settlement.kind}`); },
-        });
-        if (operation === "send") c.register({ agentId: id, state: AgentState.Stopped, transcriptPath: "/tmp/accepted" as never });
-        let contender!: Promise<unknown>;
+      let contending!: Promise<StopResult>;
+      let launching: Promise<LaunchResult | LaunchFailedResult>;
+      if (failure === "launch-body") {
+        const failing = testBarrier(`${operation}-launch-body-${contender}`);
+        const body = async (adoptIdentity: AdoptIdentity): Promise<never> => {
+          adoptIdentity(testRunId("deadbeef"), runtime);
+          await failing.enterAndWait();
+          throw new Error("post-identity launch failure");
+        };
+        launching = operation === "send"
+          ? c.launch(id, body)
+          : c.spawnNew(async (register, adoptIdentity) => {
+            register({ agentId: id, transcriptPath });
+            return body(adoptIdentity);
+          });
+        await failing.entered;
+        contending = c.stop(id, reason);
+        failing.release();
+      } else {
         const acceptedRun = {
           status: "accepted" as const,
-          runId: runId("deadbeef"),
-          runtime: {
-            abort: async () => { trace.push("abort"); },
-            contain: async () => { trace.push("contain"); return "/tmp/receipt" as never; },
-          },
+          runId: testRunId("deadbeef"),
+          runtime,
           onAccepted: () => {
-            contender = c.stop(id, schedule % 2 === 0 ? CancellationReason.StopRequested : CancellationReason.ParentShutdown);
+            contending = c.stop(id, reason);
             throw new Error("callback subscription failed");
           },
         };
-
-        const launching = operation === "send"
+        launching = operation === "send"
           ? c.launch(id, async () => acceptedRun)
           : c.spawnNew(async (register) => {
-            register({ agentId: id, transcriptPath: "/tmp/accepted" as never });
-            return { ...acceptedRun, agentId: id, transcriptPath: "/tmp/accepted" as never };
+            register({ agentId: id, transcriptPath });
+            return { ...acceptedRun, agentId: id, transcriptPath };
           });
-
-        expect(await launching).toEqual({ status: "settling", agentId: id, runId: runId("deadbeef") });
-        expect(await contender).toEqual({ status: "already_stopped", agentId: id });
-        expect(trace).toEqual(["contain", "publish:failed"]);
-        expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
-        expect(c.activeCount()).toBe(0);
       }
+
+      expect(await launching).toEqual({ status: "settling", agentId: id, runId: testRunId("deadbeef") });
+      expect(await contending).toEqual({ status: "already_stopped", agentId: id });
+      expect(trace).toEqual(["contain", "publish:failed"]);
+      expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: testRunId("deadbeef") });
+      expect(c.activeCount()).toBe(0);
     });
   }
 
   for (const operation of ["send", "spawn"] as const) {
     test(`${operation} reports settling immediately when post-native acceptance fails`, async () => {
       const terminalGate = deferred<void>();
-      const id = agentId(`settling-${operation}`);
-      const c = controller({ onTerminal: async () => { await terminalGate.promise; } });
-      if (operation === "send") c.register({ agentId: id, state: AgentState.Stopped, transcriptPath: "/tmp/settling" as never });
+      const id = testAgentId(`settling-${operation}`);
+      const c = testRunController({ onTerminal: async () => { await terminalGate.promise; } });
+      if (operation === "send") c.register({ agentId: id, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/settling") });
       const failed = {
         status: "identity_failed" as const,
-        runId: runId("deadbeef"),
-        runtime: runtime(),
+        runId: testRunId("deadbeef"),
+        runtime: testRuntime(),
         beforeTerminal: async () => {},
       };
 
       const launching = operation === "send"
         ? c.launch(id, async (adoptIdentity) => { adoptIdentity(failed.runId, failed.runtime); return failed; })
         : c.spawnNew(async (register, adoptIdentity) => {
-          register({ agentId: id, transcriptPath: "/tmp/settling" as never });
+          register({ agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/settling") });
           adoptIdentity(failed.runId, failed.runtime);
-          return { ...failed, agentId: id, transcriptPath: "/tmp/settling" as never };
+          return { ...failed, agentId: id, transcriptPath: testSessionPath("/tmp/pi-subagents-test/settling") };
         });
 
       expect(await Promise.race([launching, Bun.sleep(100).then(() => "timed_out" as const)])).toEqual({
-        status: "settling", agentId: id, runId: runId("deadbeef"),
+        status: "settling", agentId: id, runId: testRunId("deadbeef"),
       });
       expect(c.snapshot(id)?.state).toBe(AgentState.Settling);
       terminalGate.resolve();
@@ -346,43 +372,74 @@ describe("RunController arbitration", () => {
     });
   }
 
-  test("settlement wins in 100 deterministic schedules and stop only waits", async () => {
-    for (let i = 0; i < 100; i++) {
-      let publications = 0; const c = controller({ onTerminal: () => { publications++; } }); const id = register(c, i);
-      await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime() }));
-      const settling = c.settle(id, runId("deadbeef"), { kind: "completed" });
-      const stopped = await c.stop(id, CancellationReason.StopRequested);
-      await settling;
-      expect(stopped.status).toBe("already_stopped"); expect(publications).toBe(1);
-    }
-  });
+  for (const ordering of terminalOrderings) {
+    test(ordering.name, async () => {
+      const trace: string[] = [];
+      const publications: string[] = [];
+      let releases = 0;
+      const gate = testBarrier(ordering.name);
+      const c = testRunController({
+        onStopping: async () => {
+          trace.push("persist:stopping");
+          if (ordering.first === "stop") await gate.enterAndWait();
+        },
+        onTerminal: async (_record, settlement) => {
+          publications.push(settlement.kind);
+          trace.push(`publish:${settlement.kind}`);
+          if (ordering.first === "settlement") await gate.enterAndWait();
+        },
+        onRelease: () => { releases++; },
+      });
+      const id = registerStopped(c);
+      await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime({ trace }) }));
 
-  test("stop wins in 100 schedules, persists intent before abort, and later settlement is evidence only", async () => {
-    for (let i = 0; i < 100; i++) {
-      const trace: string[] = []; const c = controller({ onStopping: () => { trace.push("persist:stopping"); }, onTerminal: (_r, s) => { trace.push(`publish:${s.kind}`); } }); const id = register(c, i);
-      await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime(trace) }));
-      const stopping = c.stop(id, CancellationReason.StopRequested);
-      await c.settle(id, runId("deadbeef"), { kind: "completed" });
-      expect((await stopping).status).toBe("stopped");
-      expect(trace).toEqual(["persist:stopping", "abort", "contain", "publish:cancelled"]);
-    }
-  });
+      if (ordering.first === "settlement") {
+        const settling = c.settle(id, testRunId("deadbeef"), { kind: "completed" });
+        await gate.entered;
+        const stopping = c.stop(id, CancellationReason.StopRequested);
+        gate.release();
+
+        expect(await settling).toEqual({ status: "stopped", agentId: id, runId: testRunId("deadbeef") });
+        expect(await stopping).toEqual({ status: "already_stopped", agentId: id });
+        expect(publications).toEqual(["completed"]);
+        expect(trace).toEqual(["contain", "publish:completed"]);
+      } else {
+        const stopping = c.stop(id, CancellationReason.StopRequested);
+        await gate.entered;
+        // The first settlement joins the in-flight stop as evidence only.
+        const settling = c.settle(id, testRunId("deadbeef"), { kind: "completed" });
+        gate.release();
+
+        expect(await stopping).toEqual({ status: "stopped", agentId: id, runId: testRunId("deadbeef") });
+        expect(await settling).toEqual({ status: "already_stopped", agentId: id });
+        // A late settlement arriving after the stop-won terminal has completed must be
+        // suppressed: no second publication, and capacity already released stays released.
+        expect(await c.settle(id, testRunId("deadbeef"), { kind: "completed" }))
+          .toEqual({ status: "already_stopped", agentId: id });
+        expect(publications).toEqual(["cancelled"]);
+        expect(trace).toEqual(["persist:stopping", "abort", "contain", "publish:cancelled"]);
+      }
+      expect(c.snapshot(id)?.state).toBe(AgentState.Stopped);
+      expect(c.activeCount()).toBe(0);
+      expect(releases).toBe(1);
+    });
+  }
 
   test("an unacknowledged abort cannot block bounded stop containment", async () => {
     const trace: string[] = [];
     const abortNeverSettles = new Promise<void>(() => {});
-    const c = controller({
+    const c = testRunController({
       onStopping: () => { trace.push("persist:stopping"); },
       onTerminal: (_record, settlement) => { trace.push(`publish:${settlement.kind}`); },
       onRelease: () => { trace.push("release"); },
     });
-    const id = register(c);
+    const id = registerStopped(c);
     await c.launch(id, async () => ({
       status: "accepted",
-      runId: runId("deadbeef"),
+      runId: testRunId("deadbeef"),
       runtime: {
         abort: async () => { trace.push("abort:sent"); await abortNeverSettles; },
-        contain: async () => { trace.push("contain:receipt"); return "/tmp/receipt" as never; },
+        contain: async () => { trace.push("contain:receipt"); return testVerifiedReceiptPath() },
       },
     }));
 
@@ -391,7 +448,7 @@ describe("RunController arbitration", () => {
       Bun.sleep(100).then(() => "timed_out" as const),
     ]);
 
-    expect(result).toEqual({ status: "stopped", agentId: id, runId: runId("deadbeef") });
+    expect(result).toEqual({ status: "stopped", agentId: id, runId: testRunId("deadbeef") });
     expect(trace).toEqual([
       "persist:stopping",
       "abort:sent",
@@ -407,9 +464,9 @@ describe("RunController arbitration", () => {
     "the winning %s cancellation reason reaches terminal finalisation",
     async (reason) => {
       const settlements: unknown[] = [];
-      const c = controller({ onTerminal: (_record, settlement) => { settlements.push(settlement); } });
-      const id = register(c);
-      await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime() }));
+      const c = testRunController({ onTerminal: (_record, settlement) => { settlements.push(settlement); } });
+      const id = registerStopped(c);
+      await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
 
       await c.stop(id, reason);
 
@@ -419,26 +476,30 @@ describe("RunController arbitration", () => {
 
   test("failed containment retains stopping state and reservation; later receipt finalises once", async () => {
     let attempts = 0, releases = 0, publications = 0;
-    const c = controller({ onRelease: () => { releases++; }, onTerminal: () => { publications++; } }); const id = register(c);
-    await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime([], async () => { if (++attempts === 1) throw new Error("alive"); }) }));
+    const c = testRunController({ onRelease: () => { releases++; }, onTerminal: () => { publications++; } });
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime({ contain: async () => { if (++attempts === 1) throw new Error("alive"); return testVerifiedReceiptPath(); } }) }));
     expect((await c.stop(id, CancellationReason.StopRequested)).status).toBe("containment_failed");
-    expect(c.snapshot(id)?.state).toBe(AgentState.Stopping); expect(c.activeCount()).toBe(1); expect(publications).toBe(0);
+    expect(c.snapshot(id)?.state).toBe(AgentState.Stopping);
+    expect(c.activeCount()).toBe(1);
+    expect(publications).toBe(0);
     expect((await c.stop(id, CancellationReason.StopRequested)).status).toBe("stopped");
-    expect(releases).toBe(1); expect(publications).toBe(1);
+    expect(releases).toBe(1);
+    expect(publications).toBe(1);
   });
 
   test("beforeTerminal failure after proven containment reports terminal_persistence_failed, not containment_failed, and retry does not re-contain", async () => {
     let containments = 0;
     let beforeTerminalAttempts = 0;
-    const c = controller();
-    const id = register(c);
-    const rt = runtime([], async () => { containments++; });
+    const c = testRunController();
+    const id = registerStopped(c);
+    const rt = testRuntime({ contain: async () => { containments++; return testVerifiedReceiptPath(); } });
     await c.launch(id, async (adoptIdentity) => {
-      adoptIdentity(runId("deadbeef"), rt, async () => {
+      adoptIdentity(testRunId("deadbeef"), rt, async () => {
         beforeTerminalAttempts++;
         if (beforeTerminalAttempts === 1) throw new Error("append unavailable");
       });
-      return { status: "accepted", runId: runId("deadbeef"), runtime: rt };
+      return { status: "accepted", runId: testRunId("deadbeef"), runtime: rt };
     });
 
     const first = await c.stop(id, CancellationReason.StopRequested);
@@ -452,89 +513,123 @@ describe("RunController arbitration", () => {
     expect(beforeTerminalAttempts).toBe(2);
   });
 
-  test("duplicate terminal callbacks settle exactly once in 100 schedules", async () => {
-    for (let i = 0; i < 100; i++) {
-      let publications = 0, releases = 0, containments = 0;
-      const gate = deferred<void>();
-      const c = controller({ onTerminal: () => { publications++; }, onRelease: () => { releases++; } });
-      const id = register(c, i);
-      await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime([], async () => { containments++; await gate.promise; }) }));
-      const callbacks = i % 2 === 0
-        ? [c.settle(id, runId("deadbeef"), { kind: "completed" }), c.settle(id, runId("deadbeef"), { kind: "failed", cause: terminalFailureCause(AgentErrorCode.ProtocolError) }), c.stop(id, CancellationReason.StopRequested)]
-        : [c.stop(id, CancellationReason.StopRequested), c.settle(id, runId("deadbeef"), { kind: "completed" }), c.settle(id, runId("deadbeef"), { kind: "failed", cause: terminalFailureCause(AgentErrorCode.ProtocolError) })];
-      gate.resolve();
-      await Promise.all(callbacks);
-      expect(publications).toBe(1); expect(releases).toBe(1); expect(containments).toBe(1);
-      expect(c.activeCount()).toBe(0); expect(c.snapshot(id)?.state).toBe(AgentState.Stopped);
-    }
+  test("two settlement callers released together publish one terminal and release capacity once", async () => {
+    let publications = 0, releases = 0, containments = 0;
+    const gate = testBarrier("duplicate-settlement-containment");
+    const c = testRunController({ onTerminal: () => { publications++; }, onRelease: () => { releases++; } });
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime({ contain: async () => { containments++; await gate.enterAndWait(); return testVerifiedReceiptPath(); } }) }));
+
+    const callers = [
+      c.settle(id, testRunId("deadbeef"), { kind: "completed" }),
+      c.settle(id, testRunId("deadbeef"), { kind: "failed", cause: terminalFailureCause(AgentErrorCode.ProtocolError) }),
+      c.stop(id, CancellationReason.StopRequested),
+    ];
+    await gate.entered;
+    expect(containments).toBe(1);
+    gate.release();
+    await Promise.all(callers);
+
+    expect({ publications, releases, containments }).toEqual({ publications: 1, releases: 1, containments: 1 });
+    expect(c.activeCount()).toBe(0);
+    expect(c.snapshot(id)?.state).toBe(AgentState.Stopped);
   });
 
-  test("send_input versus stop has only serialisable outcomes in 100 schedules", async () => {
-    for (let i = 0; i < 100; i++) {
-      const c = controller(); const id = register(c, i);
-      if (i % 2 === 1) {
-        await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime() }));
-        const sending = c.launch(id, async () => ({ status: "accepted", runId: runId("cafebabe"), runtime: runtime() }));
-        const stopping = c.stop(id, CancellationReason.StopRequested);
-        await expect(sending).rejects.toThrow("invalid_state:");
-        expect((await stopping).status).toBe("stopped");
-        expect(c.activeCount()).toBe(0); expect(c.snapshot(id)?.state).toBe(AgentState.Stopped);
-        continue;
-      }
-      const launchGate = deferred<void>();
-      const sending = c.launch(id, async () => { await launchGate.promise; return { status: "accepted", runId: runId("deadbeef"), runtime: runtime() }; });
-      const stopping = c.stop(id, CancellationReason.StopRequested);
-      launchGate.resolve();
-      const [send, stop] = await Promise.all([sending, stopping]);
-      expect(send.status).toBe("running");
-      expect(stop.status).toBe("stopped");
-      expect(c.activeCount()).toBe(0);
-      expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
-    }
+  test("send_input admission completes before stop claims the stopped record", async () => {
+    const admitting = testBarrier("send-admission");
+    const c = testRunController();
+    const id = registerStopped(c);
+    const sending = c.launch(id, async () => {
+      await admitting.enterAndWait();
+      return { status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() };
+    });
+    await admitting.entered;
+    const stopping = c.stop(id, CancellationReason.StopRequested);
+    admitting.release();
+
+    expect(await sending).toEqual({ status: "running", agentId: id, runId: testRunId("deadbeef") });
+    expect(await stopping).toEqual({ status: "stopped", agentId: id, runId: testRunId("deadbeef") });
+    expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: testRunId("deadbeef") });
+    expect(c.activeCount()).toBe(0);
   });
 
-  test("sequential runs have fresh terminal ownership and ignore delayed prior-run callbacks", async () => {
-    for (let schedule = 0; schedule < 100; schedule++) {
-      const publications: string[] = [];
-      const c = controller({ onTerminal: (record, settlement) => { publications.push(`${record.runId}:${settlement.kind}`); } });
-      const id = register(c, schedule);
-      const first = runId("deadbeef");
-      const second = runId("cafebabe");
-      await c.launch(id, async () => ({ status: "accepted", runId: first, runtime: runtime() }));
-      expect((await c.settle(id, first, { kind: "completed" })).status).toBe("stopped");
-      await c.launch(id, async () => ({ status: "accepted", runId: second, runtime: runtime() }));
+  test("stop claims the stopped record before send_input admission", async () => {
+    let admittedSends = 0;
+    const stopping = testBarrier("stop-intent-persistence");
+    const c = testRunController({ onStopping: async () => { await stopping.enterAndWait(); } });
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
 
-      const delayed = c.settle(id, first, schedule % 2 === 0
-        ? { kind: "failed", cause: terminalFailureCause(AgentErrorCode.ProtocolError) }
-        : { kind: "completed" });
-      const stopped = c.stop(id, CancellationReason.StopRequested);
+    const stopped = c.stop(id, CancellationReason.StopRequested);
+    await stopping.entered;
+    await expect(c.launch(id, async () => {
+      admittedSends++;
+      return { status: "accepted", runId: testRunId("cafebabe"), runtime: testRuntime() };
+    })).rejects.toThrow("invalid_state:");
+    stopping.release();
 
-      expect((await delayed).status).toBe("already_stopped");
-      expect(await stopped).toEqual({ status: "stopped", agentId: id, runId: second });
-      expect(publications).toEqual(["deadbeef:completed", "cafebabe:cancelled"]);
-      expect(c.activeCount()).toBe(0);
-    }
+    expect(await stopped).toEqual({ status: "stopped", agentId: id, runId: testRunId("deadbeef") });
+    expect(admittedSends).toBe(0);
+    expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: testRunId("deadbeef") });
+    expect(c.activeCount()).toBe(0);
+  });
+
+  test("a delayed prior-run callback arrives before the current run terminalises and cannot publish it", async () => {
+    const publications: string[] = [];
+    const c = testRunController({ onTerminal: (record, settlement) => { publications.push(`${record.runId}:${settlement.kind}`); } });
+    const id = registerStopped(c);
+    const first = testRunId("deadbeef");
+    const second = testRunId("cafebabe");
+    await c.launch(id, async () => ({ status: "accepted", runId: first, runtime: testRuntime() }));
+    expect((await c.settle(id, first, { kind: "completed" })).status).toBe("stopped");
+    await c.launch(id, async () => ({ status: "accepted", runId: second, runtime: testRuntime() }));
+
+    const delayed = await c.settle(id, first, { kind: "failed", cause: terminalFailureCause(AgentErrorCode.ProtocolError) });
+    expect(delayed).toEqual({ status: "already_stopped", agentId: id });
+    expect(c.snapshot(id)).toMatchObject({ state: AgentState.Running, runId: second });
+
+    expect(await c.stop(id, CancellationReason.StopRequested)).toEqual({ status: "stopped", agentId: id, runId: second });
+    expect(publications).toEqual(["deadbeef:completed", "cafebabe:cancelled"]);
+    expect(c.activeCount()).toBe(0);
+  });
+
+  test("the current run terminalises before the delayed prior-run callback and remains the sole publication", async () => {
+    const publications: string[] = [];
+    const c = testRunController({ onTerminal: (record, settlement) => { publications.push(`${record.runId}:${settlement.kind}`); } });
+    const id = registerStopped(c);
+    const first = testRunId("deadbeef");
+    const second = testRunId("cafebabe");
+    await c.launch(id, async () => ({ status: "accepted", runId: first, runtime: testRuntime() }));
+    expect((await c.settle(id, first, { kind: "completed" })).status).toBe("stopped");
+    await c.launch(id, async () => ({ status: "accepted", runId: second, runtime: testRuntime() }));
+
+    expect((await c.settle(id, second, { kind: "completed" })).status).toBe("stopped");
+    expect(await c.settle(id, first, { kind: "completed" })).toEqual({ status: "already_stopped", agentId: id });
+
+    expect(publications).toEqual(["deadbeef:completed", "cafebabe:completed"]);
+    expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: second });
+    expect(c.activeCount()).toBe(0);
   });
 
   test("does not hold the agent mutex while stop persistence or containment waits", async () => {
-    const persistence = deferred<void>(); const persistenceEntered = deferred<void>(); const containment = deferred<void>();
-    const c = controller({ onStopping: () => { persistenceEntered.resolve(); return persistence.promise; } }); const id = register(c);
-    await c.launch(id, async () => ({ status: "accepted", runId: runId("deadbeef"), runtime: runtime([], () => containment.promise) }));
+    const persistence = deferred<void>();
+    const persistenceEntered = deferred<void>();
+    const containment = deferred<void>();
+    const c = testRunController({ onStopping: () => { persistenceEntered.resolve(); return persistence.promise; } });
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime({ contain: async () => { await containment.promise; return testVerifiedReceiptPath(); } }) }));
     const stopping = c.stop(id, CancellationReason.StopRequested);
     await persistenceEntered.promise;
-    const competingLaunch = c.launch(id, async () => ({ status: "accepted" as const, runId: runId("cafebabe"), runtime: runtime() }));
-    let launchOutcome: "pending" | "accepted" | "rejected" = "pending";
+    const competingLaunch = c.launch(id, async () => ({ status: "accepted" as const, runId: testRunId("cafebabe"), runtime: testRuntime() }));
+    let launchOutcome: string = "pending";
     void competingLaunch.then(() => { launchOutcome = "accepted"; }, () => { launchOutcome = "rejected"; });
     for (let i = 0; i < 10 && launchOutcome === "pending"; i++) await Promise.resolve();
-    expect(String(launchOutcome)).toBe("rejected");
-    persistence.resolve(); await Promise.resolve();
+    expect(launchOutcome).toBe("rejected");
+    persistence.resolve();
+    await Promise.resolve();
     expect(c.snapshot(id)?.state).toBe(AgentState.Stopping);
     containment.resolve();
     expect((await stopping).status).toBe("stopped");
   });
 });
 
-function controller(options: Partial<RunControllerOptions> = {}) { return new RunController({ capacity: 2, ...options }); }
-function register(c: RunController, suffix = 0) { const id = agentId(`agent-${suffix}`); c.register({ agentId: id, state: AgentState.Stopped, transcriptPath: "/tmp/a" as never }); return id; }
-function runtime(trace: string[] = [], contain = async () => {}) { return { abort: async () => { trace.push("abort"); }, contain: async () => { trace.push("contain"); await contain(); return "/tmp/receipt" as never; } }; }
-function deferred<T>() { let resolve!: (value: T | PromiseLike<T>) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }

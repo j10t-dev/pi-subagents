@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Type } from "typebox";
 
 import { createPiSubagentsExtension, type ExtensionController } from "../index.ts";
 import { CompletionService } from "../src/completion-service.ts";
@@ -14,14 +15,25 @@ import {
   MAX_RPC_RECORD_BYTES,
   MAX_STDERR_TAIL_BYTES,
 } from "../src/constants.ts";
-import { AgentErrorCode, AgentState, agentId, CompletionState, createRunAttemptId, modelSpec, runId, terminalFailureCause, toAgentError, truncateUtf8 } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CompletionState, modelSpec, runId, terminalFailureCause, toAgentError, truncateUtf8, verifiedContainmentReceiptPath } from "../src/domain.ts";
 import { BoundedJsonlDecoder } from "../src/jsonl.ts";
 import { OutputStore } from "../src/output-store.ts";
 import { RpcRunClient } from "../src/rpc-client.ts";
 import { createSubagentTools } from "../src/tools.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
+import { containmentReceiptPath, diagnosticsPath, outputPath as outputPathIn, sessionPath } from "../src/paths.ts";
+import {
+  testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath,
+  testSessionPath,
+} from "./support/brands.ts";
+import { extensionApiForTest, lifecycleOn, type ExtensionApiPort } from "./support/extension-api.ts";
 
 const FAKE_CHILD = join(import.meta.dir, "fixtures", "fake-rpc-child.mjs");
+
+/** The probe stands in for an unrelated host tool, so it carries its own schema. */
+const parentProbeSchema = Type.Object({
+  question: Type.String({ description: "Anything the parent should echo back." }),
+});
 const TEST_SELECTION = Object.freeze({
   model: modelSpec("mock-provider/luna"),
   thinkingLevel: "high" as const,
@@ -48,9 +60,10 @@ describe("context safety", () => {
   test("one receive batch retains at most 50 KB and the service remains usable", async () => {
     const service = new CompletionService();
     for (const [index, id] of ["deadbeef", "cafebabe"].entries()) {
-      await service.publish({ agentId: agentId(`context-${index}`), runId: runId(id), state: CompletionState.Completed,
+      await service.publish({ agentId: testAgentId(`context-${index}`), runId: runId(id), state: CompletionState.Completed,
         output: truncateUtf8("x".repeat(MAX_COMPLETION_OUTPUT_BYTES), MAX_COMPLETION_OUTPUT_BYTES),
-        outputPath: `/tmp/${id}.output` as never, transcriptPath: `/tmp/${id}.jsonl` as never });
+        outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/output/${id}.output`),
+        transcriptPath: testSessionPath(`/tmp/pi-subagents-test/sessions/${id}.jsonl`) });
     }
     const first = await service.receive();
     expect(first.completions.reduce((bytes, item) => bytes + item.output.retainedBytes, 0)).toBe(MAX_AGGREGATE_RECEIVE_BYTES);
@@ -164,12 +177,13 @@ function hostileController(): {
   const controller = new SubagentController({ composition: {
     prepareSpawn: async (input) => {
       const ordinal = sequence++;
-      const id = agentId(`hostile-${ordinal}`);
+      const id = testAgentId(`hostile-${ordinal}`);
       const nativeRunId = runId(`${ordinal + 1}`.padStart(8, "0"));
-      const transcriptPath = join(root, `${id}.jsonl`);
+      // This suite writes real files under a per-test OS temp root, so paths validate against it.
+      const transcriptPath = sessionPath(root, `${id}.jsonl`);
       writeFileSync(transcriptPath, `${JSON.stringify({ type: "session", id })}\n`);
-      const session: LaunchSession = { agentId: id, transcriptPath: transcriptPath as never, previousLeafId: null,
-        attemptId: createRunAttemptId(), containmentReceiptPath: join(root, `${id}.receipt`) as never };
+      const session: LaunchSession = { agentId: id, transcriptPath, previousLeafId: null,
+        attemptId: testAttemptId(`attempt-${ordinal}`), containmentReceiptPath: containmentReceiptPath(root, `${id}.receipt`) };
       return {
         selection: TEST_SELECTION,
         createSession: async () => session,
@@ -186,16 +200,16 @@ function hostileController(): {
       const store = stores.get(record.agentId);
       if (store === undefined || record.runId === undefined) throw new Error("missing hostile output store");
       const output = store.currentOutput(record.runId).output;
-      const outputPath = join(root, `${record.agentId}-${record.runId}.output`);
+      const outputPath = outputPathIn(root, `${record.agentId}-${record.runId}.output`);
       writeFileSync(outputPath, output.text);
       if (settlement.kind === "completed") return { agentId: record.agentId, runId: record.runId, state: CompletionState.Completed,
-        output, outputPath: outputPath as never, transcriptPath: record.transcriptPath };
+        output, outputPath: testCommittedOutputPath(outputPath, root), transcriptPath: record.transcriptPath };
       const diagnostic = store.getDiagnosticsTail() + store.getStderrTail();
-      const diagnosticPath = join(root, `${record.agentId}-${record.runId}.diagnostic`);
+      const diagnosticPath = diagnosticsPath(root, `${record.agentId}-${record.runId}.diagnostic`);
       writeFileSync(diagnosticPath, diagnostic);
       return { agentId: record.agentId, runId: record.runId, state: CompletionState.Failed,
-        error: toAgentError(undefined, AgentErrorCode.ProtocolError, diagnosticPath as never), output,
-        outputPath: outputPath as never, transcriptPath: record.transcriptPath };
+        error: toAgentError(undefined, AgentErrorCode.ProtocolError, diagnosticPath), output,
+        outputPath: testCommittedOutputPath(outputPath, root), transcriptPath: record.transcriptPath };
     },
   } });
   return { controller, close: async () => {
@@ -221,24 +235,32 @@ async function providerHarness(controller: SubagentController): Promise<{
     update: undefined,
     context: object,
   ): Promise<ProviderToolResult> };
+  function registerTestTool(tools: Map<string, RegisteredTool>): ExtensionApiPort["registerTool"] {
+    // `registerTool` is generic over each tool's parameter schema, so no concrete function type is
+    // assignable to it; this probe only needs the tool's name and executor.
+    return ((tool: { name: string; execute: RegisteredTool["execute"] }) => tools.set(tool.name, tool)) as unknown as ExtensionApiPort["registerTool"];
+  }
   const tools = new Map<string, RegisteredTool>();
   const handlers = new Map<string, Array<(event: object, context: object) => Promise<void> | void>>();
   const api = {
-    registerTool: (tool: RegisteredTool & { name: string }) => { tools.set(tool.name, tool); },
-    on: (name: string, handler: (event: object, context: object) => Promise<void> | void) => {
-      handlers.set(name, [...(handlers.get(name) ?? []), handler]);
-    },
-  };
-  api.registerTool({ name: "parent_probe", execute: async () => ({
-    content: [{ type: "text", text: "parent tool remains callable" }], details: { ok: true },
-  }) });
+    registerTool: registerTestTool(tools),
+    on: lifecycleOn(handlers),
+    appendEntry: () => {},
+    sendMessage: () => {},
+    getThinkingLevel: () => "high",
+    getActiveTools: () => [],
+  } satisfies ExtensionApiPort;
+  api.registerTool({
+    name: "parent_probe", label: "Parent probe", description: "Test parent availability", parameters: parentProbeSchema,
+    execute: async () => ({ content: [{ type: "text", text: "parent tool remains callable" }], details: { ok: true } }),
+  });
   const adapter: ExtensionController = {
     restore: () => controller.restore(), shutdown: () => controller.shutdown(), status: () => controller.status(),
     tools: () => createSubagentTools(controller), beforeTree: () => controller.beforeTree(),
     beforeSwitch: () => controller.beforeSwitch(), beforeFork: () => controller.beforeFork(),
   };
   createPiSubagentsExtension({ platform: "linux", child: false,
-    createController: () => adapter, diagnostic: () => {} })(api as never);
+    createController: () => adapter, diagnostic: () => {} })(extensionApiForTest(api));
   const context = { ui: { setStatus: () => {} } };
   for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, context);
   return {
@@ -311,9 +333,10 @@ function hostileLaunch(
   return {
     runtime: { abort: async () => { await client.abort(); }, contain: async () => {
       await client.shutdown();
-      return session.containmentReceiptPath as never;
+      // The session receipt is already validated against this suite's temp root.
+      return verifiedContainmentReceiptPath(session.containmentReceiptPath);
     } },
-    containment: { backend: "cgroup-v2" as const, scopePath: "/tmp/test-cgroup/attempt" as never },
+    containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
     ready: async () => {}, persistLaunchRequested: async () => {}, persistRunStarted: async () => {},
     start: async () => { client.start(); },
     getEntries: async () => queried
@@ -340,7 +363,7 @@ function fakeClient(scenario: string): { client: RpcRunClient; store: OutputStor
       select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined,
       notify: () => {}, setStatus: () => {}, setWidget: () => {},
     } }),
-    agentId: agentId(`context-${scenario}`), runAttemptId: createRunAttemptId(),
+    agentId: testAgentId(`context-${scenario}`), runAttemptId: testAttemptId(`attempt-${scenario}`),
   });
   return { client, store, close: async () => { await client.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
 }
