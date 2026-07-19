@@ -3,6 +3,7 @@ import {
   AgentErrorCode,
   AgentState,
   CancellationReason,
+  CodedError,
   terminalFailureCause,
   type AgentId,
   type RunId,
@@ -127,12 +128,12 @@ export class RunController {
   }
 
   register(record: RunRecord): void {
-    if (this.agents.has(record.agentId)) throw coded(AgentErrorCode.InvalidAgent);
+    if (this.agents.has(record.agentId)) throw new CodedError(AgentErrorCode.InvalidAgent);
     this.agents.set(record.agentId, { ...record, mutex: new Mutex() });
   }
 
   async beginRestore(): Promise<RestoreAdmission> {
-    if (this.launchAdmissionClosed) throw coded(AgentErrorCode.InvalidState);
+    if (this.launchAdmissionClosed) throw new CodedError(AgentErrorCode.InvalidState);
     this.launchAdmissionClosed = true;
     if (this.admittedLaunches > 0) {
       this.launchDrain = new Promise<void>((resolve) => { this.resolveLaunchDrain = resolve; });
@@ -142,7 +143,7 @@ export class RunController {
     let released = false;
     return {
       reserve: (records) => {
-        if (staged !== undefined) throw coded(AgentErrorCode.InvalidState);
+        if (staged !== undefined) throw new CodedError(AgentErrorCode.InvalidState);
         const values = [...records];
         this.preflightRestore(values);
         const acquired: Array<{ record: RunRecord; reservation?: RunReservation }> = [];
@@ -158,9 +159,9 @@ export class RunController {
         }
       },
       replace: (record) => {
-        if (staged === undefined) throw coded(AgentErrorCode.InvalidState);
+        if (staged === undefined) throw new CodedError(AgentErrorCode.InvalidState);
         const index = staged.findIndex((item) => item.record.agentId === record.agentId);
-        if (index < 0) throw coded(AgentErrorCode.InvalidAgent);
+        if (index < 0) throw new CodedError(AgentErrorCode.InvalidAgent);
         const previous = staged[index]!;
         let reservation = previous.reservation;
         if (previous.record.state !== AgentState.Stopped && record.state === AgentState.Stopped) {
@@ -172,7 +173,7 @@ export class RunController {
         staged[index] = { record, ...(reservation === undefined ? {} : { reservation }) };
       },
       commit: () => {
-        if (staged === undefined) throw coded(AgentErrorCode.InvalidState);
+        if (staged === undefined) throw new CodedError(AgentErrorCode.InvalidState);
         for (const item of staged) {
           const live: LiveRecord = { ...item.record, mutex: new Mutex(), ...(item.reservation === undefined ? {} : { reservation: item.reservation }) };
           if (item.record.containmentResponsibility !== undefined && item.record.runId === undefined) live.preRunContainment = true;
@@ -205,18 +206,18 @@ export class RunController {
     adoptIdentity: (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>) => void,
   ) => Promise<NewLaunchOperation>): Promise<LaunchResult | LaunchFailedResult> {
     const reservation = this.semaphore.tryAcquire();
-    if (reservation === undefined) throw coded(AgentErrorCode.CapacityExceeded);
+    if (reservation === undefined) throw new CodedError(AgentErrorCode.CapacityExceeded);
     this.options.onReserve?.();
     let registered: LiveRecord | undefined;
     const register = (record: Pick<RunRecord, "agentId" | "transcriptPath">): void => {
-      if (registered !== undefined || this.agents.has(record.agentId)) throw coded(AgentErrorCode.InvalidAgent);
+      if (registered !== undefined || this.agents.has(record.agentId)) throw new CodedError(AgentErrorCode.InvalidAgent);
       let resolveLaunchDone!: () => void;
       const launchDone = new Promise<void>((resolve) => { resolveLaunchDone = resolve; });
       registered = { ...record, state: AgentState.Stopped, mutex: new Mutex(), launching: true, launchDone, resolveLaunchDone, reservation };
       this.agents.set(record.agentId, registered);
     };
     const adoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>): void => {
-      if (registered === undefined || registered.runId !== undefined) throw coded(AgentErrorCode.InvalidState);
+      if (registered === undefined || registered.runId !== undefined) throw new CodedError(AgentErrorCode.InvalidState);
       registered.runId = runId;
       registered.runtime = runtime;
       registered.state = AgentState.Running;
@@ -266,7 +267,7 @@ export class RunController {
       // `adoptIdentity` is the native-ID linearisation point and must precede every
       // binding, persistence and callback-subscription seam.
       if (launchRecord.state === AgentState.Stopped) adoptIdentity(launched.runId, launched.runtime);
-      if (launchRecord.runId !== launched.runId || launchRecord.runtime !== launched.runtime) throw coded(AgentErrorCode.InvalidState);
+      if (launchRecord.runId !== launched.runId || launchRecord.runtime !== launched.runtime) throw new CodedError(AgentErrorCode.InvalidState);
       const accepted = { status: "running" as const, agentId: launched.agentId, runId: launched.runId };
       try {
         launched.onAccepted?.();
@@ -334,7 +335,7 @@ export class RunController {
   preflightRestore(records: Iterable<RunRecord>): void {
     const restoredIds = new Set<AgentId>();
     for (const record of records) {
-      if (this.agents.has(record.agentId) || restoredIds.has(record.agentId)) throw coded(AgentErrorCode.InvalidAgent);
+      if (this.agents.has(record.agentId) || restoredIds.has(record.agentId)) throw new CodedError(AgentErrorCode.InvalidAgent);
       restoredIds.add(record.agentId);
     }
   }
@@ -349,15 +350,15 @@ export class RunController {
     const record = this.require(agentId);
     // Reservation is a synchronous linearisation point. No external work or promise wait
     // occurs here, so a following stop must join this launch rather than observe Stopped.
-    if (record.state !== AgentState.Stopped || record.launching === true) throw coded(AgentErrorCode.InvalidState);
+    if (record.state !== AgentState.Stopped || record.launching === true) throw new CodedError(AgentErrorCode.InvalidState);
     const reservation = this.semaphore.tryAcquire();
-    if (reservation === undefined) throw coded(AgentErrorCode.CapacityExceeded);
+    if (reservation === undefined) throw new CodedError(AgentErrorCode.CapacityExceeded);
     record.reservation = reservation;
     record.launching = true;
     record.launchDone = new Promise<void>((resolve) => { record.resolveLaunchDone = resolve; });
     let launched: ExistingLaunchOperation;
     const adoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>): void => {
-      if (record.state !== AgentState.Stopped || record.runId !== undefined && record.launching !== true) throw coded(AgentErrorCode.InvalidState);
+      if (record.state !== AgentState.Stopped || record.runId !== undefined && record.launching !== true) throw new CodedError(AgentErrorCode.InvalidState);
       record.runId = runId;
       record.runtime = runtime;
       record.state = AgentState.Running;
@@ -412,7 +413,7 @@ export class RunController {
       // Direct RunController clients may return acceptance atomically; controller launch
       // transactions use `adoptIdentity` earlier at native-ID observation.
       if (record.state === AgentState.Stopped) adoptIdentity(launched.runId, launched.runtime);
-      if (record.runId !== launched.runId || record.runtime !== launched.runtime || record.state !== AgentState.Running) throw coded(AgentErrorCode.InvalidState);
+      if (record.runId !== launched.runId || record.runtime !== launched.runtime || record.state !== AgentState.Running) throw new CodedError(AgentErrorCode.InvalidState);
       const accepted = { status: "running" as const, agentId, runId: launched.runId };
       return { status: "accepted" as const, accepted, onAccepted: launched.onAccepted };
     });
@@ -439,7 +440,7 @@ export class RunController {
   }
 
   private enterLaunchAdmission(): () => void {
-    if (this.launchAdmissionClosed) throw coded(AgentErrorCode.InvalidState);
+    if (this.launchAdmissionClosed) throw new CodedError(AgentErrorCode.InvalidState);
     this.admittedLaunches++;
     let left = false;
     return () => {
@@ -501,7 +502,7 @@ export class RunController {
       if (expectedRunId !== undefined && record.runId !== expectedRunId) return;
       if (record.state === AgentState.Stopped) return;
       if (record.terminal !== undefined) { existing = record.terminal; return; }
-      if (record.state !== AgentState.Running && !(record.state === transition && record.terminal === undefined)) throw coded(AgentErrorCode.InvalidState);
+      if (record.state !== AgentState.Running && !(record.state === transition && record.terminal === undefined)) throw new CodedError(AgentErrorCode.InvalidState);
       owner = this.claimTerminalLocked(record, transition, settlement, abort, reason);
     });
     if (existing !== undefined) {
@@ -647,9 +648,8 @@ export class RunController {
 
   private require(agentId: AgentId): LiveRecord {
     const record = this.agents.get(agentId);
-    if (record === undefined) throw coded(AgentErrorCode.InvalidAgent);
+    if (record === undefined) throw new CodedError(AgentErrorCode.InvalidAgent);
     return record;
   }
 }
 
-function coded(code: AgentErrorCode): Error { return new Error(`${code}: ${code.replaceAll("_", " ")}`); }

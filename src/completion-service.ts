@@ -1,7 +1,9 @@
 import { MAX_AGGREGATE_RECEIVE_BYTES } from "./constants.ts";
 import {
   agentRunKey,
+  AgentErrorCode,
   AgentState,
+  CodedError,
   truncateUtf8,
   type AgentCompletion,
   type AgentId,
@@ -189,7 +191,7 @@ export class CompletionService {
       return { completions: [], agents: this.snapshotAgents(), timedOut: true };
     }
     if (outcome.kind === "rejected") {
-      fail(new Error("invalid_state: receive_agent is already waiting"));
+      fail(new CodedError(AgentErrorCode.InvalidState));
       return promise;
     }
 

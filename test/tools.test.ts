@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Value } from "typebox/value";
-import { AgentErrorCode, AgentState, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8 } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8 } from "../src/domain.ts";
+import { diagnosticsPath } from "../src/paths.ts";
 import { CompletionService } from "../src/completion-service.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition } from "../src/controller.ts";
 import { deferred } from "./support/async.ts";
@@ -210,6 +211,61 @@ describe("exact tool contracts", () => {
     expect(failure).toBeInstanceOf(PublicPreflightError);
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
     expect(failure.message).toBe(message);
+  });
+
+  test("stop_agent retains a CodedError diagnostics path in the failed outcome DTO", async () => {
+    const path = diagnosticsPath("/tmp", "stop-coded.log");
+    const controller = fakeToolController({
+      stop: async () => { throw new CodedError(AgentErrorCode.ContainmentFailed, path); },
+    });
+    const { stop_agent: stop } = createSubagentTools(controller);
+    const result = await stop!.execute({ agentIds: ["agent-a"] });
+    expect(result.details).toEqual({ outcomes: [{
+      agentId: "agent-a",
+      state: "failed",
+      error: { code: "containment_failed", message: "could not confirm child process termination", diagnosticsPath: "/tmp/stop-coded.log" },
+    }] });
+  });
+
+  test("send_input rethrows a CodedError preserving code, message and diagnostics path", async () => {
+    const path = diagnosticsPath("/tmp", "send-coded.log");
+    const controller = fakeToolController({
+      sendInput: async () => { throw new CodedError(AgentErrorCode.SessionUnavailable, path); },
+    });
+    const { send_input: send } = createSubagentTools(controller);
+    const caught = await send!.execute({ agentId: "agent-a", message: "m" })
+      .then(() => { throw new Error("expected rejection"); }, (e: unknown) => e);
+    expect(caught).toBeInstanceOf(CodedError);
+    expect((caught as CodedError).code).toBe(AgentErrorCode.SessionUnavailable);
+    expect(String((caught as CodedError).diagnosticsPath)).toBe("/tmp/send-coded.log");
+    expect((caught as CodedError).message).toBe("session_unavailable: child session is unavailable");
+  });
+
+  test("spawn_agent rethrows a CodedError through executeSpawn/stableOperationError preserving the diagnostics path", async () => {
+    const path = diagnosticsPath("/tmp", "spawn-coded.log");
+    const controller = fakeToolController({
+      spawn: async () => { throw new CodedError(AgentErrorCode.ModelUnavailable, path); },
+    });
+    const { spawn_agent: spawn } = createSubagentTools(controller);
+    const caught = await spawn!.execute({ task: "work" })
+      .then(() => { throw new Error("expected rejection"); }, (e: unknown) => e);
+    expect(caught).toBeInstanceOf(CodedError);
+    expect((caught as CodedError).code).toBe(AgentErrorCode.ModelUnavailable);
+    expect(String((caught as CodedError).diagnosticsPath)).toBe("/tmp/spawn-coded.log");
+    expect((caught as CodedError).message).toBe("model_unavailable: requested model is unavailable");
+  });
+
+  test("a foreign regex-coded error still maps to its stable code with no diagnostics path", async () => {
+    const controller = fakeToolController({
+      stop: async () => { throw new Error("capacity_exceeded: raw foreign detail"); },
+    });
+    const { stop_agent: stop } = createSubagentTools(controller);
+    const result = await stop!.execute({ agentIds: ["agent-a"] });
+    expect(result.details).toEqual({ outcomes: [{
+      agentId: "agent-a",
+      state: "failed",
+      error: { code: "capacity_exceeded", message: "maximum concurrent runs exceeded" },
+    }] });
   });
 
   test.each([

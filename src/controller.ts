@@ -5,6 +5,7 @@ import {
   agentRunKey,
   AgentState,
   CancellationReason,
+  CodedError,
   agentId,
   toAgentError,
   type AgentCompletion,
@@ -245,14 +246,15 @@ export class SubagentController {
   }
 
   private async spawnOwned(input: SpawnAgentRequest, token: ControllerOperation): Promise<SpawnStartResult> {
-    if (input.task.length === 0) throw coded(AgentErrorCode.InvalidInput);
-    if (this.composition === undefined) throw coded(AgentErrorCode.SpawnFailed);
+    if (input.task.length === 0) throw new CodedError(AgentErrorCode.InvalidInput);
+    if (this.composition === undefined) throw new CodedError(AgentErrorCode.SpawnFailed);
     let prepared: SpawnPreparation;
     try {
       prepared = await this.prepare(token, (scope) => this.composition!.prepareSpawn(input, scope));
     } catch (error) {
       if (isPublicPreflightError(error)) throw error;
-      throw coded(AgentErrorCode.SpawnFailed);
+      if (error instanceof CodedError) throw new CodedError(AgentErrorCode.SpawnFailed, error.diagnosticsPath);
+      throw new CodedError(AgentErrorCode.SpawnFailed);
     }
     try {
       this.requireOperationOpen(token);
@@ -268,9 +270,9 @@ export class SubagentController {
         return this.executeLaunch(session, input.task, created.transport, adoptIdentity);
       });
       this.syncInventory();
-      if (result.status === "settling") return { agentId: result.agentId, runId: result.runId, state: AgentState.Settling, error: toAgentError(undefined, AgentErrorCode.SpawnFailed) };
-      if (result.status === "failed") return { agentId: result.agentId, state: AgentState.Stopped, error: toAgentError(undefined, AgentErrorCode.SpawnFailed) };
-      if (result.status === "containment_failed") return { agentId: result.agentId, state: AgentState.Stopping, error: toAgentError(undefined, AgentErrorCode.ContainmentFailed) };
+      if (result.status === "settling") return { agentId: result.agentId, runId: result.runId, state: AgentState.Settling, error: toAgentError(AgentErrorCode.SpawnFailed) };
+      if (result.status === "failed") return { agentId: result.agentId, state: AgentState.Stopped, error: toAgentError(AgentErrorCode.SpawnFailed) };
+      if (result.status === "containment_failed") return { agentId: result.agentId, state: AgentState.Stopping, error: toAgentError(AgentErrorCode.ContainmentFailed) };
       return {
         agentId: result.agentId,
         runId: result.runId,
@@ -281,7 +283,7 @@ export class SubagentController {
         ...(prepared.selection.warning === undefined ? {} : { warning: prepared.selection.warning }),
       };
     } catch (error) {
-      if (isPublicPreflightError(error)) throw coded(AgentErrorCode.SpawnFailed);
+      if (isPublicPreflightError(error)) throw new CodedError(AgentErrorCode.SpawnFailed);
       throw publicError(error, AgentErrorCode.SpawnFailed);
     }
   }
@@ -296,8 +298,8 @@ export class SubagentController {
   }
 
   private async sendInputOwned(agentIdValue: AgentId, literalMessage: string, token: ControllerOperation): Promise<StartResult> {
-    if (literalMessage.length === 0) throw coded(AgentErrorCode.InvalidInput);
-    if (this.composition === undefined) throw coded(AgentErrorCode.SessionUnavailable);
+    if (literalMessage.length === 0) throw new CodedError(AgentErrorCode.InvalidInput);
+    if (this.composition === undefined) throw new CodedError(AgentErrorCode.SessionUnavailable);
     const prepared = await this.prepareBounded(token, AgentErrorCode.SessionUnavailable,
       (scope) => this.composition!.prepareSend(agentIdValue, literalMessage, scope));
     this.requireOperationOpen(token);
@@ -312,9 +314,9 @@ export class SubagentController {
       return { status: launch.status };
     });
     this.syncInventory();
-    if (result.status === "settling") return { agentId: result.agentId, runId: result.runId, state: AgentState.Settling, error: toAgentError(undefined, AgentErrorCode.SpawnFailed) };
-    if (result.status === "failed") return { agentId: result.agentId, state: AgentState.Stopped, error: toAgentError(undefined, AgentErrorCode.SpawnFailed) };
-    if (result.status === "containment_failed") return { agentId: result.agentId, state: AgentState.Stopping, error: toAgentError(undefined, AgentErrorCode.ContainmentFailed) };
+    if (result.status === "settling") return { agentId: result.agentId, runId: result.runId, state: AgentState.Settling, error: toAgentError(AgentErrorCode.SpawnFailed) };
+    if (result.status === "failed") return { agentId: result.agentId, state: AgentState.Stopped, error: toAgentError(AgentErrorCode.SpawnFailed) };
+    if (result.status === "containment_failed") return { agentId: result.agentId, state: AgentState.Stopping, error: toAgentError(AgentErrorCode.ContainmentFailed) };
     return { agentId: result.agentId, runId: result.runId, state: AgentState.Running };
   }
 
@@ -340,10 +342,10 @@ export class SubagentController {
   }
 
   restore(): Promise<void> {
-    if (this.lifecycle === "closing") return Promise.reject(coded(AgentErrorCode.InvalidState));
+    if (this.lifecycle === "closing") return Promise.reject(new CodedError(AgentErrorCode.InvalidState));
     if (this.restored) return Promise.resolve();
     if (this.restoreInFlight !== undefined) return this.restoreInFlight;
-    if (this.lifecycle !== "open") return Promise.reject(coded(AgentErrorCode.InvalidState));
+    if (this.lifecycle !== "open") return Promise.reject(new CodedError(AgentErrorCode.InvalidState));
     this.lifecycle = "restoring";
     const token = this.createOperation();
     const prior = [...this.operations].filter((operation) => operation !== token).map((operation) => operation.done);
@@ -360,7 +362,7 @@ export class SubagentController {
 
   private async restoreOwnedAfter(prior: readonly Promise<void>[]): Promise<void> {
     await Promise.allSettled(prior);
-    if (this.lifecycle === "closing") throw coded(AgentErrorCode.InvalidState);
+    if (this.lifecycle === "closing") throw new CodedError(AgentErrorCode.InvalidState);
     await this.restoreOwned();
   }
 
@@ -608,7 +610,7 @@ export class SubagentController {
     const preparation = this.preparationContext.getStore();
     if (preparation?.activePreparation === true && this.operations.has(preparation)) {
       preparation.preparationShutdownAttempted = true;
-      return Promise.reject(coded(AgentErrorCode.InvalidState));
+      return Promise.reject(new CodedError(AgentErrorCode.InvalidState));
     }
     if (this.shuttingDown !== undefined) return this.shuttingDown;
     const enteringClosing = this.lifecycle !== "closing";
@@ -634,7 +636,7 @@ export class SubagentController {
       }
       const containedButUnrecorded = retained.length > 0 && retained.every((result) =>
         result?.status === "containment_failed" && result.code === AgentErrorCode.TerminalPersistenceFailed);
-      throw coded(containedButUnrecorded ? AgentErrorCode.TerminalPersistenceFailed : AgentErrorCode.ContainmentFailed);
+      throw new CodedError(containedButUnrecorded ? AgentErrorCode.TerminalPersistenceFailed : AgentErrorCode.ContainmentFailed);
     })();
     this.shuttingDown = operation;
     void operation.catch(() => {
@@ -644,7 +646,7 @@ export class SubagentController {
   }
 
   private admitOperation(): ControllerOperation {
-    if (this.lifecycle !== "open") throw coded(AgentErrorCode.InvalidState);
+    if (this.lifecycle !== "open") throw new CodedError(AgentErrorCode.InvalidState);
     return this.createOperation();
   }
 
@@ -668,7 +670,7 @@ export class SubagentController {
     token.activePreparation = true;
     const scope: PreparationScope = {
       scheduleExternal: (callback: () => void): void => {
-        if (!token.activePreparation || !this.operations.has(token)) throw coded(AgentErrorCode.InvalidState);
+        if (!token.activePreparation || !this.operations.has(token)) throw new CodedError(AgentErrorCode.InvalidState);
         this.preparationContext.exit(() => {
           setImmediate(() => {
             try { void Promise.resolve(callback()).catch(() => undefined); }
@@ -692,12 +694,12 @@ export class SubagentController {
     try {
       return await this.prepare(token, operation);
     } catch (error) {
-      throw coded(preparationErrorCode(error) ?? fallbackCode);
+      throw publicError(error, fallbackCode);
     }
   }
 
   private requireOperationOpen(token: ControllerOperation): void {
-    if (this.lifecycle !== "open" || token.preparationShutdownAttempted) throw coded(AgentErrorCode.InvalidState);
+    if (this.lifecycle !== "open" || token.preparationShutdownAttempted) throw new CodedError(AgentErrorCode.InvalidState);
   }
 
   private syncInventory(): void {
@@ -764,7 +766,7 @@ export class SubagentController {
       while (true) {
         const snapshot = await bounded(transport.getEntries(before.leafId));
         const identity = classifyAssignmentEntries(snapshot.entries, literalPrompt);
-        if (identity.kind === "invalid") throw coded(AgentErrorCode.SpawnFailed);
+        if (identity.kind === "invalid") throw new CodedError(AgentErrorCode.SpawnFailed);
         if (identity.kind === "matched") {
           nativeRunId = identity.runId;
           break;
@@ -772,7 +774,7 @@ export class SubagentController {
         await bounded(this.identityDelay(ASSIGNMENT_IDENTITY_POLL_MS, deadline));
       }
       const matchedRunId = nativeRunId;
-      if (matchedRunId === undefined) throw coded(AgentErrorCode.SpawnFailed);
+      if (matchedRunId === undefined) throw new CodedError(AgentErrorCode.SpawnFailed);
       adoptIdentity(matchedRunId, runtime, ensureRunStarted);
       transport.bindRun(matchedRunId);
       await ensureRunStarted();
@@ -825,7 +827,7 @@ export class SubagentController {
     return {
       abort: async () => {},
       contain: async () => {
-        if (this.restoration === undefined) throw coded(AgentErrorCode.ContainmentFailed);
+        if (this.restoration === undefined) throw new CodedError(AgentErrorCode.ContainmentFailed);
         const decision = await this.restoration.resolveContainment(input);
         if (decision.kind === "contained") return decision.receipt;
         return decision.runtime.contain();
@@ -872,13 +874,13 @@ export class SubagentController {
 
 function unavailableRuntime(): RunRuntime {
   return {
-    abort: async () => { throw coded(AgentErrorCode.ContainmentFailed); },
-    contain: async () => { throw coded(AgentErrorCode.ContainmentFailed); },
+    abort: async () => { throw new CodedError(AgentErrorCode.ContainmentFailed); },
+    contain: async () => { throw new CodedError(AgentErrorCode.ContainmentFailed); },
   };
 }
 
 function stopOutcome(result: StopResult): object {
-  if (result.status === "containment_failed") return { agentId: result.agentId, ...(result.runId ? { runId: result.runId } : {}), state: "failed", agentState: result.agentState, error: toAgentError(undefined, result.code) };
+  if (result.status === "containment_failed") return { agentId: result.agentId, ...(result.runId ? { runId: result.runId } : {}), state: "failed", agentState: result.agentState, error: toAgentError(result.code) };
   if (result.status === "already_stopped") return { agentId: result.agentId, state: "already_stopped" };
   return { agentId: result.agentId, runId: result.runId, state: "cancelled" };
 }
@@ -915,13 +917,13 @@ function withoutLatestCompletion(record: RestoredAgentRecord): RestoredAgentReco
   return rest;
 }
 
-function coded(code: AgentErrorCode): Error { const error = toAgentError(undefined, code); return new Error(`${error.code}: ${error.message}`); }
-
 function publicError(error: unknown, fallbackCode: AgentErrorCode): Error {
-  return coded(preparationErrorCode(error) ?? fallbackCode);
+  if (error instanceof CodedError) return new CodedError(error.code, error.diagnosticsPath);
+  return new CodedError(preparationErrorCode(error) ?? fallbackCode);
 }
 
 function preparationErrorCode(error: unknown): AgentErrorCode | undefined {
+  if (error instanceof CodedError || isPublicPreflightError(error)) return error.code;
   const prefix = error instanceof Error ? /^([a-z_]+):/.exec(error.message)?.[1] : undefined;
   const prefixedCode = Object.values(AgentErrorCode).find((code) => code === prefix);
   if (prefixedCode !== undefined) return prefixedCode;

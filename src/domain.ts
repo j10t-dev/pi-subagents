@@ -183,6 +183,25 @@ export function isPublicPreflightError(value: unknown): value is PublicPreflight
   return value instanceof PublicPreflightError && Object.values(AgentErrorCode).includes(value.code);
 }
 
+/**
+ * Stable in-process coded error: message is always `${code}: ${STABLE_ERROR_MESSAGES[code]}`.
+ * Only for code-to-stable-message errors; `PublicPreflightError` keeps caller-supplied
+ * public guidance and stays separate.
+ */
+export class CodedError extends Error {
+  declare readonly code: AgentErrorCode;
+  declare readonly diagnosticsPath?: DiagnosticsPath;
+
+  constructor(code: AgentErrorCode, diagnosticsPath?: DiagnosticsPath) {
+    super(truncateUtf8(`${code}: ${STABLE_ERROR_MESSAGES[code]}`, MAX_ERROR_MESSAGE_BYTES).text);
+    Object.defineProperty(this, "name", { value: "CodedError", enumerable: false });
+    Object.defineProperty(this, "code", { value: code, enumerable: false });
+    if (diagnosticsPath !== undefined) {
+      Object.defineProperty(this, "diagnosticsPath", { value: diagnosticsPath, enumerable: false });
+    }
+  }
+}
+
 export const AgentEventType = {
   Spawned: "spawned",
   RunLaunchRequested: "run_launch_requested",
@@ -271,7 +290,7 @@ export interface TerminalFailureCause extends AgentError {
 }
 
 export function terminalFailureCause(code: TerminalFailureCode): TerminalFailureCause {
-  return toAgentError(undefined, code) as TerminalFailureCause;
+  return toAgentError(code) as TerminalFailureCause;
 }
 
 export interface CompletionOutput {
@@ -324,21 +343,24 @@ const STABLE_ERROR_MESSAGES: Record<AgentErrorCode, string> = {
 };
 
 /**
- * Converts an arbitrary thrown value into a bounded, stable `AgentError`. The stable message
- * never contains raw exception text or transport state; callers write those details only to
- * bounded diagnostics files and pass the resulting path as `diagnosticsPath`.
+ * Builds the bounded, stable `AgentError` DTO for `code`. The stable message never contains
+ * raw exception text or transport state; callers write those details only to bounded
+ * diagnostics files and pass the resulting path as `diagnosticsPath`.
  */
 export function toAgentError(
-  error: unknown,
   code: AgentErrorCode,
   diagnosticsPath?: DiagnosticsPath,
 ): AgentError {
-  void error;
   const message = truncateUtf8(STABLE_ERROR_MESSAGES[code], MAX_ERROR_MESSAGE_BYTES).text;
   if (diagnosticsPath !== undefined) {
     return { code, message, diagnosticsPath };
   }
   return { code, message };
+}
+
+/** Converts an in-process `CodedError` to its DTO, preserving the diagnostics path. */
+export function codedErrorToAgentError(error: CodedError): AgentError {
+  return toAgentError(error.code, error.diagnosticsPath);
 }
 
 /**

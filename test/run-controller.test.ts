@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AgentErrorCode, AgentState, CancellationReason, terminalFailureCause, type RunId } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CancellationReason, CodedError, terminalFailureCause, type RunId } from "../src/domain.ts";
 import {
   classifyTerminal,
   type LaunchFailedResult,
@@ -71,6 +71,21 @@ describe("RunController arbitration", () => {
     await expect(c.spawnNew(async () => { throw new Error("must not run"); })).rejects.toThrow("capacity_exceeded:");
     await c.stop(testAgentId("two"), CancellationReason.StopRequested);
     expect(c.activeCount()).toBe(0);
+  });
+
+  test("capacity rejection is a CodedError carrying the stable message", async () => {
+    const c = testRunController({ capacity: 1 });
+    const restore = await c.beginRestore();
+    restore.reserve([
+      { agentId: testAgentId("one"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/one"), runId: testRunId("deadbeef"), runtime: testRuntime() },
+    ]);
+    restore.commit();
+    restore.release();
+    const error = await c.spawnNew(async () => { throw new Error("must not run"); })
+      .then(() => { throw new Error("expected rejection"); }, (e: unknown) => e);
+    expect(error).toBeInstanceOf(CodedError);
+    expect((error as CodedError).code).toBe(AgentErrorCode.CapacityExceeded);
+    expect((error as CodedError).message).toBe("capacity_exceeded: maximum concurrent runs exceeded");
   });
 
   test("direct restore inherits every prior-session obligation above capacity", () => {

@@ -3,6 +3,8 @@ import { Value } from "typebox/value";
 
 import {
   AgentErrorCode,
+  CodedError,
+  codedErrorToAgentError,
   AgentEventType,
   AgentState,
   CancellationReason,
@@ -13,6 +15,7 @@ import {
   isLegalTransition,
   milliseconds,
   modelSpec,
+  PublicPreflightError,
   runAttemptId,
   runId,
   runIdFromEntry,
@@ -269,32 +272,59 @@ describe("truncateUtf8", () => {
 describe("toAgentError", () => {
   test("produces a stable bounded message for each error code", () => {
     for (const code of Object.values(AgentErrorCode)) {
-      const err = toAgentError(new Error("secret transport dump"), code);
+      const err = toAgentError(code);
       expect(err.code).toBe(code);
       expect(err.message.length).toBeLessThanOrEqual(10_000);
       expect(err.message).not.toContain("secret transport dump");
     }
   });
 
-  test("never leaks raw exception content regardless of error shape", () => {
-    expect(
-      toAgentError(new Error("secret transport dump"), AgentErrorCode.ProtocolError).message,
-    ).not.toContain("secret transport dump");
-    expect(toAgentError("raw string throw", AgentErrorCode.SpawnFailed).message).not.toContain(
-      "raw string throw",
-    );
-    expect(toAgentError(undefined, AgentErrorCode.InvalidState).message).toBeTruthy();
+  test("attaches an optional diagnostics path without altering the message", () => {
+    const withPath = toAgentError(AgentErrorCode.ProtocolError, diagnosticsPath("/tmp", "diag.log"));
+    expect(String(withPath.diagnosticsPath)).toBe("/tmp/diag.log");
+    expect(withPath.message).toBe(toAgentError(AgentErrorCode.ProtocolError).message);
+    const withoutPath = toAgentError(AgentErrorCode.ProtocolError);
+    expect(withoutPath.diagnosticsPath).toBeUndefined();
+  });
+});
+
+describe("CodedError", () => {
+  test("carries a stable code-prefixed message and its code for every error code", () => {
+    for (const code of Object.values(AgentErrorCode)) {
+      const error = new CodedError(code);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.name).toBe("CodedError");
+      expect(error.code).toBe(code);
+      expect(error.message).toBe(`${code}: ${toAgentError(code).message}`);
+      expect(error.diagnosticsPath).toBeUndefined();
+    }
   });
 
-  test("attaches an optional diagnostics path without altering the message", () => {
-    const withPath = toAgentError(
-      new Error("x"),
-      AgentErrorCode.ProtocolError,
-      diagnosticsPath("/tmp", "diag.log"),
-    );
-    expect(String(withPath.diagnosticsPath)).toBe("/tmp/diag.log");
-    const withoutPath = toAgentError(new Error("x"), AgentErrorCode.ProtocolError);
+  test("retains a diagnostics path through codedErrorToAgentError", () => {
+    const path = diagnosticsPath("/tmp", "coded.log");
+    const withPath = codedErrorToAgentError(new CodedError(AgentErrorCode.ProtocolError, path));
+    expect(withPath).toEqual({
+      code: AgentErrorCode.ProtocolError,
+      message: toAgentError(AgentErrorCode.ProtocolError).message,
+      diagnosticsPath: path,
+    });
+    const withoutPath = codedErrorToAgentError(new CodedError(AgentErrorCode.ProtocolError));
     expect(withoutPath.diagnosticsPath).toBeUndefined();
+  });
+
+  test("exposes no own enumerable state at the tool boundary", () => {
+    const path = diagnosticsPath("/tmp", "coded.log");
+    const withPath = new CodedError(AgentErrorCode.SpawnFailed, path);
+    const withoutPath = new CodedError(AgentErrorCode.SpawnFailed);
+    expect(Object.keys(withPath)).toEqual([]);
+    expect(JSON.stringify(withoutPath)).toBe("{}");
+    expect("diagnosticsPath" in withoutPath).toBe(false);
+  });
+
+  test("PublicPreflightError keeps its caller-supplied public message", () => {
+    const error = new PublicPreflightError(AgentErrorCode.InvalidInput, "custom guidance text");
+    expect(error.message).toBe("invalid_input: custom guidance text");
+    expect(error.code).toBe(AgentErrorCode.InvalidInput);
   });
 });
 

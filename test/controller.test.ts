@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { AgentErrorCode, AgentState, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8, verifiedContainmentReceiptPath } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CompletionState, CodedError, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8, verifiedContainmentReceiptPath } from "../src/domain.ts";
+import { diagnosticsPath } from "../src/paths.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PreparationScope } from "../src/controller.ts";
 import type { RunRuntime } from "../src/run-controller.ts";
 import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testEntryId, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
@@ -100,6 +101,37 @@ describe("parent lifecycle wiring", () => {
     expect(counters).toEqual({ reserve: 0, createSession: 0, persistSpawned: 0, createLaunch: 0, watchdog: 0, launch: 0 });
     expect(c.runs.activeCount()).toBe(0);
     expect(await c.receive()).toEqual({ completions: [], agents: [], timedOut: false });
+  });
+
+  test("a preparation CodedError diagnostics path survives publicError into the spawn rejection", async () => {
+    const path = diagnosticsPath("/tmp", "prepare-coded.log");
+    const c = new SubagentController({
+      composition: {
+        prepareSpawn: async () => { throw new CodedError(AgentErrorCode.ModelUnavailable, path); },
+        prepareSend: async () => { throw new Error("unused"); },
+      },
+    });
+    const failure = await c.spawn({ task: "one" }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CodedError);
+    expect((failure as CodedError).code).toBe(AgentErrorCode.SpawnFailed);
+    expect(String((failure as CodedError).diagnosticsPath)).toBe("/tmp/prepare-coded.log");
+    expect((failure as CodedError).message).toBe("spawn_failed: failed to spawn child agent");
+    expect((failure as CodedError).message).not.toContain("model_unavailable");
+  });
+
+  test("a preparation CodedError diagnostics path survives prepareBounded/publicError into the sendInput rejection", async () => {
+    const path = diagnosticsPath("/tmp", "send-prepare-coded.log");
+    const c = new SubagentController({
+      composition: {
+        prepareSpawn: async () => { throw new Error("unused"); },
+        prepareSend: async () => { throw new CodedError(AgentErrorCode.InvalidAgent, path); },
+      },
+    });
+    const failure = await c.sendInput(agentId("agent-a"), "hello").catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CodedError);
+    expect((failure as CodedError).code).toBe(AgentErrorCode.InvalidAgent);
+    expect(String((failure as CodedError).diagnosticsPath)).toBe("/tmp/send-prepare-coded.log");
+    expect((failure as CodedError).message).toBe("invalid_agent: unknown or unowned agent");
   });
 
   test("restore waits for preparation admitted before RunController launch admission", async () => {

@@ -22,6 +22,7 @@ import { WatchdogClient, WatchdogContainmentUnresolvedError, verifyContainmentRe
 import {
   AgentErrorCode,
   CancellationReason,
+  CodedError,
   CompletionState,
   PublicPreflightError,
   agentId,
@@ -219,7 +220,7 @@ export function createProductionController(
       outputPath: durable.committedPath, transcriptPath: record.sessionPath };
     return settlement.kind === "cancelled"
       ? { ...base, state: CompletionState.Cancelled, reason: settlement.reason }
-      : { ...base, state: CompletionState.Failed, error: toAgentError(undefined, AgentErrorCode.RunInterrupted) };
+      : { ...base, state: CompletionState.Failed, error: toAgentError(AgentErrorCode.RunInterrupted) };
   }
 
   async function prepareSpawn(input: SpawnAgentRequest): Promise<SpawnPreparation> {
@@ -397,7 +398,7 @@ export function createProductionController(
       const path = diagnosticsPath(join(root, "diagnostics", record.agentId), `${record.runId}.log`);
       if (diagnostic.length > 0) writeOwnerOnlyFile(path, diagnostic);
       completion = { ...base, state: CompletionState.Failed,
-        error: toAgentError(undefined, failure.code, diagnostic.length > 0 ? path : undefined) };
+        error: toAgentError(failure.code, diagnostic.length > 0 ? path : undefined) };
     }
     await appender.appendRunCompleted(completion);
     return completion;
@@ -455,7 +456,7 @@ function restoredCgroupRuntime(
 
 function requireChild(children: ReadonlyMap<AgentId, ChildRecord>, id: AgentId): ChildRecord {
   const child = children.get(id);
-  if (child === undefined) throw new Error(`${AgentErrorCode.InvalidAgent}: child is not owned by this parent session`);
+  if (child === undefined) throw new CodedError(AgentErrorCode.InvalidAgent);
   return child;
 }
 

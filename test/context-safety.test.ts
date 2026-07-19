@@ -208,7 +208,7 @@ function hostileController(): {
       const diagnosticPath = diagnosticsPath(root, `${record.agentId}-${record.runId}.diagnostic`);
       writeFileSync(diagnosticPath, diagnostic);
       return { agentId: record.agentId, runId: record.runId, state: CompletionState.Failed,
-        error: toAgentError(undefined, AgentErrorCode.ProtocolError, diagnosticPath), output,
+        error: toAgentError(AgentErrorCode.ProtocolError, diagnosticPath), output,
         outputPath: testCommittedOutputPath(outputPath, root), transcriptPath: record.transcriptPath };
     },
   } });

@@ -4,6 +4,7 @@ import { Type, type Static } from "typebox";
 import {
   AgentErrorCode,
   AgentState,
+  CodedError,
   CancellationReason,
   CompletionState,
   THINKING_LEVELS,
@@ -11,6 +12,7 @@ import {
   milliseconds,
   runId,
   toAgentError,
+  codedErrorToAgentError,
   truncateUtf8,
   isPublicPreflightError,
   type AgentError,
@@ -101,7 +103,7 @@ export function createSubagentTools(controller: SubagentToolController): Subagen
         const outcomes = await Promise.all(input.agentIds.map(async (raw) => {
           let id: AgentId;
           try { id = agentId(raw); }
-          catch { return failed(displayAgentId(raw), toAgentError(undefined, AgentErrorCode.InvalidAgent)); }
+          catch { return failed(displayAgentId(raw), toAgentError(AgentErrorCode.InvalidAgent)); }
           try { return await controller.stop(id); }
           catch (error) { return failed(raw, stableError(error)); }
         }));
@@ -135,13 +137,11 @@ function tool<K extends SubagentToolName, TResult extends object>(
         // as cancelled rather than reporting a stable agent error code.
         if (isAbort(error)) throw error;
         if (options.preservePublicPreflight === true && isPublicPreflightError(error)) throw error;
+        if (error instanceof CodedError) throw new CodedError(error.code, error.diagnosticsPath);
         let code: AgentErrorCode | undefined;
         try { code = stableErrorCode(error); }
         catch { throw invalidPublicResult(); }
-        if (code !== undefined) {
-          const stable = toAgentError(undefined, code);
-          throw new Error(`${stable.code}: ${stable.message}`);
-        }
+        if (code !== undefined) throw new CodedError(code);
         throw invalidPublicResult();
       }
       try {
@@ -385,7 +385,7 @@ function projectError(value: unknown): object {
   const error = requiredRecord(value);
   const code = requiredLiteral(error, "code", Object.values(AgentErrorCode));
   const diagnostics = optionalPathField(error, "diagnosticsPath").diagnosticsPath;
-  return toAgentError(undefined, code, diagnostics as DiagnosticsPath | undefined);
+  return toAgentError(code, diagnostics as DiagnosticsPath | undefined);
 }
 
 function requiredRecord(value: unknown): Record<string, unknown> {
@@ -498,8 +498,7 @@ function optionalProjectedField(value: Record<string, unknown>, key: string, pro
 }
 
 function invalidPublicResult(): Error {
-  const error = toAgentError(undefined, AgentErrorCode.InternalError);
-  return new Error(`${error.code}: ${error.message}`);
+  return new CodedError(AgentErrorCode.InternalError);
 }
 
 function bounded<TResult extends object>(details: TResult, contentDetails: object = details): { content: string; details: TResult } {
@@ -516,18 +515,19 @@ function displayAgentId(raw: string): string {
 }
 
 function stableError(error: unknown): AgentError {
+  if (error instanceof CodedError) return codedErrorToAgentError(error);
   const code = stableErrorCode(error);
-  return toAgentError(error, Object.values(AgentErrorCode).includes(code as AgentErrorCode) ? code! : AgentErrorCode.InvalidState);
+  return toAgentError(Object.values(AgentErrorCode).includes(code as AgentErrorCode) ? code! : AgentErrorCode.InvalidState);
 }
 
 async function executeStart<TResult extends object>(operation: () => Promise<TResult>, fallbackCode: AgentErrorCode): Promise<TResult> {
   try { return await operation(); }
   catch (error) {
     const stable = stableError(error);
-    const fallback = stable.code === AgentErrorCode.InvalidState && !hasStableCode(error)
-      ? toAgentError(undefined, fallbackCode)
+    const projected = stable.code === AgentErrorCode.InvalidState && !hasStableCode(error)
+      ? toAgentError(fallbackCode)
       : stable;
-    throw new Error(`${fallback.code}: ${fallback.message}`);
+    throw new CodedError(projected.code, projected.diagnosticsPath);
   }
 }
 
@@ -543,9 +543,9 @@ async function executeSpawn(operation: () => Promise<SpawnStartResult>): Promise
 function stableOperationError(error: unknown, fallbackCode: AgentErrorCode): Error {
   const stable = stableError(error);
   const projected = stable.code === AgentErrorCode.InvalidState && !hasStableCode(error)
-    ? toAgentError(undefined, fallbackCode)
+    ? toAgentError(fallbackCode)
     : stable;
-  return new Error(`${projected.code}: ${projected.message}`);
+  return new CodedError(projected.code, projected.diagnosticsPath);
 }
 
 function hasStableCode(error: unknown): boolean {
@@ -554,6 +554,7 @@ function hasStableCode(error: unknown): boolean {
 
 function stableErrorCode(error: unknown): AgentErrorCode | undefined {
   try {
+    if (error instanceof CodedError || isPublicPreflightError(error)) return error.code;
     if (error instanceof Error) {
       const code = /^([a-z_]+):/.exec(error.message)?.[1] as AgentErrorCode | undefined;
       return Object.values(AgentErrorCode).includes(code as AgentErrorCode) ? code : undefined;

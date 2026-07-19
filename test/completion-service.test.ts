@@ -60,7 +60,7 @@ describe("CompletionService.receive", () => {
     const first = service.receive();
     const second = service.receive();
 
-    await expect(second).rejects.toThrow("invalid_state: receive_agent is already waiting");
+    await expect(second).rejects.toThrow("invalid_state: agent is not in a valid state for this operation");
     await service.publish(completion());
     await expect(first).resolves.toMatchObject({
       completions: [expect.objectContaining({ runId: RUN })],
