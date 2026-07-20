@@ -9,9 +9,15 @@ export const AGENT_EVENT_CUSTOM_TYPE = "pi-subagents:event";
 
 /** Environment variable set on child processes so this extension self-suppresses lifecycle tools. */
 export const CHILD_MARKER_ENV = "PI_SUBAGENT_CHILD";
+export const CHILD_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
+export const CHILD_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
+export const CHILD_CAPACITY_ENV = "PI_SUBAGENT_MAX_CONCURRENT_RUNS";
 
 /** Default maximum number of concurrently running agents. */
 export const DEFAULT_MAX_CONCURRENT_RUNS = 4;
+export const DEFAULT_MAX_DEPTH = 1;
+export const MAX_MAX_DEPTH = 8;
+export const MAX_TREE_CHILD_PROCESSES = 100;
 
 /** Maximum time for strict live assignment identity resolution. */
 export const ASSIGNMENT_IDENTITY_TIMEOUT_MS = 5_000;

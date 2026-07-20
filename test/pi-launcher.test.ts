@@ -39,6 +39,9 @@ describe("buildRpcLaunchSpec", () => {
       childSessionDir: testAbsolutePath("/sessions"),
       effectiveModel: testModelSpec("mock-provider/luna"),
       effectiveThinking: "high" as const,
+      childDepth: 1,
+      maxDepth: 1,
+      maxConcurrentRuns: 4,
       ...override,
     });
 
@@ -49,10 +52,18 @@ describe("buildRpcLaunchSpec", () => {
     expect(buildRpcLaunchSpec(base({ effectiveTools: [] })).args).not.toContain("--tools");
   });
 
-  test("builds the exact RPC prefix and isolated environment", () => {
+  test("builds the exact RPC prefix and rewrites managed environment without mutating its caller", () => {
+    const env = {
+      HOME: "/home/me",
+      PI_SUBAGENT_CHILD: "stale",
+      PI_SUBAGENT_DEPTH: "99",
+      PI_SUBAGENT_MAX_DEPTH: "99",
+      PI_SUBAGENT_MAX_CONCURRENT_RUNS: "99",
+    };
+    const before = JSON.stringify(env);
     const spec = buildRpcLaunchSpec({ invocation: { command: testAbsolutePath("/usr/bin/node"), argsPrefix: ["/pi.js"] }, cwd: testAbsolutePath("/work"),
       childSessionDir: testAbsolutePath("/state/child"), effectiveTools: ["read", "bash"], effectiveModel: testModelSpec("openai/gpt"),
-      effectiveThinking: "high", env: { HOME: "/home/me" } });
+      effectiveThinking: "high", env, childDepth: 1, maxDepth: 2, maxConcurrentRuns: 4 });
     expect(spec.args).toEqual([
       "/pi.js",
       "--mode", "rpc",
@@ -62,13 +73,19 @@ describe("buildRpcLaunchSpec", () => {
       "--tools", "read,bash",
     ]);
     expect(spec).toMatchObject({ command: "/usr/bin/node", cwd: "/work", shell: false });
-    expect(spec.env.PI_SUBAGENT_CHILD).toBe("1");
+    expect(spec.env).toMatchObject({
+      PI_SUBAGENT_CHILD: "1",
+      PI_SUBAGENT_DEPTH: "1",
+      PI_SUBAGENT_MAX_DEPTH: "2",
+      PI_SUBAGENT_MAX_CONCURRENT_RUNS: "4",
+    });
+    expect(JSON.stringify(env)).toBe(before);
     expect(Object.isFrozen(spec)).toBe(true);
   });
   test("adds trust only for realpath-contained cwd", () => {
     const root = mkdtempSync(join(tmpdir(), "launcher-")); mkdirSync(join(root, "project", "child"), { recursive: true }); mkdirSync(join(root, "outside"));
     symlinkSync(join(root, "outside"), join(root, "project", "escape"));
-    const base = { invocation: { command: testAbsolutePath("/pi"), argsPrefix: [] }, childSessionDir: testAbsolutePath("/sessions"), effectiveTools: [], effectiveModel: testModelSpec("x"), effectiveThinking: "low" as const, trustedRoot: testAbsolutePath(join(root, "project")) };
+    const base = { invocation: { command: testAbsolutePath("/pi"), argsPrefix: [] }, childSessionDir: testAbsolutePath("/sessions"), effectiveTools: [], effectiveModel: testModelSpec("x"), effectiveThinking: "low" as const, trustedRoot: testAbsolutePath(join(root, "project")), childDepth: 1, maxDepth: 1, maxConcurrentRuns: 4 };
     expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "child")) }).args).toContain("--approve");
     expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project2")) }).args).not.toContain("--approve");
     expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "escape")) }).args).not.toContain("--approve");

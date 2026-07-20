@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { spawn as spawnProcess, type ChildProcess } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+
 import { CompletionService } from "../src/completion-service.ts";
-import { SubagentController, type PiControllerComposition, type RestorationPort, type SurrenderContainment } from "../src/controller.ts";
+import { SubagentController, type LaunchTransport, type PiControllerComposition, type RestorationPort, type SurrenderContainment } from "../src/controller.ts";
+import type { ContainmentAttempt, ContainmentBackend } from "../src/containment.ts";
 import {
   AgentErrorCode,
   AgentEventType,
@@ -23,16 +26,18 @@ import {
   type RunId,
 } from "../src/domain.ts";
 import { OutputStore } from "../src/output-store.ts";
-import { containmentReceiptPath } from "../src/paths.ts";
+import { containmentReceiptPath, sessionPath } from "../src/paths.ts";
 import { AgentEventAppender, foldAgentEvents } from "../src/persistence.ts";
-import { buildRpcLaunchSpec } from "../src/pi-launcher.ts";
-import { RunController, classifyTerminal, type RunControllerOptions } from "../src/run-controller.ts";
+import { createProductionController, effectiveToolsForRelaunch } from "../src/pi-composition.ts";
+import { buildRpcLaunchSpec, type BuildRpcLaunchOptions } from "../src/pi-launcher.ts";
+import { RunController, classifyTerminal, type RunControllerOptions, type RunRuntime } from "../src/run-controller.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testModelSpec, testReceiptPath, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
 import { agentSummary, assistantMessage, completedCompletion, testUsage } from "./support/messages.ts";
 import { testRuntime } from "./support/launches.ts";
 import { testRunController } from "./support/controllers.ts";
+import { extensionApiForTest } from "./support/extension-api.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const A = agentId("agent-a");
@@ -232,6 +237,7 @@ describe("controller orchestration scenarios", () => {
       invocation: { command: testAbsolutePath("/usr/bin/node"), argsPrefix: ["/opt/pi/cli.js"] }, cwd: testAbsolutePath("/external"),
       childSessionDir: testAbsolutePath("/tmp/sessions"), effectiveTools: ["read"], effectiveModel: testModelSpec("mock/model"),
       effectiveThinking: "minimal", trustedRoot: testAbsolutePath("/project"), env: {},
+      childDepth: 1, maxDepth: 1, maxConcurrentRuns: 4,
     });
     expect(spec.args).not.toContain("--approve");
   });
@@ -356,6 +362,85 @@ describe("controller orchestration scenarios", () => {
     await host.shutdown();
   });
 
+  test("restored send_input drops lifecycle tools when current depth policy reaches the child boundary", async () => {
+    const state = temporaryStateRoot("pi-production-relaunch-");
+    const persistedTools = ["read", "spawn_agent", "receive_agent"];
+    let captured: BuildRpcLaunchOptions | undefined;
+    let preparedAttempts = 0;
+    let bypassedAttemptPreparation = false;
+    try {
+      const project = join(String(state.path), "project");
+      const parentSessions = join(String(state.path), "parent-sessions");
+      mkdirSync(project);
+      mkdirSync(parentSessions);
+      const parent = SessionManager.create(project, parentSessions);
+      const productionRoot = join(String(state.path), parent.getSessionId());
+      const childSessions = join(productionRoot, "sessions");
+      mkdirSync(childSessions, { recursive: true });
+      const child = SessionManager.create(project, childSessions);
+      const childFile = child.getSessionFile();
+      if (childFile === undefined) throw new Error("child session file unavailable");
+      const childId = agentId(child.getSessionId());
+      const appender = new AgentEventAppender((customType, data) => {
+        parent.appendCustomEntry(customType, data);
+      });
+      await appender.appendSpawned({
+        agentId: childId,
+        sessionPath: sessionPath(productionRoot, childFile),
+        cwd: testAbsolutePath(project),
+        provider: "mock",
+        modelId: testModelSpec("mock/model"),
+        thinkingLevel: "minimal",
+        tools: persistedTools,
+      });
+      const backend = productionBackend(() => { preparedAttempts++; });
+      const dependencies = {
+        createContainmentProvider: () => ({ kind: "available" as const, backend }),
+        buildRpcLaunchSpec: (launchOptions: BuildRpcLaunchOptions) => {
+          expect(preparedAttempts).toBe(1);
+          captured = launchOptions;
+          return buildRpcLaunchSpec({
+            ...launchOptions,
+            invocation: { command: testAbsolutePath("/pi"), argsPrefix: [] },
+          });
+        },
+        createPreparedLaunch: async (prepared: { runtime: RunRuntime; attempt: ContainmentAttempt }) => {
+          expect(captured?.effectiveTools).toEqual(["read"]);
+          return deterministicLaunch(prepared.runtime, prepared.attempt.descriptor);
+        },
+        constructLaunch: async () => {
+          bypassedAttemptPreparation = true;
+          throw new Error("obsolete containment-bypass seam was used");
+        },
+      };
+      const host = createProductionController(
+        productionContext(parent, project),
+        extensionApiForTest({
+          registerTool: () => {}, on: () => {},
+          appendEntry: (customType, data) => { parent.appendCustomEntry(customType, data); },
+          sendMessage: () => {}, getThinkingLevel: () => "minimal", getActiveTools: () => ["read"],
+        }),
+        { capacity: 4, currentDepth: 0, maxDepth: 1, stateRoot: String(state.path) },
+        dependencies,
+      );
+      await host.restore();
+
+      await host.sendInput(childId, "restored assignment");
+
+      expect(preparedAttempts).toBe(1);
+      expect(bypassedAttemptPreparation).toBeFalse();
+      expect(captured?.effectiveTools).toEqual(effectiveToolsForRelaunch(persistedTools, 0, 1));
+      expect(captured?.effectiveTools).toEqual(["read"]);
+      expect(persistedTools).toEqual(["read", "spawn_agent", "receive_agent"]);
+    } finally {
+      state.cleanup();
+    }
+  });
+
+  test("restored relaunch policy never adds lifecycle tools omitted by an explicit allowlist", () => {
+    expect(effectiveToolsForRelaunch(["read"], 0, 2)).toEqual(["read"]);
+  });
+
   test("24 public IDs come from the native session and first assignment entry", async () => {
     const nativeSessionId = agentId("native-session-42"); const assignmentEntryId = runId("0123abcd");
     const host = controllerWithNativeLaunch(nativeSessionId, assignmentEntryId, () => {});
@@ -397,7 +482,11 @@ function assistant(text: string) {
   return assistantMessage(text, { timestamp: Date.now(), usage: testUsage({ input: 0, output: 0, totalTokens: 0 }) });
 }
 
-function controllerWithNativeLaunch(id: AgentId, nativeRunId: RunId, onPrompt: (message: string) => void): SubagentController {
+function controllerWithNativeLaunch(
+  id: AgentId,
+  nativeRunId: RunId,
+  onPrompt: (message: string) => void,
+): SubagentController {
   const session = { agentId: id, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${id}.jsonl`), previousLeafId: null,
     attemptId: testAttemptId(`attempt-${id}`), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${id}.receipt`) };
   const launch = async (surrender: SurrenderContainment) => {
@@ -418,9 +507,70 @@ function controllerWithNativeLaunch(id: AgentId, nativeRunId: RunId, onPrompt: (
   const composition = {
     prepareSpawn: async () => ({ selection: { model: modelSpec("mock-provider/luna"), thinkingLevel: "high", tools: ["read"] },
       createSession: async () => session, persistSpawned: async () => {}, createLaunch: async (_session, surrender) => launch(surrender) }),
-    prepareSend: async () => ({ session, createLaunch: launch }),
+    prepareSend: async () => ({ session, createLaunch: (surrender: SurrenderContainment) => launch(surrender) }),
   } satisfies PiControllerComposition;
   return new SubagentController({ composition });
+}
+
+function productionContext(
+  sessionManager: SessionManager,
+  cwd: string,
+): Parameters<typeof createProductionController>[0] {
+  return {
+    sessionManager,
+    cwd,
+    model: undefined,
+    modelRegistry: { getAll: () => [] },
+    hasUI: false,
+    ui: {
+      select: async () => undefined, confirm: async () => false, input: async () => undefined,
+      editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {},
+    },
+    isIdle: () => true,
+    isProjectTrusted: () => false,
+  };
+}
+
+function productionBackend(onPrepareAttempt: () => void): ContainmentBackend {
+  const parentScope = testAbsolutePath("/tmp/test-cgroup/parent");
+  const prepareAttempt = (attemptId: ContainmentAttempt["attemptId"]): ContainmentAttempt => {
+    onPrepareAttempt();
+    return {
+      attemptId,
+      parentScope,
+      descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
+      terminate: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/attempt.receipt"),
+      verifyEmpty: async () => {},
+      cleanup: async () => {},
+    };
+  };
+  return {
+    root: testAbsolutePath("/tmp/test-cgroup"),
+    parentScope,
+    preflight: async () => {},
+    prepareAttempt,
+    restoreAttempt: prepareAttempt,
+    shutdown: async () => {},
+  };
+}
+
+function deterministicLaunch(
+  owned: RunRuntime,
+  containment: LaunchTransport["containment"],
+): LaunchTransport {
+  let reads = 0;
+  let assignment = "";
+  return {
+    runtime: owned,
+    containment,
+    ready: async () => {}, persistLaunchRequested: async () => {}, persistRunStarted: async () => {},
+    start: async () => {},
+    getEntries: async () => reads++ === 0 ? { entries: [], leafId: null } : {
+      entries: [{ type: "message", id: R2, message: { role: "user", content: assignment } }], leafId: R2,
+    },
+    prompt: async (message: string) => { assignment = message; }, waitForAgentStart: async () => {},
+    bindRun: () => {}, waitSettled: () => new Promise<never>(() => {}),
+  };
 }
 
 function spawnSleeper(): ChildProcess {

@@ -1,9 +1,11 @@
 import { isAbsolute, join } from "node:path";
 
-import { DEFAULT_MAX_CONCURRENT_RUNS } from "./constants.ts";
+import { DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_MAX_DEPTH, MAX_MAX_DEPTH, MAX_TREE_CHILD_PROCESSES } from "./constants.ts";
+import { boundedTreeChildCount, type DelegationLimits } from "./delegation-policy.ts";
 
 export interface SubagentSettingsResolved {
   maxConcurrentRuns: number;
+  maxDepth: number;
   cgroupRoot?: string;
 }
 
@@ -38,6 +40,8 @@ export interface LoadSubagentSettingsOptions {
    */
   projectText?: string;
   projectTrusted: boolean;
+  /** Managed descendants inherit limits and may not override them locally. */
+  readonly inheritedLimits?: DelegationLimits;
 }
 
 export interface LoadSubagentSettingsResult {
@@ -61,14 +65,22 @@ export function loadSubagentSettings(
     ? readSubagents(options.projectText, "project", diagnostics)
     : undefined;
 
-  let maxConcurrentRuns =
-    extractMaxConcurrentRuns(global, "global", diagnostics) ??
-    DEFAULT_MAX_CONCURRENT_RUNS;
+  const inherited = options.inheritedLimits;
+  let maxConcurrentRuns = inherited?.maxConcurrentRuns ??
+    extractMaxConcurrentRuns(global, "global", diagnostics) ?? DEFAULT_MAX_CONCURRENT_RUNS;
+  let maxDepth = inherited?.maxDepth ?? extractMaxDepth(global, "global", diagnostics) ?? DEFAULT_MAX_DEPTH;
 
-  const projectValue = extractMaxConcurrentRuns(project, "project", diagnostics);
-  if (projectValue !== undefined) {
-    maxConcurrentRuns = projectValue;
+  if (inherited === undefined) {
+    const projectValue = extractMaxConcurrentRuns(project, "project", diagnostics);
+    if (projectValue !== undefined) maxConcurrentRuns = projectValue;
+    if (maxDepth > 1 && boundedTreeChildCount(maxConcurrentRuns, maxDepth) > MAX_TREE_CHILD_PROCESSES) {
+      diagnostics.push(
+        `subagents maxDepth ${maxDepth} with maxConcurrentRuns ${maxConcurrentRuns} allows more than 100 concurrent child processes; using maxDepth 1`,
+      );
+      maxDepth = 1;
+    }
   }
+  diagnoseProjectMaxDepth(project, diagnostics);
 
   const cgroupRoot = extractCgroupRoot(global, diagnostics);
   diagnoseProjectCgroupRoot(project, diagnostics);
@@ -76,6 +88,7 @@ export function loadSubagentSettings(
   return {
     value: {
       maxConcurrentRuns,
+      maxDepth,
       ...(cgroupRoot === undefined ? {} : { cgroupRoot }),
     },
     diagnostics,
@@ -131,6 +144,38 @@ function readSubagents(
   return subagents as Record<string, unknown>;
 }
 
+export function readGlobalMaxDepth(globalText: string | undefined): number {
+  const diagnostics: string[] = [];
+  const maxDepth = extractMaxDepth(readSubagents(globalText, "global", diagnostics), "global", diagnostics);
+  return maxDepth ?? DEFAULT_MAX_DEPTH;
+}
+
+function extractMaxDepth(
+  subagents: Record<string, unknown> | undefined,
+  source: string,
+  diagnostics: string[],
+): number | undefined {
+  if (subagents === undefined || subagents.maxDepth === undefined) return undefined;
+  const maxDepth = subagents.maxDepth;
+  if (
+    typeof maxDepth !== "number" || !Number.isInteger(maxDepth) ||
+    maxDepth < 0 || maxDepth > MAX_MAX_DEPTH
+  ) {
+    diagnostics.push(`${source} subagents.maxDepth must be an integer from 0 through 8; ignoring`);
+    return undefined;
+  }
+  return maxDepth;
+}
+
+function diagnoseProjectMaxDepth(
+  subagents: Record<string, unknown> | undefined,
+  diagnostics: string[],
+): void {
+  if (subagents?.maxDepth !== undefined) {
+    diagnostics.push("project subagents.maxDepth is global-only; ignoring");
+  }
+}
+
 function extractMaxConcurrentRuns(
   subagents: Record<string, unknown> | undefined,
   source: string,
@@ -144,11 +189,11 @@ function extractMaxConcurrentRuns(
   }
   if (
     typeof maxConcurrentRuns !== "number" ||
-    !Number.isInteger(maxConcurrentRuns) ||
+    !Number.isSafeInteger(maxConcurrentRuns) ||
     maxConcurrentRuns < 1
   ) {
     diagnostics.push(
-      `${source} subagents.maxConcurrentRuns must be a positive integer; ignoring`,
+      `${source} subagents.maxConcurrentRuns must be a positive safe integer; ignoring`,
     );
     return undefined;
   }

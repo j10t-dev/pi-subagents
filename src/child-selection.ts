@@ -26,6 +26,7 @@ export interface ChildSelectionInput {
   readonly parentModel: NativeModel;
   readonly parentThinking: NativeThinkingLevel;
   readonly parentActiveTools: readonly string[];
+  readonly allowLifecycleTools: boolean;
   readonly modelRegistry: ModelCatalogue;
 }
 
@@ -38,7 +39,7 @@ export interface EffectiveChildSelection {
 
 export function resolveChildSelection(input: ChildSelectionInput): EffectiveChildSelection {
   const selection = selectModel(input);
-  const tools = selectTools(input.requestedTools, input.parentActiveTools);
+  const tools = selectTools(input.requestedTools, input.parentActiveTools, input.allowLifecycleTools);
   return Object.freeze({ ...selection, tools });
 }
 
@@ -190,11 +191,23 @@ function canonicalModel(model: NativeModel): string {
   return `${model.provider}/${model.id}`;
 }
 
+export function filterLifecycleTools(
+  tools: readonly string[],
+  allowLifecycleTools: boolean,
+): readonly string[] {
+  return Object.freeze(
+    allowLifecycleTools
+      ? [...tools]
+      : tools.filter((tool) => !LIFECYCLE_TOOLS.has(tool)),
+  );
+}
+
 function selectTools(
   requestedTools: readonly string[] | undefined,
   parentActiveTools: readonly string[],
+  allowLifecycleTools: boolean,
 ): readonly string[] {
-  const eligible = parentActiveTools.filter((tool) => !LIFECYCLE_TOOLS.has(tool));
+  const eligible = filterLifecycleTools(parentActiveTools, allowLifecycleTools);
   if (requestedTools === undefined) return Object.freeze([...eligible]);
 
   const requested = [...new Set(requestedTools)];

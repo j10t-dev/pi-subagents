@@ -14,10 +14,10 @@ import {
   type SurrenderContainment,
 } from "./controller.ts";
 import { AgentEventAppender, foldAgentEvents, type RestoredAgentRecord } from "./persistence.ts";
-import { buildRpcLaunchSpec, resolvePiInvocation } from "./pi-launcher.ts";
+import { buildRpcLaunchSpec, resolvePiInvocation, type BuildRpcLaunchOptions, type RpcLaunchSpec } from "./pi-launcher.ts";
 import { isLocalOutputPublicationError, RpcRunClient } from "./rpc-client.ts";
 import { OutputStore } from "./output-store.ts";
-import { UIForwarder } from "./ui-forwarder.ts";
+import { UIForwarder, type UIForwarderContext } from "./ui-forwarder.ts";
 import { WatchdogClient, WatchdogContainmentUnresolvedError, verifyContainmentReceipt } from "./watchdog-client.ts";
 import {
   AgentErrorCode,
@@ -45,10 +45,20 @@ import {
 } from "./domain.ts";
 import { absolutePath, containmentReceiptPath, diagnosticsPath, sessionPath, writeOwnerOnlyFile } from "./paths.ts";
 import type { RunRecord, RunRuntime, Settlement } from "./run-controller.ts";
-import { resolveChildSelection } from "./child-selection.ts";
+import { filterLifecycleTools, resolveChildSelection, type ModelCatalogue } from "./child-selection.ts";
+import { canDelegateFrom } from "./delegation-policy.ts";
 import { ensureDurableDirectorySync } from "./durable-fs.ts";
 import { createContainmentProvider, type ContainmentProvider } from "./cgroup-v2.ts";
-import type { ContainmentBackend } from "./containment.ts";
+import type { ContainmentAttempt, ContainmentBackend } from "./containment.ts";
+
+interface ProductionControllerContext extends UIForwarderContext {
+  readonly sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId" | "getBranch">;
+  readonly cwd: string;
+  readonly model: ExtensionContext["model"];
+  readonly modelRegistry: ModelCatalogue;
+  isIdle(): boolean;
+  isProjectTrusted(): boolean;
+}
 
 interface ChildRecord {
   readonly session: LaunchSession;
@@ -62,10 +72,29 @@ interface ChildRecord {
 
 export interface ProductionControllerOptions {
   capacity: number;
+  currentDepth: number;
+  maxDepth: number;
   stateRoot: string;
   cgroupRoot?: string;
   onStatusChange?: () => void;
 }
+
+interface PreparedProductionLaunch {
+  readonly attempt: ContainmentAttempt;
+  readonly spec: RpcLaunchSpec;
+  readonly runtime: RunRuntime;
+}
+
+interface ProductionControllerDependencies {
+  readonly createContainmentProvider: typeof createContainmentProvider;
+  readonly buildRpcLaunchSpec: (options: BuildRpcLaunchOptions) => RpcLaunchSpec;
+  readonly createPreparedLaunch?: (prepared: PreparedProductionLaunch) => Promise<LaunchTransport>;
+}
+
+const PRODUCTION_CONTROLLER_DEPENDENCIES: ProductionControllerDependencies = {
+  createContainmentProvider,
+  buildRpcLaunchSpec,
+};
 
 /** The single production capability gate. No launch-side continuation runs before it succeeds. */
 export async function withProductionContainmentPreflight<T>(
@@ -91,17 +120,20 @@ export async function withProductionContainmentPreflight<T>(
 
 /** Builds the concrete Pi/watchdog composition for one parent-session extension instance. */
 export function createProductionController(
-  context: ExtensionContext,
+  context: ProductionControllerContext,
   pi: ExtensionAPI,
   options: ProductionControllerOptions,
+  dependencies: ProductionControllerDependencies = PRODUCTION_CONTROLLER_DEPENDENCIES,
 ): SubagentController {
   const parentId = agentId(context.sessionManager.getSessionId());
   const root = absolutePath(join(options.stateRoot, parentId));
   ensureDurableDirectorySync(root);
   const appender = new AgentEventAppender((customType, data) => pi.appendEntry(customType, data));
-  const containment = createContainmentProvider({
+  const containment = dependencies.createContainmentProvider({
     parentSessionId: context.sessionManager.getSessionId(),
-    ...(options.cgroupRoot === undefined ? {} : { configuredRoot: options.cgroupRoot }),
+    ...(options.currentDepth === 0 && options.cgroupRoot !== undefined
+      ? { configuredRoot: options.cgroupRoot }
+      : {}),
     receiptPathFor: (attemptId) => receiptFor(root, attemptId),
     diagnostic: (message) => context.ui.notify(message, "warning"),
   });
@@ -231,6 +263,7 @@ export function createProductionController(
       parentModel: requireParentModel(context.model),
       parentThinking: pi.getThinkingLevel(),
       parentActiveTools: pi.getActiveTools(),
+      allowLifecycleTools: canDelegateFrom(options.currentDepth + 1, options.maxDepth),
       modelRegistry: context.modelRegistry,
     });
     return withProductionContainmentPreflight(containment, async (backend) => {
@@ -262,7 +295,12 @@ export function createProductionController(
         await appender.appendSpawned({ agentId: session.agentId, sessionPath: session.transcriptPath, cwd,
           provider: modelProvider(record.model), modelId: modelId(record.model), thinkingLevel: record.thinking, tools: record.tools });
       },
-      createLaunch: async (session, surrender) => createLaunch(requireChild(children, session.agentId), backend, surrender),
+      createLaunch: async (session, surrender) => createLaunch(
+        requireChild(children, session.agentId),
+        backend,
+        surrender,
+        selection.tools,
+      ),
     };
     });
   }
@@ -280,7 +318,13 @@ export function createProductionController(
       containmentReceiptPath: receiptFor(root, attemptId),
     };
     children.set(id, { ...child, session });
-    return { session, createLaunch: async (surrender) => createLaunch(requireChild(children, id), backend, surrender) };
+    const effectiveTools = effectiveToolsForRelaunch(child.tools, options.currentDepth, options.maxDepth);
+    return { session, createLaunch: async (surrender) => createLaunch(
+      requireChild(children, id),
+      backend,
+      surrender,
+      effectiveTools,
+    ) };
     });
   }
 
@@ -288,6 +332,7 @@ export function createProductionController(
     child: ChildRecord,
     backend: ContainmentBackend,
     surrender: SurrenderContainment,
+    effectiveTools: readonly string[],
   ): Promise<LaunchTransport> {
     const attempt = backend.prepareAttempt(child.session.attemptId);
     const outputDir = absolutePath(join(root, "output", child.session.agentId));
@@ -322,15 +367,20 @@ export function createProductionController(
         }
       },
     };
-    watchdog = constructContainedLaunch(runtime, surrender, () => new WatchdogClient({
+    const spec = launchAfterSurrender(runtime, surrender, () => dependencies.buildRpcLaunchSpec({
+      invocation: resolvePiInvocation(), cwd: child.cwd, childSessionDir: absolutePath(join(root, "sessions")),
+      existingSession: child.session.transcriptPath, effectiveTools, effectiveModel: child.model,
+      effectiveThinking: child.thinking, childDepth: options.currentDepth + 1,
+      maxDepth: options.maxDepth, maxConcurrentRuns: options.capacity,
+      ...(context.isProjectTrusted() ? { trustedRoot: absolutePath(context.cwd) } : {}),
+    }));
+    if (dependencies.createPreparedLaunch !== undefined) {
+      return dependencies.createPreparedLaunch({ attempt, spec, runtime });
+    }
+    watchdog = new WatchdogClient({
       attemptId: child.session.attemptId,
       receiptPath: child.session.containmentReceiptPath,
       attempt,
-    }));
-    const spec = buildRpcLaunchSpec({
-      invocation: resolvePiInvocation(), cwd: child.cwd, childSessionDir: absolutePath(join(root, "sessions")),
-      existingSession: child.session.transcriptPath, effectiveTools: child.tools, effectiveModel: child.model,
-      effectiveThinking: child.thinking, ...(context.isProjectTrusted() ? { trustedRoot: absolutePath(context.cwd) } : {}),
     });
     client = new RpcRunClient({
       launchTransport: async () => {
@@ -405,6 +455,17 @@ export function createProductionController(
   }
 }
 
+export function effectiveToolsForRelaunch(
+  persistedTools: readonly string[],
+  currentDepth: number,
+  maxDepth: number,
+): readonly string[] {
+  return filterLifecycleTools(
+    persistedTools,
+    canDelegateFrom(currentDepth + 1, maxDepth),
+  );
+}
+
 /** Returns the first assignment after an existing cursor; a missing cursor is unavailable. */
 export function firstUserEntryAfterCursor(entries: readonly SessionEntry[], cursor: SessionEntryId | null): RunId | undefined {
   const cursorIndex = cursor === null ? -1 : entries.findIndex((entry) => entry.id === cursor);
@@ -416,17 +477,14 @@ export function firstUserEntryAfterCursor(entries: readonly SessionEntry[], curs
   return undefined;
 }
 
-/**
- * The single process-creation gate used by production composition. The runtime is transferred
- * to controller ownership synchronously before the watchdog factory is permitted to run.
- */
-export function constructContainedLaunch<T>(
+/** Transfers containment to controller ownership before any launch construction can proceed. */
+export function launchAfterSurrender<T>(
   runtime: RunRuntime,
   surrender: SurrenderContainment,
-  createWatchdog: () => T,
+  createLaunch: () => T,
 ): T {
   surrender(runtime);
-  return createWatchdog();
+  return createLaunch();
 }
 
 function restoredCgroupRuntime(

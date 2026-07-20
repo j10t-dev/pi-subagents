@@ -3,10 +3,12 @@ import { accessSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathS
 import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { resolveCgroupV2Backend } from "../src/cgroup-v2.ts";
 import { createRunAttemptId } from "../src/domain.ts";
 import { testAbsolutePath } from "./support/brands.ts";
+import { isContainedPath } from "../src/paths.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
 import { WatchdogClient, verifyContainmentReceipt } from "../src/watchdog-client.ts";
 
@@ -66,6 +68,56 @@ describe("production cgroup-v2 process containment", () => {
       rmSync(state, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("configured-root descendants remain nested beneath the ancestor attempt", async () => {
+    const state = mkdtempSync(join(tmpdir(), "pi-cgroup-nested-"));
+    const readyPath = join(state, "nested-ready.json");
+    const bootstrap = resolveCgroupV2Backend({
+      parentSessionId: `nested-bootstrap-${process.pid}-${Date.now()}`,
+      receiptPathFor: (attemptId) => containmentReceiptPath(state, `bootstrap-${attemptId}.json`),
+    });
+    let ancestor: ReturnType<typeof resolveCgroupV2Backend> | undefined;
+    let ancestorClient: WatchdogClient | undefined;
+    try {
+      await bootstrap.preflight();
+      ancestor = resolveCgroupV2Backend({
+        parentSessionId: `nested-ancestor-${process.pid}-${Date.now()}`,
+        configuredRoot: bootstrap.root,
+        receiptPathFor: (attemptId) => containmentReceiptPath(state, `ancestor-${attemptId}.json`),
+      });
+      await ancestor.preflight();
+      const attemptId = createRunAttemptId();
+      const ancestorAttempt = ancestor.prepareAttempt(attemptId);
+      ancestorClient = new WatchdogClient({
+        attemptId,
+        receiptPath: containmentReceiptPath(state, `ancestor-${attemptId}.json`),
+        attempt: ancestorAttempt,
+      });
+      await ancestorClient.ready();
+      await ancestorClient.launch({
+        command: testAbsolutePath(process.execPath),
+        args: [fileURLToPath(new URL("fixtures/nested-cgroup-controller.ts", import.meta.url)), state, readyPath],
+        cwd: testAbsolutePath(state),
+        env: process.env,
+        shell: false,
+      });
+      const ready = await waitForNestedReady(readyPath);
+      expect(isContainedPath(ancestorAttempt.descriptor.scopePath, ready.nestedRoot)).toBeTrue();
+      expect(isContainedPath(ancestorAttempt.descriptor.scopePath, ready.nestedScope)).toBeTrue();
+      expect(ready.grandchildPids).not.toHaveLength(0);
+
+      await ancestorClient.close();
+      await waitForProcessesAbsent([ready.controllerPid, ...ready.grandchildPids]);
+      expect(cgroupReportsRunning(ancestorAttempt.descriptor.scopePath)).toBeFalse();
+      expect(cgroupReportsRunning(ready.nestedScope)).toBeFalse();
+      expect(cgroupReportsRunning(ready.nestedRoot)).toBeFalse();
+    } finally {
+      await ancestorClient?.close().catch(() => undefined);
+      await ancestor?.shutdown().catch(() => undefined);
+      await bootstrap.shutdown().catch(() => undefined);
+      rmSync(state, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 function resolveSetsid(): string {
@@ -97,6 +149,41 @@ function processGroup(pid: number): number {
   const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
   const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
   return Number(tail[2]);
+}
+
+interface NestedCgroupReady {
+  readonly controllerPid: number;
+  readonly nestedRoot: string;
+  readonly nestedScope: string;
+  readonly grandchildPids: readonly number[];
+}
+
+async function waitForNestedReady(path: string): Promise<NestedCgroupReady> {
+  const errorPath = `${path}.error`;
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (existsSync(errorPath)) throw new Error(readFileSync(errorPath, "utf8"));
+    if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8")) as NestedCgroupReady;
+    await Bun.sleep(20);
+  }
+  throw new Error("nested cgroup fixture did not publish readiness");
+}
+
+async function waitForProcessesAbsent(pids: readonly number[]): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (pids.every(processAbsent)) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`nested cgroup fixture processes remain: ${pids.filter((pid) => !processAbsent(pid)).join(",")}`);
+}
+
+function cgroupReportsRunning(path: string): boolean {
+  try { return /(?:^|\n)populated 1(?:\n|$)/u.test(readFileSync(join(path, "cgroup.events"), "utf8")); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function processAbsent(pid: number): boolean {

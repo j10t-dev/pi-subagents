@@ -22,18 +22,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { CONFIG_DIR_NAME, RpcClient, SessionManager } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, RpcClient, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
-import { constructContainedLaunch } from "../src/pi-composition.ts";
+import { launchAfterSurrender } from "../src/pi-composition.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
 import {
   adaptParentPiEnvironmentForRpcClient,
+  clearManagedChildEnvironment,
   createParentPiEnvironment,
   reportIntegrationCli,
   resolveIntegrationCli,
 } from "./support/pi-integration-harness.ts";
 import { testAttemptId, testVerifiedReceiptPath } from "./support/brands.ts";
+
+clearManagedChildEnvironment(process.env);
 
 const PI_EXECUTABLE = resolveIntegrationCli();
 reportIntegrationCli(PI_EXECUTABLE);
@@ -224,16 +227,16 @@ describe("installed Pi integration prerequisites", () => {
     } finally { await client.stop(); }
   }, 40_000);
 
-  test("real composition surrenders containment before watchdog construction", () => {
+  test("real composition surrenders containment exactly once before constructing a launch", () => {
     const order: string[] = [];
     const runtime = { abort: async () => {}, contain: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/receipt") };
-    const result = constructContainedLaunch(
+    const result = launchAfterSurrender(
       runtime,
       (owned) => { expect(owned).toBe(runtime); order.push("surrender"); },
-      () => { order.push("watchdog"); return 42; },
+      () => { order.push("launch"); return 42; },
     );
     expect(result).toBe(42);
-    expect(order).toEqual(["surrender", "watchdog"]);
+    expect(order).toEqual(["surrender", "launch"]);
   });
 
   test("a no-process containment receipt is accepted for the matching attempt", () => {
@@ -401,6 +404,52 @@ describe("deterministic network-free real-Pi matrix", () => {
       const transcript = readFileSync(findChildTranscript(agentDir, clamped.agentId), "utf8");
       expect(transcript).toContain('"modelId":"plain-model"');
       expect(transcript).toContain('"thinkingLevel":"off"');
+    });
+  }, 40_000);
+
+  test("05a managed depth-two delegation exposes lifecycle tools only below the boundary", async () => {
+    await withFixture("nested-delegation", async ({ client, childLaunchDir, agentDir }) => {
+      await client.promptAndWait("CALL_SPAWN_TASK|NESTED_DELEGATION", undefined, 20_000);
+      const child = decodeStartResult(await client.getLastAssistantText());
+      expect(child.tools).toEqual(expect.arrayContaining(["spawn_agent", "receive_agent"]));
+
+      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      const received = parseJsonRecord(await client.getLastAssistantText());
+      const completions = received.completions;
+      if (!Array.isArray(completions) || completions.length !== 1) throw new Error("missing nested child completion");
+      const childOutput = requireJsonRecord(requireJsonRecord(completions[0]).output).text;
+      if (typeof childOutput !== "string") throw new Error("missing nested child output");
+      const nested = parseJsonRecord(childOutput);
+      expect(nested.childTools).toEqual(expect.arrayContaining(["spawn_agent", "receive_agent"]));
+      const grandchildReceive = requireJsonRecord(nested.grandchildReceive);
+      const grandchildCompletions = grandchildReceive.completions;
+      if (!Array.isArray(grandchildCompletions) || grandchildCompletions.length !== 1) {
+        throw new Error("missing grandchild completion");
+      }
+      const grandchild = requireJsonRecord(grandchildCompletions[0]);
+      const grandchildText = requireJsonRecord(grandchild.output).text;
+      if (typeof grandchildText !== "string") throw new Error("missing grandchild output");
+      const grandchildTools = parseStringArray(grandchildText);
+      for (const lifecycleTool of LIFECYCLE_TOOLS) expect(grandchildTools).not.toContain(lifecycleTool);
+
+      const childTranscript = SessionManager.open(findChildTranscript(agentDir, child.agentId)).getEntries();
+      expect(transcriptToolNames(childTranscript)).toEqual(expect.arrayContaining(["spawn_agent", "receive_agent"]));
+      expect(transcriptToolNames(childTranscript)).not.toContain("bash");
+      expect(containsPiCommand(transcriptAssistantText(childTranscript))).toBeFalse();
+      if (typeof grandchild.agentId !== "string") throw new Error("missing grandchild agent ID");
+      const grandchildTranscript = SessionManager.open(findChildTranscript(agentDir, grandchild.agentId)).getEntries();
+      expect(transcriptToolNames(grandchildTranscript)).not.toContain("bash");
+      expect(containsPiCommand(transcriptAssistantText(grandchildTranscript))).toBeFalse();
+
+      expect(childLaunchPids(childLaunchDir)).toHaveLength(2);
+      expect(childLaunchPids(childLaunchDir).every(processAbsent)).toBeTrue();
+    }, process.env, undefined, ({ agentDir }) => {
+      writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+        defaultProvider: "mock-provider",
+        defaultModel: "mock-model",
+        defaultThinkingLevel: "high",
+        subagents: { maxConcurrentRuns: 2, maxDepth: 2 },
+      }));
     });
   }, 40_000);
 
@@ -761,6 +810,22 @@ describe("deterministic network-free real-Pi matrix", () => {
     });
   }, 40_000);
 });
+
+function transcriptToolNames(entries: readonly SessionEntry[]): string[] {
+  return entries.flatMap((entry) => entry.type === "message" && entry.message.role === "assistant"
+    ? entry.message.content.flatMap((part) => part.type === "toolCall" ? [part.name] : [])
+    : []);
+}
+
+function transcriptAssistantText(entries: readonly SessionEntry[]): string {
+  return entries.flatMap((entry) => entry.type === "message" && entry.message.role === "assistant"
+    ? entry.message.content.flatMap((part) => part.type === "text" ? [part.text] : [])
+    : []).join("\n");
+}
+
+function containsPiCommand(text: string): boolean {
+  return text.split("\n").some((line) => /(?:^|[;&|]\s*)(?:\S+\/)?pi(?:\s|$)/i.test(line.trim()));
+}
 
 function findChildTranscript(agentDir: string, childId: string): string {
   const state = join(agentDir, "pi-subagents");

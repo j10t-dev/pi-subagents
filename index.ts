@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-import { CHILD_MARKER_ENV } from "./src/constants.ts";
+import { canDelegateFrom, parseExtensionLaunchContext, type DelegationLimits } from "./src/delegation-policy.ts";
 import { SubagentController } from "./src/controller.ts";
 import { createProductionController } from "./src/pi-composition.ts";
-import { loadSubagentSettings, readSubagentSettingsFiles, type SubagentSettingsResolved } from "./src/settings.ts";
+import { loadSubagentSettings, readGlobalMaxDepth, readSubagentSettingsFiles, type SubagentSettingsResolved } from "./src/settings.ts";
 import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
 
 const STATUS_KEY = "pi-subagents";
@@ -48,10 +48,14 @@ export interface ExtensionController {
   beforeFork?(): boolean;
 }
 
+export type ExtensionRegistration =
+  | { readonly enabled: true }
+  | { readonly enabled: false; readonly diagnostic?: string };
+
 export interface PiSubagentsExtensionOptions {
   platform: string;
   nodeVersion?: string;
-  child: boolean;
+  registration: ExtensionRegistration;
   createController(context: ExtensionContext, api: ExtensionAPI, refreshStatus: () => void): ExtensionController;
   diagnostic(message: string): void;
 }
@@ -65,7 +69,14 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       );
       return;
     }
-    if (options.child) return;
+    if (!options.registration.enabled) {
+      const diagnostic = options.registration.diagnostic;
+      if (diagnostic !== undefined) {
+        options.diagnostic(diagnostic);
+        pi.on("session_start", (_event, context) => { context.ui.notify(diagnostic, "warning"); });
+      }
+      return;
+    }
 
     let current: ExtensionController | undefined;
     let activeContext: ExtensionContext | undefined;
@@ -174,12 +185,19 @@ function compactResult(value: object | undefined): string {
   return text.length <= 500 ? text : `${text.slice(0, 497)}...`;
 }
 
+const launchContext = parseExtensionLaunchContext(process.env);
+const defaultRootMaxDepth = readGlobalMaxDepth(readOptional(join(getAgentDir(), "settings.json")));
+const defaultRegistration = registrationForLaunchContext(launchContext, defaultRootMaxDepth);
+
 const extension = createPiSubagentsExtension({
   platform: process.platform,
   nodeVersion: process.versions.node,
-  child: process.env[CHILD_MARKER_ENV] === "1",
+  registration: defaultRegistration,
   createController: (context, pi, refreshStatus) => {
     const agentDir = getAgentDir();
+    const currentDepth = launchContext.kind === "descendant" ? launchContext.currentDepth : 0;
+    const inheritedLimits: DelegationLimits | undefined =
+      launchContext.kind === "descendant" ? launchContext.limits : undefined;
     const projectTrusted = context.isProjectTrusted();
     const texts = readSubagentSettingsFiles({
       agentDir,
@@ -191,12 +209,13 @@ const extension = createPiSubagentsExtension({
     const loaded = loadSubagentSettings({
       ...texts,
       projectTrusted,
+      ...(inheritedLimits === undefined ? {} : { inheritedLimits }),
     });
     for (const message of loaded.diagnostics) context.ui.notify(message, "warning");
     const controller = createProductionController(
       context,
       pi,
-      buildProductionControllerOptions(agentDir, loaded.value, refreshStatus),
+      buildProductionControllerOptions(agentDir, loaded.value, currentDepth, refreshStatus),
     );
     // Built once per controller: `tools()` is called on every tool execution and every render.
     let registry: SubagentToolRegistry | undefined;
@@ -210,14 +229,33 @@ export default extension;
 export function buildProductionControllerOptions(
   agentDir: string,
   settings: SubagentSettingsResolved,
+  currentDepth: number,
   onStatusChange: () => void,
 ): Parameters<typeof createProductionController>[2] {
   return {
     capacity: settings.maxConcurrentRuns,
+    currentDepth,
+    maxDepth: settings.maxDepth,
     stateRoot: join(agentDir, "pi-subagents"),
-    ...(settings.cgroupRoot === undefined ? {} : { cgroupRoot: settings.cgroupRoot }),
+    ...(currentDepth === 0 && settings.cgroupRoot !== undefined
+      ? { cgroupRoot: settings.cgroupRoot }
+      : {}),
     onStatusChange,
   };
+}
+
+export function registrationForLaunchContext(
+  context: ReturnType<typeof parseExtensionLaunchContext>,
+  rootMaxDepth: number,
+): ExtensionRegistration {
+  if (context.kind === "invalid") return { enabled: false, diagnostic: context.diagnostic };
+  if (context.kind === "legacy-child") return { enabled: false };
+  if (context.kind === "descendant") {
+    return canDelegateFrom(context.currentDepth, context.limits.maxDepth)
+      ? { enabled: true }
+      : { enabled: false };
+  }
+  return canDelegateFrom(context.currentDepth, rootMaxDepth) ? { enabled: true } : { enabled: false };
 }
 
 function readOptional(path: string): string | undefined {

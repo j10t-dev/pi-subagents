@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import extension, { buildProductionControllerOptions, createPiSubagentsExtension, type ExtensionController } from "../index.ts";
+import extension, { buildProductionControllerOptions, createPiSubagentsExtension, registrationForLaunchContext, type ExtensionController } from "../index.ts";
+import { parseExtensionLaunchContext } from "../src/delegation-policy.ts";
 import { withProductionContainmentPreflight } from "../src/pi-composition.ts";
 import type { ContainmentBackend } from "../src/containment.ts";
 import { absolutePath } from "../src/paths.ts";
@@ -10,7 +11,10 @@ import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type Lifecycle
 
 interface HarnessContext {
   statuses: Array<string | undefined>;
-  ui: { setStatus(key: string, value: string | undefined): void };
+  ui: {
+    setStatus(key: string, value: string | undefined): void;
+    notify(message: string, type: "warning"): void;
+  };
 }
 type Handler = LifecycleHandler<HarnessContext>;
 
@@ -43,7 +47,10 @@ function context(): HarnessContext {
   const statuses: Array<string | undefined> = [];
   return {
     statuses,
-    ui: { setStatus: (_key: string, value: string | undefined) => statuses.push(value) },
+    ui: {
+      setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+      notify: () => {},
+    },
   };
 }
 
@@ -68,7 +75,7 @@ describe("Pi subagents extension", () => {
     createPiSubagentsExtension({
       platform: "linux",
       nodeVersion: "22.19.0",
-      child: false,
+      registration: { enabled: true },
       createController: () => controller(log),
       diagnostic: (message) => log.push(message),
     })(extensionApiForTest(h.api));
@@ -89,7 +96,7 @@ describe("Pi subagents extension", () => {
     const h = harness();
     const log: string[] = [];
     createPiSubagentsExtension({
-      platform: "linux", child: false,
+      platform: "linux", registration: { enabled: true },
       createController: () => controller(log), diagnostic: () => {},
     })(extensionApiForTest(h.api));
     const tool = h.tools[0] as { renderResult(result: { details?: object }): { text: string } };
@@ -122,7 +129,7 @@ describe("Pi subagents extension", () => {
       },
     };
     createPiSubagentsExtension({
-      platform: "linux", nodeVersion: "22.19.0", child: false,
+      platform: "linux", nodeVersion: "22.19.0", registration: { enabled: true },
       createController: () => slow, diagnostic: () => {},
     })(extensionApiForTest(h.api));
     await h.emit("session_start", { type: "session_start", reason: "startup" });
@@ -142,7 +149,7 @@ describe("Pi subagents extension", () => {
     const h = harness();
     createPiSubagentsExtension({
       platform: "linux",
-      child: false,
+      registration: { enabled: true },
       createController: () => controller([]),
       diagnostic: () => {},
     })(extensionApiForTest(h.api));
@@ -160,11 +167,102 @@ describe("Pi subagents extension", () => {
     }
   });
 
+  const invalidContexts = [
+    ["invalid marker", { PI_SUBAGENT_CHILD: "2" }],
+    ["stray numeric values", { PI_SUBAGENT_DEPTH: "1" }],
+    ["partial values", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1" }],
+    ["marked depth zero", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "0", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1" }],
+    ["depth above maximum", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "3", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1" }],
+    ["leading zero", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "01", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1" }],
+    ["negative text", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "-1", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1" }],
+    ["exponent text", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1e0", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1" }],
+    ["unsafe integer", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "9007199254740992" }],
+    ["zero capacity", { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "0" }],
+  ] as const;
+
+  test.each(invalidContexts)("parses %s metadata as invalid", (_label, env) => {
+    expect(parseExtensionLaunchContext(env)).toMatchObject({ kind: "invalid" });
+  });
+
+  test.each(invalidContexts)("routes %s invalid metadata through registration wiring", async (_label, env) => {
+    const parsed = parseExtensionLaunchContext(env);
+    expect(parsed.kind).toBe("invalid");
+    const registration = registrationForLaunchContext(parsed, 1);
+    expect(registration.enabled).toBe(false);
+    if (registration.enabled) throw new Error("invalid metadata must disable registration");
+    expect(typeof registration.diagnostic).toBe("string");
+    const h = harness();
+    const diagnostics: string[] = [];
+    createPiSubagentsExtension({
+      platform: "linux", registration,
+      createController: () => { throw new Error("must not construct"); },
+      diagnostic: (message) => diagnostics.push(message),
+    })(extensionApiForTest(h.api));
+    expect(h.tools).toEqual([]);
+    expect([...h.handlers.keys()]).toEqual(["session_start"]);
+    const notifications: Array<[string, string]> = [];
+    await h.emit("session_start", {}, {
+      statuses: [], ui: { setStatus: () => {}, notify: (message, type) => notifications.push([message, type]) },
+    });
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toBe(registration.diagnostic);
+    expect(notifications).toEqual([[registration.diagnostic!, "warning"]]);
+  });
+
+  test("zero-depth roots, maximum-depth descendants, and legacy children register nothing", () => {
+    const registrations = [
+      registrationForLaunchContext(parseExtensionLaunchContext({}), 0),
+      registrationForLaunchContext(parseExtensionLaunchContext({
+        PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "2", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1",
+      }), 1),
+      registrationForLaunchContext(parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1" }), 1),
+    ];
+    for (const registration of registrations) {
+      const h = harness();
+      createPiSubagentsExtension({ platform: "linux", registration,
+        createController: () => { throw new Error("must not construct"); }, diagnostic: () => {} })(extensionApiForTest(h.api));
+      expect(h.tools).toEqual([]);
+      expect(h.handlers.size).toBe(0);
+    }
+  });
+
+  test("a root at the explicit default and a descendant below its maximum register tools", () => {
+    const registrations = [
+      registrationForLaunchContext(parseExtensionLaunchContext({}), 1),
+      registrationForLaunchContext(parseExtensionLaunchContext({
+        PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1",
+      }), 1),
+    ];
+    for (const registration of registrations) {
+      const h = harness();
+      createPiSubagentsExtension({ platform: "linux", registration,
+        createController: () => controller([]), diagnostic: () => {} })(extensionApiForTest(h.api));
+      expect(h.tools).toHaveLength(4);
+    }
+  });
+
+  test("invalid registration warns once at session start without registering tools", async () => {
+    const h = harness();
+    const diagnostics: string[] = [];
+    createPiSubagentsExtension({
+      platform: "linux", registration: { enabled: false, diagnostic: "pi-subagents disabled: malformed managed delegation environment" },
+      createController: () => { throw new Error("must not construct"); }, diagnostic: (message) => diagnostics.push(message),
+    })(extensionApiForTest(h.api));
+    expect(h.tools).toEqual([]);
+    expect(diagnostics).toEqual(["pi-subagents disabled: malformed managed delegation environment"]);
+    expect([...h.handlers.keys()]).toEqual(["session_start"]);
+    const notifications: Array<[string, string]> = [];
+    await h.emit("session_start", {}, {
+      statuses: [], ui: { setStatus: () => {}, notify: (message, type) => notifications.push([message, type]) },
+    });
+    expect(notifications).toEqual([["pi-subagents disabled: malformed managed delegation environment", "warning"]]);
+  });
+
   test("child suppression registers nothing and cannot disable other extensions", () => {
     const h = harness();
     h.tools.push({ name: "other_extension" });
     createPiSubagentsExtension({
-      platform: "linux", child: true,
+      platform: "linux", registration: { enabled: false },
       createController: () => { throw new Error("must not construct"); }, diagnostic: () => {},
     })(extensionApiForTest(h.api));
     expect(h.tools.map((tool) => tool.name)).toEqual(["other_extension"]);
@@ -175,7 +273,7 @@ describe("Pi subagents extension", () => {
     const h = harness();
     const diagnostics: string[] = [];
     createPiSubagentsExtension({
-      platform: "darwin", nodeVersion: "22.19.0", child: false,
+      platform: "darwin", nodeVersion: "22.19.0", registration: { enabled: true },
       createController: () => { throw new Error("must not construct"); },
       diagnostic: (message) => diagnostics.push(message),
     })(extensionApiForTest(h.api));
@@ -191,7 +289,7 @@ describe("Pi subagents extension", () => {
     const h = harness();
     const diagnostics: string[] = [];
     createPiSubagentsExtension({
-      platform: "darwin", nodeVersion: "22.19.0", child: true,
+      platform: "darwin", nodeVersion: "22.19.0", registration: { enabled: false },
       createController: () => { throw new Error("must not construct"); },
       diagnostic: (message) => diagnostics.push(message),
     })(extensionApiForTest(h.api));
@@ -207,7 +305,7 @@ describe("Pi subagents extension", () => {
     for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
       const h = harness();
       const log: string[] = [];
-      createPiSubagentsExtension({ platform: "linux", child: false,
+      createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
         createController: () => controller(log), diagnostic: () => {} })(extensionApiForTest(h.api));
       const ctx = await h.emit("session_start", { type: "session_start", reason: "startup" });
       expect(log).toEqual(["restore"]);
@@ -221,7 +319,7 @@ describe("Pi subagents extension", () => {
   test("reload shuts down the old instance before the next instance restores", async () => {
     const h = harness();
     const log: string[] = [];
-    createPiSubagentsExtension({ platform: "linux", child: false,
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => controller(log), diagnostic: () => {} })(extensionApiForTest(h.api));
     await h.emit("session_start", { type: "session_start", reason: "startup" });
     await h.emit("session_shutdown", { type: "session_shutdown", reason: "reload" });
@@ -235,7 +333,7 @@ describe("Pi subagents extension", () => {
     const release = deferred<void>();
     const log: string[] = [];
     let shutdownAttempts = 0;
-    createPiSubagentsExtension({ platform: "linux", child: false,
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => ({ ...controller(log), shutdown: async () => {
         shutdownAttempts++;
         log.push(`shutdown-${shutdownAttempts}`);
@@ -259,7 +357,7 @@ describe("Pi subagents extension", () => {
 
   test("Node versions before 22.19 are rejected before registration", () => {
     const h = harness(); const diagnostics: string[] = [];
-    createPiSubagentsExtension({ platform: "linux", nodeVersion: "22.18.0", child: false,
+    createPiSubagentsExtension({ platform: "linux", nodeVersion: "22.18.0", registration: { enabled: true },
       createController: () => { throw new Error("must not construct"); }, diagnostic: (message) => diagnostics.push(message) })(extensionApiForTest(h.api));
     expect(h.tools).toEqual([]);
     expect(diagnostics).toEqual([
@@ -272,7 +370,7 @@ describe("Pi subagents extension", () => {
     const log: string[] = [];
     let refreshStatus = (): void => { throw new Error("status refresh was not wired"); };
     let value = "agents: 1 running, 0 result ready";
-    createPiSubagentsExtension({ platform: "linux", child: false,
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: (_context, _api, refresh) => {
         refreshStatus = refresh;
         return { ...controller(log), status: () => value };
@@ -285,12 +383,13 @@ describe("Pi subagents extension", () => {
     expect(ctx.statuses.at(-1)).toBe("agents: 0 running, 1 result ready");
   });
 
-  test("passes the global cgroup root through factored production controller options", () => {
-    expect(buildProductionControllerOptions("/agent", { maxConcurrentRuns: 2, cgroupRoot: "/sys/fs/cgroup/delegated" }, () => {})).toMatchObject({
-      capacity: 2,
-      stateRoot: "/agent/pi-subagents",
-      cgroupRoot: "/sys/fs/cgroup/delegated",
-    });
+  test("passes configured cgroup roots only to root production controllers", () => {
+    expect(buildProductionControllerOptions(
+      "/agent", { maxConcurrentRuns: 4, maxDepth: 2, cgroupRoot: "/sys/fs/cgroup/delegated" }, 0, () => {},
+    )).toMatchObject({ cgroupRoot: "/sys/fs/cgroup/delegated", currentDepth: 0 });
+    expect(buildProductionControllerOptions(
+      "/agent", { maxConcurrentRuns: 4, maxDepth: 2, cgroupRoot: "/sys/fs/cgroup/delegated" }, 1, () => {},
+    )).not.toHaveProperty("cgroupRoot");
   });
 
   for (const preparation of ["prepareSpawn", "prepareSend"] as const) {

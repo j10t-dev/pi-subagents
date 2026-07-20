@@ -103,7 +103,19 @@ function scripted(model: Model<Api>, context: Context): ReturnType<typeof create
   const stream = createAssistantMessageEventStream();
   const prompt = lastUserText(context.messages);
   const result = lastToolResultText(context.messages);
-  if (result !== undefined) {
+  if (process.env.PI_SUBAGENT_CHILD === "1" && prompt.includes("NESTED_DELEGATION")) {
+    const toolResultCount = context.messages.filter((item) => item.role === "toolResult").length;
+    if (toolResultCount === 0) {
+      emitTool(stream, model.id, "spawn_agent", { task: "REPORT_TOOLS" });
+    } else if (toolResultCount === 1) {
+      emitTool(stream, model.id, "receive_agent", { timeoutMs: 10_000 });
+    } else {
+      emitText(stream, model.id, JSON.stringify({
+        childTools: context.tools?.map((tool) => tool.name).sort() ?? [],
+        grandchildReceive: parseFixtureProtocolRecord(result ?? "{}"),
+      }));
+    }
+  } else if (result !== undefined) {
     if (hangAfterSetsid) {
       const initial = message(model.id, [], "stop");
       stream.push({ type: "start", partial: initial });
@@ -162,6 +174,26 @@ function scripted(model: Model<Api>, context: Context): ReturnType<typeof create
     emitText(stream, model.id, `echo:${prompt}`);
   }
   return stream;
+}
+
+type FixtureProtocolValue = string | number | boolean | null | FixtureProtocolRecord | readonly FixtureProtocolValue[];
+type FixtureProtocolRecord = { readonly [key: string]: FixtureProtocolValue };
+
+function parseFixtureProtocolRecord(text: string): FixtureProtocolRecord {
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return {}; }
+  return isFixtureProtocolRecord(value) ? value : {};
+}
+
+function isFixtureProtocolRecord(value: unknown): value is FixtureProtocolRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+    Object.values(value).every(isFixtureProtocolValue);
+}
+
+function isFixtureProtocolValue(value: unknown): value is FixtureProtocolValue {
+  return value === null || typeof value === "string" || typeof value === "number" ||
+    typeof value === "boolean" || Array.isArray(value) && value.every(isFixtureProtocolValue) ||
+    isFixtureProtocolRecord(value);
 }
 
 function emitText(stream: ReturnType<typeof createAssistantMessageEventStream>, modelId: string, text: string): void {

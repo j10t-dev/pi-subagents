@@ -17,6 +17,13 @@ export interface IntegrationCliRuntime {
   write(message: string): void;
 }
 
+const MANAGED_CHILD_ENV = [
+  "PI_SUBAGENT_CHILD",
+  "PI_SUBAGENT_DEPTH",
+  "PI_SUBAGENT_MAX_DEPTH",
+  "PI_SUBAGENT_MAX_CONCURRENT_RUNS",
+] as const;
+
 const SYSTEM_RUNTIME: IntegrationCliRuntime = {
   resolveOnPath: () => execFileSync("sh", ["-c", "command -v pi"], { encoding: "utf8" }),
   canonicalise: (path) => realpathSync(path),
@@ -32,19 +39,22 @@ export function createParentPiEnvironment(input: ParentPiEnvironmentInput): Node
     HOME: input.home,
     MOCK_PROVIDER_NO_NETWORK: "1",
   };
-  delete environment.PI_SUBAGENT_CHILD;
+  for (const key of MANAGED_CHILD_ENV) delete environment[key];
   if (input.childLaunchDir === undefined) delete environment.MOCK_PROVIDER_CHILD_LAUNCH_DIR;
   else environment.MOCK_PROVIDER_CHILD_LAUNCH_DIR = input.childLaunchDir;
   return environment;
 }
 
-/**
- * Adapts a parent environment for Pi's public RpcClient. Its `Record<string, string>`
- * type cannot express Node's supported undefined tombstone for removing an inherited
- * variable, so this test-only assertion is deliberately confined to this boundary.
- */
+export function clearManagedChildEnvironment(environment: NodeJS.ProcessEnv): void {
+  for (const key of MANAGED_CHILD_ENV) delete environment[key];
+}
+
 export function adaptParentPiEnvironmentForRpcClient(environment: NodeJS.ProcessEnv): Record<string, string> {
-  return { ...environment, PI_SUBAGENT_CHILD: undefined } as unknown as Record<string, string>;
+  const adapted: Record<string, string> = {};
+  for (const [key, value] of Object.entries(environment)) {
+    if (value !== undefined) adapted[key] = value;
+  }
+  return adapted;
 }
 
 export function resolveIntegrationCli(

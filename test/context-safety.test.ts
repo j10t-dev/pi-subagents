@@ -259,7 +259,7 @@ async function providerHarness(controller: SubagentController): Promise<{
     tools: () => createSubagentTools(controller), beforeTree: () => controller.beforeTree(),
     beforeSwitch: () => controller.beforeSwitch(), beforeFork: () => controller.beforeFork(),
   };
-  createPiSubagentsExtension({ platform: "linux", child: false,
+  createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
     createController: () => adapter, diagnostic: () => {} })(extensionApiForTest(api));
   const context = { ui: { setStatus: () => {} } };
   for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, context);

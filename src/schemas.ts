@@ -10,7 +10,7 @@ import {
   THINKING_LEVELS,
 } from "./domain.ts";
 import type { ThinkingLevel, Usage } from "./domain.ts";
-import { MAX_COMPLETION_OUTPUT_BYTES, MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
+import { MAX_COMPLETION_OUTPUT_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_MAX_DEPTH } from "./constants.ts";
 
 type LiteralSchemas<T extends readonly string[]> = {
   -readonly [K in keyof T]: TLiteral<T[K]>;
@@ -317,7 +317,8 @@ export function decodePersistedAgentEvent(value: unknown): PersistedAgentEventDt
 // --- Settings schema -----------------------------------------------------
 
 export const SubagentSettingsSchema = Type.Object({
-  maxConcurrentRuns: Type.Optional(Type.Integer({ minimum: 1 })),
+  maxConcurrentRuns: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+  maxDepth: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_MAX_DEPTH })),
   cgroupRoot: Type.Optional(Type.String()),
 });
 

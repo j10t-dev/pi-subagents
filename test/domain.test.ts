@@ -513,14 +513,21 @@ describe("public TypeBox schemas", () => {
     expect(Value.Check(UsageSchema, { ...valid.usage!.usage, totalTokens: Number.NaN })).toBeFalse();
   });
 
-  test("SubagentSettingsSchema and SettingsDocumentSchema reject non-positive limits", () => {
-    expect(Value.Check(SubagentSettingsSchema, { maxConcurrentRuns: 4 })).toBe(true);
+  test("SubagentSettingsSchema and SettingsDocumentSchema validate safe limits and depth", () => {
+    expect(Value.Check(SubagentSettingsSchema, { maxConcurrentRuns: 4, maxDepth: 0 })).toBe(true);
+    expect(Value.Check(SubagentSettingsSchema, { maxConcurrentRuns: 4, maxDepth: 8 })).toBe(true);
     expect(Value.Check(SubagentSettingsSchema, { maxConcurrentRuns: 0 })).toBe(false);
     expect(Value.Check(SubagentSettingsSchema, { maxConcurrentRuns: 1.5 })).toBe(false);
+    expect(Value.Check(SubagentSettingsSchema, { maxConcurrentRuns: Number.MAX_SAFE_INTEGER + 1 })).toBe(false);
+    for (const maxDepth of [-1, 9, 1.5]) {
+      expect(Value.Check(SubagentSettingsSchema, { maxDepth })).toBe(false);
+      expect(Value.Check(SettingsDocumentSchema, { subagents: { maxDepth } })).toBe(false);
+    }
     expect(Value.Check(SettingsDocumentSchema, {})).toBe(true);
-    expect(Value.Check(SettingsDocumentSchema, { subagents: { maxConcurrentRuns: 4 } })).toBe(
-      true,
-    );
+    expect(Value.Check(SettingsDocumentSchema, { subagents: { maxConcurrentRuns: 4, maxDepth: 8 } })).toBe(true);
+    expect(Value.Check(SettingsDocumentSchema, {
+      subagents: { maxConcurrentRuns: Number.MAX_SAFE_INTEGER + 1 },
+    })).toBe(false);
   });
 
   test("decoded DTOs remain plain strings/numbers until constructors brand them", () => {

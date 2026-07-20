@@ -40,12 +40,17 @@ The default concurrency limit is `4`. Override it in global `~/.pi/agent/setting
 {
   "subagents": {
     "maxConcurrentRuns": 4,
+    "maxDepth": 2,
     "cgroupRoot": "/sys/fs/cgroup/my-delegated-subtree"
   }
 }
 ```
 
-cgroup v2 with writable delegation is mandatory for new launches. `subagents.cgroupRoot` is accepted only in global `settings.json`; it must be pre-provisioned, absolute, and beneath the cgroup-v2 mount. A configured root is never removed. Without it, the extension creates a `pi-subagents` child below the current unified cgroup and removes that root only when it created it, its parent scope was removed, and it is empty. Unsupported environments fail before launcher or Pi child creation with stable `containment_failed`.
+`maxDepth` is global-only. Its default is `1`, `0` is the kill switch, and the hard maximum is `8`. Depth zero is the root, depth one is a child, and depth two is a grandchild. Recursive configurations that could create more than 100 child processes fall back to depth one. Managed descendants inherit the concurrency capacity; they cannot override it locally. With capacity four and depth two, the maximum is 20 concurrent children: four children and 16 grandchildren.
+
+Lifecycle tools are inherited or allowlisted only below the depth boundary. A restored allowlist can lose lifecycle tools when a lower depth policy applies, but it never gains tools omitted by the original allowlist. The `spawn_agent` prompt guideline remains unchanged and applies only while that tool is active.
+
+cgroup v2 with writable delegation is mandatory for new launches. `subagents.cgroupRoot` is accepted only in global `settings.json`; it must be pre-provisioned, absolute, and beneath the cgroup-v2 mount. A configured `cgroupRoot` is used only by the managed root controller; descendants derive roots beneath their current ancestor-owned cgroup. A configured root is never removed. Without it, the extension creates a `pi-subagents` child below the current unified cgroup and removes that root only when it created it, its parent scope was removed, and it is empty. Forced containment kills descendants, but orphaned nested state may require manual cleanup. Unsupported environments fail before launcher or Pi child creation with stable `containment_failed`.
 
 Run `bun run check:cgroup` before deployment to verify the host prerequisite. Version-1 receipts remain restoration compatibility only; new launches publish version-2 cgroup receipts.
 
@@ -95,4 +100,4 @@ Run it separately from the default and integration suites:
 bun run test:live-model
 ```
 
-The script sets `PI_SUBAGENTS_LIVE_SMOKE=1`. It requires the current Pi registry to contain `openai-codex/gpt-5.6-luna`, usable `openai-codex` provider credentials, and an active `web_fetch` tool. A missing opt-in, model, or credential is reported as an explicit pre-start skip, not a product pass. Active `web_fetch` is required by the launched allowlist and verified through the child transcript; its absence fails the smoke. The smoke covers direct parent `spawn_agent`, child `web_fetch`, parent `receive_agent`, successful completion, and absence of a nested Pi CLI call. Broader live-model behavioural evaluation is out of scope.
+The script sets `PI_SUBAGENTS_LIVE_SMOKE=1`. It requires the current Pi registry to contain `openai-codex/gpt-5.6-luna`, usable `openai-codex` provider credentials, and an active `web_fetch` tool. A missing opt-in, model, or credential is reported as an explicit pre-start skip, not a product pass. Active `web_fetch` is required by the launched allowlist and verified through the child transcript; its absence fails the smoke. The explicit child `tools: ["web_fetch"]` allowlist is why this smoke still asserts no nested Pi command; it is not a universal restriction on children. The smoke covers direct parent `spawn_agent`, child `web_fetch`, parent `receive_agent`, and successful completion. `PI_SUBAGENT_CHILD=1` remains compatibility input for legacy children and suppresses lifecycle tools. Malformed metadata fails closed and emits a warning. Environment metadata is forgeable recursion policy, not security containment. Broader live-model behavioural evaluation is out of scope.

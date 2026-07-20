@@ -67,6 +67,7 @@ function selectionInput(
     parentModel,
     parentThinking: overrides.parentThinking ?? "high",
     parentActiveTools: overrides.parentActiveTools ?? ["read", "web_fetch", "spawn_agent"],
+    allowLifecycleTools: overrides.allowLifecycleTools ?? false,
     modelRegistry,
     ...(overrides.requestedModel === undefined ? {} : { requestedModel: overrides.requestedModel }),
     ...(overrides.requestedTools === undefined ? {} : { requestedTools: overrides.requestedTools }),
@@ -122,6 +123,39 @@ describe("resolveChildSelection", () => {
       parentActiveTools,
     })).tools)
       .toEqual(expected);
+  });
+
+  test("retains inherited and explicitly requested lifecycle tools below the boundary", () => {
+    expect(resolveChildSelection(selectionInput({
+      allowLifecycleTools: true,
+      parentActiveTools: ["read", "spawn_agent", "receive_agent"],
+    })).tools).toEqual(["read", "spawn_agent", "receive_agent"]);
+
+    expect(resolveChildSelection(selectionInput({
+      allowLifecycleTools: true,
+      requestedTools: ["spawn_agent"],
+      parentActiveTools: ["read", "spawn_agent"],
+    })).tools).toEqual(["spawn_agent"]);
+  });
+
+  test("rejects inactive lifecycle tools below the boundary", () => {
+    expect(() => resolveChildSelection(selectionInput({
+      allowLifecycleTools: true,
+      requestedTools: ["receive_agent"],
+      parentActiveTools: ["read", "spawn_agent"],
+    }))).toThrow(expect.objectContaining({ code: AgentErrorCode.InvalidInput }));
+  });
+
+  test("strips inherited lifecycle tools and rejects each explicit lifecycle tool at the boundary", () => {
+    expect(resolveChildSelection(selectionInput({
+      parentActiveTools: ["read", ...LIFECYCLE_TOOL_NAMES],
+    })).tools).toEqual(["read"]);
+    for (const tool of LIFECYCLE_TOOL_NAMES) {
+      expect(() => resolveChildSelection(selectionInput({
+        requestedTools: [tool],
+        parentActiveTools: ["read", ...LIFECYCLE_TOOL_NAMES],
+      }))).toThrow(expect.objectContaining({ code: AgentErrorCode.InvalidInput }));
+    }
   });
 
   test.each(["spawn_agent", "send_input", "receive_agent", "stop_agent", "inactive", "unknown"])(

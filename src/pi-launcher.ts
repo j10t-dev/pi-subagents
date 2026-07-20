@@ -2,7 +2,12 @@ import { realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
 
 import type { AbsolutePath, ModelSpec, ThinkingLevel } from "./domain.ts";
-import { CHILD_MARKER_ENV } from "./constants.ts";
+import {
+  CHILD_CAPACITY_ENV,
+  CHILD_DEPTH_ENV,
+  CHILD_MARKER_ENV,
+  CHILD_MAX_DEPTH_ENV,
+} from "./constants.ts";
 import { isContainedPath } from "./paths.ts";
 
 export interface PiInvocation { readonly command: AbsolutePath; readonly argsPrefix: readonly string[] }
@@ -40,6 +45,9 @@ export interface BuildRpcLaunchOptions {
   readonly effectiveTools: readonly string[];
   readonly effectiveModel: ModelSpec;
   readonly effectiveThinking: ThinkingLevel;
+  readonly childDepth: number;
+  readonly maxDepth: number;
+  readonly maxConcurrentRuns: number;
   readonly trustedRoot?: AbsolutePath;
   readonly env?: NodeJS.ProcessEnv;
 }
@@ -57,7 +65,13 @@ export function buildRpcLaunchSpec(options: BuildRpcLaunchOptions): RpcLaunchSpe
   else args.push("--tools", options.effectiveTools.join(","));
   if (options.existingSession !== undefined) args.push("--session", options.existingSession);
   if (isRealContained(options.trustedRoot, options.cwd)) args.push("--approve");
-  const env = Object.freeze({ ...(options.env ?? process.env), [CHILD_MARKER_ENV]: "1" });
+  const env = Object.freeze({
+    ...(options.env ?? process.env),
+    [CHILD_MARKER_ENV]: "1",
+    [CHILD_DEPTH_ENV]: String(options.childDepth),
+    [CHILD_MAX_DEPTH_ENV]: String(options.maxDepth),
+    [CHILD_CAPACITY_ENV]: String(options.maxConcurrentRuns),
+  });
   return Object.freeze({ command: invocation.command, args: Object.freeze(args), cwd: options.cwd, env, shell: false });
 }
 
