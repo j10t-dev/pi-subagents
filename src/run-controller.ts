@@ -231,35 +231,27 @@ export class RunController {
       if (launchRecord.runId !== undefined && launched.status !== "accepted" && launched.status !== "identity_failed") {
         let owner!: TerminalOwner;
         await launchRecord.mutex.runExclusive(() => {
-          owner = this.claimTerminalLocked(launchRecord, AgentState.Settling,
-            { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-          this.finishLaunch(launchRecord);
+          owner = this.settleLaunchFailureLocked(launchRecord);
         });
         this.continueNaturalTerminal(owner);
         return { status: "settling", agentId: launchRecord.agentId, runId: launchRecord.runId };
       }
       if (launched.status === "failed") {
-        delete launchRecord.launching;
-        launchRecord.resolveLaunchDone?.(); delete launchRecord.resolveLaunchDone; delete launchRecord.launchDone; delete launchRecord.stopAfterLaunch;
-        delete launchRecord.reservation;
-        reservation.release();
+        this.finishPreIdentityLaunch(launchRecord, { releaseReservation: true });
         return { status: "failed", agentId: launched.agentId };
       }
       if (launched.status === "containment_failed") {
         launchRecord.state = AgentState.Stopping;
         launchRecord.runtime = launched.runtime;
         launchRecord.preRunContainment = true;
-        delete launchRecord.launching;
-        launchRecord.resolveLaunchDone?.(); delete launchRecord.resolveLaunchDone; delete launchRecord.launchDone; delete launchRecord.stopAfterLaunch;
+        this.finishPreIdentityLaunch(launchRecord, { releaseReservation: false });
         return { status: "containment_failed", agentId: launched.agentId };
       }
       if (launched.status === "identity_failed") {
         let owner!: TerminalOwner;
         await launchRecord.mutex.runExclusive(() => {
           launchRecord.beforeTerminal = launched.beforeTerminal;
-          owner = this.claimTerminalLocked(launchRecord, AgentState.Settling,
-            { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-          this.finishLaunch(launchRecord);
+          owner = this.settleLaunchFailureLocked(launchRecord);
         });
         this.continueNaturalTerminal(owner);
         return { status: "settling", agentId: launched.agentId, runId: launched.runId };
@@ -277,9 +269,7 @@ export class RunController {
       catch {
         let owner!: TerminalOwner;
         await launchRecord.mutex.runExclusive(() => {
-          owner = this.claimTerminalLocked(launchRecord, AgentState.Settling,
-            { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-          this.finishLaunch(launchRecord);
+          owner = this.settleLaunchFailureLocked(launchRecord);
         });
         this.continueNaturalTerminal(owner);
         return { status: "settling", agentId: launched.agentId, runId: launched.runId };
@@ -288,9 +278,7 @@ export class RunController {
       if (registered?.runId !== undefined) {
         let owner!: TerminalOwner;
         await registered.mutex.runExclusive(() => {
-          owner = this.claimTerminalLocked(registered!, AgentState.Settling,
-            { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-          this.finishLaunch(registered!);
+          owner = this.settleLaunchFailureLocked(registered!);
         });
         this.continueNaturalTerminal(owner);
         return { status: "settling", agentId: registered.agentId, runId: registered.runId };
@@ -298,12 +286,8 @@ export class RunController {
       if (registered !== undefined) {
         this.agents.delete(registered.agentId);
         registered.state = AgentState.Stopped;
-        delete registered.launching;
         delete registered.reservation;
-        delete registered.stopAfterLaunch;
-        registered.resolveLaunchDone?.();
-        delete registered.resolveLaunchDone;
-        delete registered.launchDone;
+        this.finishPreIdentityLaunch(registered, { releaseReservation: false });
       }
       reservation.release();
       throw error;
@@ -370,45 +354,34 @@ export class RunController {
       if (record.runId !== undefined) {
         let owner!: TerminalOwner;
         await record.mutex.runExclusive(() => {
-          owner = this.claimTerminalLocked(record, AgentState.Settling,
-            { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-          this.finishLaunch(record);
+          owner = this.settleLaunchFailureLocked(record);
         });
         this.continueNaturalTerminal(owner);
         return { status: "settling", agentId, runId: record.runId };
       }
       await record.mutex.runExclusive(() => {
-        record.reservation?.release(); delete record.reservation; delete record.launching;
-        record.resolveLaunchDone?.(); delete record.resolveLaunchDone; delete record.launchDone; delete record.stopAfterLaunch;
+        this.finishPreIdentityLaunch(record, { releaseReservation: true });
       });
       throw error;
     }
     const result = await record.mutex.runExclusive(() => {
       if (record.runId !== undefined && launched.status !== "accepted" && launched.status !== "identity_failed") {
-        const owner = this.claimTerminalLocked(record, AgentState.Settling,
-          { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-        this.finishLaunch(record);
-        return { status: "identity_failed" as const, owner };
+        return { status: "identity_failed" as const, owner: this.settleLaunchFailureLocked(record) };
       }
       if (launched.status === "failed") {
-        record.reservation?.release(); delete record.reservation; delete record.launching;
-        record.resolveLaunchDone?.(); delete record.resolveLaunchDone; delete record.launchDone; delete record.stopAfterLaunch;
+        this.finishPreIdentityLaunch(record, { releaseReservation: true });
         return { status: "failed" as const, agentId };
       }
       if (launched.status === "containment_failed") {
         record.runtime = launched.runtime;
         record.state = AgentState.Stopping;
         record.preRunContainment = true;
-        delete record.launching;
-        record.resolveLaunchDone?.(); delete record.resolveLaunchDone; delete record.launchDone;
+        this.finishPreIdentityLaunch(record, { releaseReservation: false });
         return { status: "containment_failed" as const, agentId };
       }
       if (launched.status === "identity_failed") {
         record.beforeTerminal = launched.beforeTerminal;
-        const owner = this.claimTerminalLocked(record, AgentState.Settling,
-          { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-        this.finishLaunch(record);
-        return { status: "identity_failed" as const, owner };
+        return { status: "identity_failed" as const, owner: this.settleLaunchFailureLocked(record) };
       }
       // Direct RunController clients may return acceptance atomically; controller launch
       // transactions use `adoptIdentity` earlier at native-ID observation.
@@ -430,9 +403,7 @@ export class RunController {
     catch {
       let owner!: TerminalOwner;
       await record.mutex.runExclusive(() => {
-        owner = this.claimTerminalLocked(record, AgentState.Settling,
-          { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) });
-        this.finishLaunch(record);
+        owner = this.settleLaunchFailureLocked(record);
       });
       this.continueNaturalTerminal(owner);
       return { status: "settling", agentId, runId: record.runId! };
@@ -525,6 +496,27 @@ export class RunController {
     let resolve!: (value: StopResult) => void;
     record.terminal = new Promise<StopResult>((done) => { resolve = done; });
     return { record, settlement, abort, ...(reason === undefined ? {} : { reason }), resolve };
+  }
+
+  private settleLaunchFailureLocked(record: LiveRecord): TerminalOwner {
+    const owner = this.claimTerminalLocked(
+      record,
+      AgentState.Settling,
+      { kind: "failed", cause: terminalFailureCause(AgentErrorCode.SpawnFailed) },
+    );
+    this.finishLaunch(record);
+    return owner;
+  }
+
+  private finishPreIdentityLaunch(
+    record: LiveRecord,
+    options: { releaseReservation: boolean },
+  ): void {
+    if (options.releaseReservation) {
+      record.reservation?.release();
+      delete record.reservation;
+    }
+    this.finishLaunch(record);
   }
 
   private finishLaunch(record: LiveRecord, preserveStopAfterLaunch = false): void {
