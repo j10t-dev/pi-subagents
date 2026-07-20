@@ -88,6 +88,17 @@ export type SpawnStartResult =
   | (Extract<StartResult, { state: typeof AgentState.Running }> & EffectiveChildSelection)
   | Exclude<StartResult, { state: typeof AgentState.Running }>;
 
+export type PublicStopOutcome =
+  | { agentId: AgentId; runId: RunId; state: "cancelled" }
+  | { agentId: AgentId; state: "already_stopped" }
+  | {
+      agentId: AgentId;
+      runId?: RunId;
+      state: "failed";
+      agentState: typeof AgentState.Settling | typeof AgentState.Stopping;
+      error: AgentError;
+    };
+
 /** Production assembly supplies facilities; transaction ordering remains controller-owned. */
 export interface PiControllerComposition {
   /** Pure/validation-only preflight. */
@@ -322,7 +333,7 @@ export class SubagentController {
 
   receive(options?: ReceiveOptions): Promise<ReceiveAgentResult> { return this.completions.receive(options); }
 
-  async stop(agentIdValue: AgentId, reason: CancellationReason = CancellationReason.StopRequested): Promise<object> {
+  async stop(agentIdValue: AgentId, reason: CancellationReason = CancellationReason.StopRequested): Promise<PublicStopOutcome> {
     const result = await this.runs.stop(agentIdValue, reason);
     this.syncInventory();
     return stopOutcome(result);
@@ -879,7 +890,7 @@ function unavailableRuntime(): RunRuntime {
   };
 }
 
-function stopOutcome(result: StopResult): object {
+function stopOutcome(result: StopResult): PublicStopOutcome {
   if (result.status === "containment_failed") return { agentId: result.agentId, ...(result.runId ? { runId: result.runId } : {}), state: "failed", agentState: result.agentState, error: toAgentError(result.code) };
   if (result.status === "already_stopped") return { agentId: result.agentId, state: "already_stopped" };
   return { agentId: result.agentId, runId: result.runId, state: "cancelled" };

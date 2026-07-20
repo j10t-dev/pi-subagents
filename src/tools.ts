@@ -5,23 +5,24 @@ import {
   AgentErrorCode,
   AgentState,
   CodedError,
-  CancellationReason,
   CompletionState,
-  THINKING_LEVELS,
   agentId,
   milliseconds,
-  runId,
   toAgentError,
   codedErrorToAgentError,
   truncateUtf8,
   isPublicPreflightError,
+  type AgentCompletion,
   type AgentError,
   type AgentId,
+  type AgentUsage,
   type DiagnosticsPath,
+  type RunId,
 } from "./domain.ts";
 import { AbortError } from "./async-primitives.ts";
 import { MAX_AGGREGATE_RECEIVE_BYTES, MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
-import type { SpawnStartResult, StartResult, SubagentController } from "./controller.ts";
+import type { PublicStopOutcome, SpawnStartResult, StartResult, SubagentController } from "./controller.ts";
+import type { AgentSummary, ReceiveAgentResult } from "./completion-service.ts";
 
 export const spawnAgentSchema = Type.Object({
   task: Type.String({ description: "Literal first assignment for the fresh child session." }),
@@ -85,6 +86,14 @@ export type SubagentToolRegistry = {
 /** The controller surface required by public subagent tools. */
 export type SubagentToolController = Pick<SubagentController, "spawn" | "sendInput" | "receive" | "stop">;
 
+type ToolStopOutcome = PublicStopOutcome | {
+  agentId: string;
+  runId?: RunId;
+  state: "failed";
+  agentState?: typeof AgentState.Settling | typeof AgentState.Stopping;
+  error: AgentError;
+};
+
 export function createSubagentTools(controller: SubagentToolController): SubagentToolRegistry {
   return {
     spawn_agent: tool("spawn_agent", "Start an isolated child agent assignment.", spawnAgentSchema,
@@ -100,7 +109,7 @@ export function createSubagentTools(controller: SubagentToolController): Subagen
       }), projectReceive, renderReceive, boundReceiveContent),
     stop_agent: tool("stop_agent", "Stop one or more owned child agents.", stopAgentSchema,
       async (input) => {
-        const outcomes = await Promise.all(input.agentIds.map(async (raw) => {
+        const outcomes: ToolStopOutcome[] = await Promise.all(input.agentIds.map(async (raw) => {
           let id: AgentId;
           try { id = agentId(raw); }
           catch { return failed(displayAgentId(raw), toAgentError(AgentErrorCode.InvalidAgent)); }
@@ -192,39 +201,35 @@ function copyPublicInput(value: unknown, seen = new WeakSet<object>()): unknown 
 }
 
 function projectStart(value: StartResult): object {
-  const source = requiredRecord(value);
-  const state = requiredLiteral(source, "state", Object.values(AgentState));
-  if (state === AgentState.Running) {
-    return { agentId: requiredAgentId(source, "agentId"), runId: requiredRunId(source, "runId"), state };
+  if (value.state === AgentState.Running) {
+    return { agentId: value.agentId, runId: value.runId, state: value.state };
   }
-  if (state === AgentState.Settling) {
-    return { agentId: requiredAgentId(source, "agentId"), runId: requiredRunId(source, "runId"), state, error: projectError(source.error) };
+  if (value.state === AgentState.Settling) {
+    return { agentId: value.agentId, runId: value.runId, state: value.state, error: projectError(value.error) };
   }
-  if (state !== AgentState.Stopped && state !== AgentState.Stopping) throw invalidPublicResult();
-  return { agentId: requiredAgentId(source, "agentId"), state, error: projectError(source.error) };
+  return { agentId: value.agentId, state: value.state, error: projectError(value.error) };
 }
 
 function projectSpawnStart(value: SpawnStartResult): object {
-  const source = requiredRecord(value);
-  const state = requiredLiteral(source, "state", Object.values(AgentState));
-  if (state !== AgentState.Running) return projectStart(value);
+  if (value.state !== AgentState.Running) return projectStart(value);
   return {
-    agentId: requiredAgentId(source, "agentId"),
-    runId: requiredRunId(source, "runId"),
-    state,
-    model: requiredCanonicalModelReference(source, "model"),
-    thinkingLevel: requiredLiteral(source, "thinkingLevel", THINKING_LEVELS),
-    tools: requiredToolArray(source, "tools"),
-    ...(source.warning === undefined ? {} : { warning: requiredBoundedString(source, "warning", MAX_ERROR_MESSAGE_BYTES) }),
+    agentId: value.agentId,
+    runId: value.runId,
+    state: value.state,
+    model: requiredCanonicalModelReference({ model: value.model }, "model"),
+    thinkingLevel: value.thinkingLevel,
+    tools: requiredToolArray({ tools: value.tools }, "tools"),
+    ...(value.warning === undefined
+      ? {}
+      : { warning: requiredBoundedString({ warning: value.warning }, "warning", MAX_ERROR_MESSAGE_BYTES) }),
   };
 }
 
-function projectReceive(value: object): object {
-  const source = requiredRecord(value);
+function projectReceive(value: ReceiveAgentResult): object {
   return {
-    completions: requiredArray(source, "completions").map(projectCompletion),
-    agents: requiredArray(source, "agents").map(projectAgentSummary),
-    timedOut: requiredBoolean(source, "timedOut"),
+    completions: value.completions.map(projectCompletion),
+    agents: value.agents.map(projectAgentSummary),
+    timedOut: value.timedOut,
   };
 }
 
@@ -300,53 +305,45 @@ function jsonBytes(value: object): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
-function projectStop(value: object): object {
-  const source = requiredRecord(value);
-  return { outcomes: requiredArray(source, "outcomes").map((item) => {
-    const outcome = requiredRecord(item);
-    const state = requiredLiteral(outcome, "state", ["cancelled", "already_stopped", "failed"] as const);
-    if (state === "cancelled") {
-      return { agentId: requiredAgentId(outcome, "agentId"), runId: requiredRunId(outcome, "runId"), state };
+function projectStop(value: { outcomes: ToolStopOutcome[] }): object {
+  return { outcomes: value.outcomes.map((outcome) => {
+    if (outcome.state === "cancelled") {
+      return { agentId: outcome.agentId, runId: outcome.runId, state: outcome.state };
     }
-    if (state === "already_stopped") return { agentId: requiredAgentId(outcome, "agentId"), state };
-    if (state !== "failed") throw invalidPublicResult();
+    if (outcome.state === "already_stopped") return { agentId: outcome.agentId, state: outcome.state };
     return {
-      agentId: requiredBoundedString(outcome, "agentId", 256),
-      ...optionalRunIdField(outcome, "runId"),
-      state,
-      ...optionalLiteralField(outcome, "agentState", [AgentState.Settling, AgentState.Stopping] as const),
+      agentId: outcome.agentId,
+      ...(outcome.runId === undefined ? {} : { runId: outcome.runId }),
+      state: outcome.state,
+      ...(outcome.agentState === undefined ? {} : { agentState: outcome.agentState }),
       error: projectError(outcome.error),
     };
   }) };
 }
 
-function projectCompletion(value: unknown): object {
-  const completion = requiredRecord(value);
-  const state = requiredLiteral(completion, "state", Object.values(CompletionState));
+function projectCompletion(completion: AgentCompletion): object {
   const base = {
-    agentId: requiredAgentId(completion, "agentId"),
-    runId: requiredRunId(completion, "runId"),
-    state,
+    agentId: completion.agentId,
+    runId: completion.runId,
+    state: completion.state,
     output: projectOutput(completion.output),
-    outputPath: requiredPath(completion, "outputPath"),
-    transcriptPath: requiredPath(completion, "transcriptPath"),
-    ...optionalProjectedField(completion, "usage", projectAgentUsage),
+    outputPath: requiredPath({ outputPath: completion.outputPath }, "outputPath"),
+    transcriptPath: requiredPath({ transcriptPath: completion.transcriptPath }, "transcriptPath"),
+    ...(completion.usage === undefined ? {} : { usage: projectAgentUsage(completion.usage) }),
   };
-  if (state === CompletionState.Failed) return { ...base, error: projectError(completion.error) };
-  if (state === CompletionState.Cancelled) return { ...base, reason: requiredLiteral(completion, "reason", Object.values(CancellationReason)) };
-  if (state !== CompletionState.Completed) throw invalidPublicResult();
+  if (completion.state === CompletionState.Failed) return { ...base, error: projectError(completion.error) };
+  if (completion.state === CompletionState.Cancelled) return { ...base, reason: completion.reason };
   return base;
 }
 
-function projectAgentSummary(value: unknown): object {
-  const summary = requiredRecord(value);
+function projectAgentSummary(summary: AgentSummary): object {
   return {
-    agentId: requiredAgentId(summary, "agentId"),
-    state: requiredLiteral(summary, "state", Object.values(AgentState)),
-    transcriptPath: requiredPath(summary, "transcriptPath"),
-    ...optionalRunIdField(summary, "currentRunId"),
-    ...optionalLiteralField(summary, "latestCompletionState", Object.values(CompletionState)),
-    ...optionalPathField(summary, "latestOutputPath"),
+    agentId: summary.agentId,
+    state: summary.state,
+    transcriptPath: requiredPath({ transcriptPath: summary.transcriptPath }, "transcriptPath"),
+    ...(summary.currentRunId === undefined ? {} : { currentRunId: summary.currentRunId }),
+    ...(summary.latestCompletionState === undefined ? {} : { latestCompletionState: summary.latestCompletionState }),
+    ...(summary.latestOutputPath === undefined ? {} : { latestOutputPath: requiredPath({ latestOutputPath: summary.latestOutputPath }, "latestOutputPath") }),
   };
 }
 
@@ -361,16 +358,31 @@ function projectOutput(value: unknown): object {
   return { text, originalBytes, retainedBytes, truncated };
 }
 
-function projectAgentUsage(value: unknown): object {
-  const agentUsage = requiredRecord(value);
-  const usage = requiredRecord(agentUsage.usage);
-  const cost = requiredRecord(usage.cost);
+function projectAgentUsage(agentUsage: AgentUsage): object {
+  const agentUsageRecord = { turns: agentUsage.turns };
+  const usage = {
+    input: agentUsage.usage.input,
+    output: agentUsage.usage.output,
+    cacheRead: agentUsage.usage.cacheRead,
+    cacheWrite: agentUsage.usage.cacheWrite,
+    cacheWrite1h: agentUsage.usage.cacheWrite1h,
+    reasoning: agentUsage.usage.reasoning,
+    totalTokens: agentUsage.usage.totalTokens,
+  };
+  const cost = {
+    input: agentUsage.usage.cost.input,
+    output: agentUsage.usage.cost.output,
+    cacheRead: agentUsage.usage.cost.cacheRead,
+    cacheWrite: agentUsage.usage.cost.cacheWrite,
+    total: agentUsage.usage.cost.total,
+  };
   return {
-    turns: requiredNonnegativeInteger(agentUsage, "turns"),
+    turns: requiredNonnegativeInteger(agentUsageRecord, "turns"),
     usage: {
       input: requiredNonnegativeNumber(usage, "input"), output: requiredNonnegativeNumber(usage, "output"),
       cacheRead: requiredNonnegativeNumber(usage, "cacheRead"), cacheWrite: requiredNonnegativeNumber(usage, "cacheWrite"),
-      ...optionalNumberField(usage, "cacheWrite1h"), ...optionalNumberField(usage, "reasoning"),
+      ...optionalNumberField(usage, "cacheWrite1h"),
+      ...optionalNumberField(usage, "reasoning"),
       totalTokens: requiredNonnegativeNumber(usage, "totalTokens"),
       cost: {
         input: requiredNonnegativeNumber(cost, "input"), output: requiredNonnegativeNumber(cost, "output"),
@@ -381,11 +393,11 @@ function projectAgentUsage(value: unknown): object {
   };
 }
 
-function projectError(value: unknown): object {
-  const error = requiredRecord(value);
-  const code = requiredLiteral(error, "code", Object.values(AgentErrorCode));
-  const diagnostics = optionalPathField(error, "diagnosticsPath").diagnosticsPath;
-  return toAgentError(code, diagnostics as DiagnosticsPath | undefined);
+function projectError(error: AgentError): object {
+  const diagnosticsPath = error.diagnosticsPath === undefined
+    ? undefined
+    : requiredPath({ diagnosticsPath: error.diagnosticsPath }, "diagnosticsPath") as DiagnosticsPath;
+  return toAgentError(error.code, diagnosticsPath);
 }
 
 function requiredRecord(value: unknown): Record<string, unknown> {
@@ -441,27 +453,9 @@ function requiredBoolean(value: Record<string, unknown>, key: string): boolean {
   return item;
 }
 
-function requiredLiteral<const T extends readonly string[]>(value: Record<string, unknown>, key: string, allowed: T): T[number] {
-  const item = requiredString(value, key);
-  if (!allowed.includes(item)) throw invalidPublicResult();
-  return item;
-}
-
-function requiredAgentId(value: Record<string, unknown>, key: string): string {
-  const item = requiredString(value, key);
-  try { agentId(item); } catch { throw invalidPublicResult(); }
-  return item;
-}
-
 function requiredBoundedString(value: Record<string, unknown>, key: string, maxBytes: number): string {
   const item = requiredString(value, key);
   if (item.length === 0 || new TextEncoder().encode(item).byteLength > maxBytes) throw invalidPublicResult();
-  return item;
-}
-
-function requiredRunId(value: Record<string, unknown>, key: string): string {
-  const item = requiredString(value, key);
-  try { runId(item); } catch { throw invalidPublicResult(); }
   return item;
 }
 
@@ -473,28 +467,9 @@ function requiredPath(value: Record<string, unknown>, key: string): string {
   return item;
 }
 
-function optionalRunIdField(value: Record<string, unknown>, key: string): Record<string, string> {
-  if (value[key] === undefined) return {};
-  return { [key]: requiredRunId(value, key) };
-}
-
-function optionalPathField(value: Record<string, unknown>, key: string): Record<string, string> {
-  if (value[key] === undefined) return {};
-  return { [key]: requiredPath(value, key) };
-}
-
-function optionalLiteralField<const T extends readonly string[]>(value: Record<string, unknown>, key: string, allowed: T): Record<string, T[number]> {
-  if (value[key] === undefined) return {};
-  return { [key]: requiredLiteral(value, key, allowed) };
-}
-
 function optionalNumberField(value: Record<string, unknown>, key: string): Record<string, number> {
   if (value[key] === undefined) return {};
   return { [key]: requiredNonnegativeNumber(value, key) };
-}
-
-function optionalProjectedField(value: Record<string, unknown>, key: string, project: (item: unknown) => object): object {
-  return value[key] === undefined ? {} : { [key]: project(value[key]) };
 }
 
 function invalidPublicResult(): Error {
@@ -505,7 +480,7 @@ function bounded<TResult extends object>(details: TResult, contentDetails: objec
   return { content: JSON.stringify(contentDetails), details };
 }
 
-function failed(agentId: string, error: AgentError) {
+function failed(agentId: string, error: AgentError): ToolStopOutcome {
   return { agentId, state: "failed" as const, error };
 }
 
@@ -516,19 +491,12 @@ function displayAgentId(raw: string): string {
 
 function stableError(error: unknown): AgentError {
   if (error instanceof CodedError) return codedErrorToAgentError(error);
-  const code = stableErrorCode(error);
-  return toAgentError(Object.values(AgentErrorCode).includes(code as AgentErrorCode) ? code! : AgentErrorCode.InvalidState);
+  return toAgentError(stableErrorCode(error) ?? AgentErrorCode.InvalidState);
 }
 
 async function executeStart<TResult extends object>(operation: () => Promise<TResult>, fallbackCode: AgentErrorCode): Promise<TResult> {
   try { return await operation(); }
-  catch (error) {
-    const stable = stableError(error);
-    const projected = stable.code === AgentErrorCode.InvalidState && !hasStableCode(error)
-      ? toAgentError(fallbackCode)
-      : stable;
-    throw new CodedError(projected.code, projected.diagnosticsPath);
-  }
+  catch (error) { throw stableOperationError(error, fallbackCode); }
 }
 
 async function executeSpawn(operation: () => Promise<SpawnStartResult>): Promise<SpawnStartResult> {

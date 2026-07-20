@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { Value } from "typebox/value";
-import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8 } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8, type AgentCompletion } from "../src/domain.ts";
 import { diagnosticsPath } from "../src/paths.ts";
-import { CompletionService } from "../src/completion-service.ts";
-import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition } from "../src/controller.ts";
+import { CompletionService, type AgentSummary, type ReceiveAgentResult } from "../src/completion-service.ts";
+import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PublicStopOutcome } from "../src/controller.ts";
 import { deferred } from "./support/async.ts";
 import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
 import { launchSession, runningTransport as sharedRunningTransport, testRuntime } from "./support/launches.ts";
@@ -43,6 +43,10 @@ type ToolControllerFake = Partial<Record<keyof SubagentToolController, (...args:
 function fakeToolController(value: ToolControllerFake): SubagentToolController {
   // malformed trust-boundary fixture: fake tool methods may return deliberately invalid DTOs.
   return value as unknown as SubagentToolController;
+}
+
+function withFixtureExtras<T extends object, TExtras extends object>(value: T, extras: TExtras): T & TExtras {
+  return { ...value, ...extras };
 }
 
 const TEST_SELECTION = Object.freeze({
@@ -110,8 +114,40 @@ describe("exact tool contracts", () => {
     expect(messages).toEqual(["literal"]);
   });
 
-  test("every execute result is a fresh recursively exact public DTO", async () => {
+  test("projects exact public fields from typed secret-bearing DTOs", async () => {
     const secret = "boundary-secret";
+    const typedReceive = withFixtureExtras({
+      completions: [
+        withFixtureExtras({
+          agentId: agentId("agent-a"), runId: runId("deadbeef"), state: CompletionState.Completed,
+          output: withFixtureExtras(truncateUtf8("answer", 50_000), { raw: secret }),
+          outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/out"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"),
+          usage: withFixtureExtras({
+            turns: 1,
+            usage: withFixtureExtras({
+              input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14,
+              cost: withFixtureExtras({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 }, { secret }),
+            }, { secret }),
+          }, { secret }),
+        } satisfies AgentCompletion, { message: secret }),
+        withFixtureExtras({
+          agentId: agentId("agent-b"), runId: runId("cafebabe"), state: CompletionState.Failed,
+          output: truncateUtf8("bad", 50_000),
+          outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/b"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/b-session"),
+          error: withFixtureExtras({ code: AgentErrorCode.ProtocolError, message: "child process protocol error", diagnosticsPath: diagnosticsPath("/tmp", "diag") }, { raw: secret }),
+        } satisfies AgentCompletion, { exception: secret }),
+        withFixtureExtras({
+          agentId: agentId("agent-c"), runId: runId("feedface"), state: CompletionState.Cancelled,
+          output: truncateUtf8("", 50_000),
+          outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/c"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/c-session"), reason: "stop_requested",
+        } satisfies AgentCompletion, { process: secret }),
+      ],
+      agents: [
+        withFixtureExtras({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"), currentRunId: runId("deadbeef"), latestCompletionState: CompletionState.Completed, latestOutputPath: testCommittedOutputPath("/tmp/pi-subagents-test/out") } satisfies AgentSummary, { client: { secret } }),
+        withFixtureExtras({ agentId: agentId("agent-b"), state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/b-session") } satisfies AgentSummary, { raw: secret }),
+      ],
+      timedOut: false,
+    } satisfies ReceiveAgentResult, { message: secret });
     const controller = fakeToolController({
       spawn: async () => ({
         agentId: "agent-a", runId: "deadbeef", state: "running",
@@ -119,19 +155,7 @@ describe("exact tool contracts", () => {
         process: { secret }, rawModel: secret, inherited: { secret },
       }),
       sendInput: async () => ({ agentId: "agent-a", state: "stopped", error: { code: "spawn_failed", message: "failed to spawn child agent", diagnosticsPath: "/tmp/d", exception: secret }, client: secret }),
-      receive: async () => ({
-        completions: [
-          { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "answer", originalBytes: 6, retainedBytes: 6, truncated: false, raw: secret }, outputPath: "/tmp/out", transcriptPath: "/tmp/session", usage: { turns: 1, usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10, secret }, secret }, secret }, message: secret },
-          { agentId: "agent-b", runId: "cafebabe", state: "failed", output: { text: "bad", originalBytes: 3, retainedBytes: 3, truncated: false }, outputPath: "/tmp/b", transcriptPath: "/tmp/b-session", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "/tmp/diag", raw: secret }, exception: secret },
-          { agentId: "agent-c", runId: "feedface", state: "cancelled", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/c", transcriptPath: "/tmp/c-session", reason: "stop_requested", process: secret },
-        ],
-        agents: [
-          { agentId: "agent-a", state: "running", transcriptPath: "/tmp/session", currentRunId: "deadbeef", latestCompletionState: "completed", latestOutputPath: "/tmp/out", client: { secret } },
-          { agentId: "agent-b", state: "stopped", transcriptPath: "/tmp/b-session", raw: secret },
-        ],
-        timedOut: false,
-        message: secret,
-      }),
+      receive: async () => typedReceive,
       stop: async (id: string) => id === "agent-a"
         ? { agentId: id, runId: "deadbeef", state: "cancelled", process: secret }
         : { agentId: id, runId: "cafebabe", state: "failed", agentState: "stopping", error: { code: "containment_failed", message: "could not confirm child process termination", diagnosticsPath: "/tmp/stop-diag", raw: secret }, exception: secret },
@@ -156,12 +180,12 @@ describe("exact tool contracts", () => {
     });
     expect(results[1]!.details).toEqual({ agentId: "agent-a", state: "stopped", error: { code: "spawn_failed", message: "failed to spawn child agent", diagnosticsPath: "/tmp/d" } });
     expect(results[2]!.details).toEqual({ completions: [
-      { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "answer", originalBytes: 6, retainedBytes: 6, truncated: false }, outputPath: "/tmp/out", transcriptPath: "/tmp/session", usage: { turns: 1, usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } } } },
-      { agentId: "agent-b", runId: "cafebabe", state: "failed", output: { text: "bad", originalBytes: 3, retainedBytes: 3, truncated: false }, outputPath: "/tmp/b", transcriptPath: "/tmp/b-session", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "/tmp/diag" } },
-      { agentId: "agent-c", runId: "feedface", state: "cancelled", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/c", transcriptPath: "/tmp/c-session", reason: "stop_requested" },
+      { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "answer", originalBytes: 6, retainedBytes: 6, truncated: false }, outputPath: "/tmp/pi-subagents-test/out", transcriptPath: "/tmp/pi-subagents-test/session", usage: { turns: 1, usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } } } },
+      { agentId: "agent-b", runId: "cafebabe", state: "failed", output: { text: "bad", originalBytes: 3, retainedBytes: 3, truncated: false }, outputPath: "/tmp/pi-subagents-test/b", transcriptPath: "/tmp/pi-subagents-test/b-session", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "/tmp/diag" } },
+      { agentId: "agent-c", runId: "feedface", state: "cancelled", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/pi-subagents-test/c", transcriptPath: "/tmp/pi-subagents-test/c-session", reason: "stop_requested" },
     ], agents: [
-      { agentId: "agent-a", state: "running", transcriptPath: "/tmp/session", currentRunId: "deadbeef", latestCompletionState: "completed", latestOutputPath: "/tmp/out" },
-      { agentId: "agent-b", state: "stopped", transcriptPath: "/tmp/b-session" },
+      { agentId: "agent-a", state: "running", transcriptPath: "/tmp/pi-subagents-test/session", currentRunId: "deadbeef", latestCompletionState: "completed", latestOutputPath: "/tmp/pi-subagents-test/out" },
+      { agentId: "agent-b", state: "stopped", transcriptPath: "/tmp/pi-subagents-test/b-session" },
     ], timedOut: false });
     expect(results[3]!.details).toEqual({ outcomes: [
       { agentId: "agent-a", runId: "deadbeef", state: "cancelled" },
@@ -304,32 +328,16 @@ describe("exact tool contracts", () => {
   });
 
   test.each([
-    ["unknown error code", { agentId: "agent-a", state: "stopped", error: { code: "invented_code", message: "secret" } }],
-    ["invalid agent state", { completions: [], agents: [{ agentId: "agent-a", state: "possessed", transcriptPath: "/tmp/a" }], timedOut: false }],
-    ["invalid completion state", { completions: [{ agentId: "agent-a", runId: "deadbeef", state: "secret-state", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }], agents: [], timedOut: false }],
-    ["invalid cancellation reason", { completions: [{ agentId: "agent-a", runId: "deadbeef", state: "cancelled", reason: "secret-reason", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }], agents: [], timedOut: false }],
-    ["invalid nested usage", { completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", usage: { turns: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: Number.NaN, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }], agents: [], timedOut: false }],
-    ["invalid output byte metadata", { completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "x", originalBytes: 1, retainedBytes: 999, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }], agents: [], timedOut: false }],
-    ["invalid path", { completions: [], agents: [{ agentId: "agent-a", state: "stopped", transcriptPath: "relative/secret" }], timedOut: false }],
-    ["invalid run id", { completions: [{ agentId: "agent-a", runId: "secret-run", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }], agents: [], timedOut: false }],
-    ["invalid stop agent state", { outcomes: [{ agentId: "agent-a", runId: "deadbeef", state: "failed", agentState: "running", error: { code: "containment_failed", message: "secret" } }] }],
-  ] as const)("maps %s in an internal DTO to a bounded internal error", async (_name, malformed) => {
-    const isStop = "outcomes" in malformed;
-    const isStart = "error" in malformed;
-    const controller = isStop ? { stop: async () => malformed.outcomes[0] } : isStart
-      ? { sendInput: async () => malformed }
-      : { receive: async () => malformed };
-    const tools = createSubagentTools(fakeToolController(controller));
-    if (isStop) {
-      await expect(tools.stop_agent.execute({ agentIds: ["agent-a"] }))
-        .rejects.toThrow("internal_error: internal agent result is invalid");
-    } else if (isStart) {
-      await expect(tools.send_input.execute({ agentId: "agent-a", message: "next" }))
-        .rejects.toThrow("internal_error: internal agent result is invalid");
-    } else {
-      await expect(tools.receive_agent.execute({}))
-        .rejects.toThrow("internal_error: internal agent result is invalid");
-    }
+    ["invalid nested usage", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", usage: { turns: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: Number.NaN, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }], agents: [], timedOut: false }) })).receive_agent.execute({})],
+    ["invalid cacheWrite1h usage", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", usage: { turns: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: Number.NaN, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }], agents: [], timedOut: false }) })).receive_agent.execute({})],
+    ["invalid output byte metadata", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "x", originalBytes: 1, retainedBytes: 999, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }], agents: [], timedOut: false }) })).receive_agent.execute({})],
+    ["invalid path", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [], agents: [{ agentId: "agent-a", state: "stopped", transcriptPath: "relative/secret" }], timedOut: false }) })).receive_agent.execute({})],
+    ["invalid canonical model reference", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "unqualified-model", thinkingLevel: "high", tools: [] }) })).spawn_agent.execute({ task: "work" })],
+    ["overlong warning", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider/luna", thinkingLevel: "high", tools: [], warning: "x".repeat(100_000) }) })).spawn_agent.execute({ task: "work" })],
+    ["overlong tool value", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider/luna", thinkingLevel: "high", tools: ["x".repeat(1_000)] }) })).spawn_agent.execute({ task: "work" })],
+    ["invalid diagnostics path", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "failed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "relative/secret" } }], agents: [], timedOut: false }) })).receive_agent.execute({})],
+  ] as const)("maps invalid child-derived %s internal DTO to a bounded error", async (_name, execute) => {
+    await expect(execute()).rejects.toThrow("internal_error: internal agent result is invalid");
   });
 
   for (const operation of ["spawn", "send"] as const) {
@@ -640,6 +648,37 @@ describe("exact tool contracts", () => {
     expect(details.completions[1]!.output.truncated).toBeTrue();
     expect(result.content).toContain("a".repeat(1_000));
     expect(receive.renderResult!(result)).not.toContain("a".repeat(100));
+  });
+
+  test("stop projects each successful public outcome without injected fields", async () => {
+    const cancelled = { agentId: agentId("agent-a"), runId: runId("deadbeef"), state: "cancelled" } satisfies PublicStopOutcome;
+    const alreadyStopped = { agentId: agentId("agent-b"), state: "already_stopped" } satisfies PublicStopOutcome;
+    const failed = {
+      agentId: agentId("agent-c"),
+      state: "failed",
+      agentState: AgentState.Stopping,
+      error: { code: AgentErrorCode.ContainmentFailed, message: "could not confirm child process termination" },
+    } satisfies PublicStopOutcome;
+    const controller = fakeToolController({
+      stop: async (id: string) => {
+        if (id === "agent-a") return { ...cancelled, injected: "secret" };
+        if (id === "agent-b") return { ...alreadyStopped, injected: "secret" };
+        return { ...failed, injected: "secret" };
+      },
+    });
+
+    const result = await createSubagentTools(controller).stop_agent.execute({ agentIds: ["agent-a", "agent-b", "agent-c"] });
+
+    expect(result.details).toEqual({ outcomes: [
+      { agentId: "agent-a", runId: "deadbeef", state: "cancelled" },
+      { agentId: "agent-b", state: "already_stopped" },
+      {
+        agentId: "agent-c",
+        state: "failed",
+        agentState: "stopping",
+        error: { code: "containment_failed", message: "could not confirm child process termination" },
+      },
+    ] });
   });
 
   test("stop is set-valued, preserves duplicates, and isolates invalid members", async () => {
