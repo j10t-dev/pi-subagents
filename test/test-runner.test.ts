@@ -113,6 +113,19 @@ describe("groupTestFiles", () => {
       "unassigned test file: test/mystery.test.ts",
     );
   });
+
+  test("assigns split settings suites to unit exactly once", () => {
+    const unit = groupTestFiles([
+      "test/async-primitives.test.ts",
+      "test/paths.test.ts",
+      "test/settings.test.ts",
+    ]).find((group) => group.name === "unit");
+    expect(unit?.files).toEqual([
+      "test/async-primitives.test.ts",
+      "test/paths.test.ts",
+      "test/settings.test.ts",
+    ]);
+  });
 });
 
 describe("resolveTestGroupOwner", () => {
