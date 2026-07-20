@@ -793,7 +793,7 @@ export class SubagentController {
       return {
         status: "accepted", agentId: session.agentId, transcriptPath: session.transcriptPath, runId: matchedRunId,
         runtime,
-        onAccepted: () => { void settled.then((result) => this.runs.settle(session.agentId, nativeRunId!, classifyTerminal(result.reason === "agent_settled"
+        onAccepted: () => { void settled.then((result) => this.runs.settle(session.agentId, matchedRunId, classifyTerminal(result.reason === "agent_settled"
           ? { kind: "settled", stopReason: result.stopReason, ...(result.toolSequenceCompleted === undefined ? {} : { toolSequenceCompleted: result.toolSequenceCompleted }), ...(result.failureCause === undefined ? {} : { failureCause: result.failureCause }) }
           : { kind: "process_exited", failureCause: result.failureCause }))).catch(() => undefined); },
       };
@@ -908,13 +908,11 @@ function asActiveRestored(
   state: typeof AgentState.Settling | typeof AgentState.Stopping,
 ): RestoredAgentRecord {
   const { latestCompletion: _completion, ...rest } = record;
-  void _completion;
   return { ...rest, state, currentRunId: runId };
 }
 
 function asStopped(record: RestoredAgentRecord, latestCompletion?: AgentCompletion): RestoredAgentRecord {
   const { currentRunId: _run, pendingLaunch: _launch, pendingStopReason: _reason, ...durable } = record;
-  void _run; void _launch; void _reason;
   return { ...durable, state: AgentState.Stopped, ...(latestCompletion === undefined ? {} : { latestCompletion }) };
 }
 
@@ -924,7 +922,6 @@ function asUncontained(record: RestoredAgentRecord): RestoredAgentRecord {
 
 function withoutLatestCompletion(record: RestoredAgentRecord): RestoredAgentRecord {
   const { latestCompletion: _completion, latestCompletionAttemptId: _attempt, latestCompletionReceiptPath: _receipt, ...rest } = record;
-  void _completion; void _attempt; void _receipt;
   return rest;
 }
 

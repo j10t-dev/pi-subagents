@@ -74,10 +74,6 @@ export class RunSemaphore {
   get activeCount(): number {
     return this.active;
   }
-
-  get capacityValue(): number {
-    return this.capacity;
-  }
 }
 
 /**
@@ -111,11 +107,7 @@ export class AbortError extends Error {
   }
 }
 
-/**
- * Waits for either `promise` to settle or `signal` to abort, whichever happens first. Always
- * removes its abort listener before returning, so it never leaks listeners onto a long-lived
- * signal.
- */
+/** Resolves after `milliseconds`, or rejects with `AbortError` if `signal` aborts first. */
 export function delayWithAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const delay = new Promise<void>((resolve) => { timer = setTimeout(resolve, milliseconds); });

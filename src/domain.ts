@@ -174,7 +174,7 @@ export type AgentErrorCode = (typeof AgentErrorCode)[keyof typeof AgentErrorCode
 
 export class PublicPreflightError extends Error {
   constructor(readonly code: AgentErrorCode, publicMessage: string) {
-    super(truncateUtf8(`${code}: ${publicMessage}`, 10_000).text);
+    super(truncateUtf8(`${code}: ${publicMessage}`, MAX_ERROR_MESSAGE_BYTES).text);
     this.name = "PublicPreflightError";
   }
 }
@@ -446,12 +446,8 @@ export interface AgentEventPayloadMapV1 {
   [AgentEventType.RunCompleted]: RunCompletedPayload;
 }
 
-export interface AgentEventPayloadMap {
-  [AgentEventType.Spawned]: SpawnedPayload;
+export interface AgentEventPayloadMap extends AgentEventPayloadMapV1 {
   [AgentEventType.RunLaunchRequested]: RunLaunchRequestedPayloadV2;
-  [AgentEventType.RunStarted]: RunStartedPayload;
-  [AgentEventType.RunStopping]: RunStoppingPayload;
-  [AgentEventType.RunCompleted]: RunCompletedPayload;
 }
 
 export type PersistedAgentEventV1 = {

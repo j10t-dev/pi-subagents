@@ -537,9 +537,7 @@ export class RunController {
     const runtime = record.runtime;
     try {
       if (abort) await this.options.onStopping?.(record, reason ?? CancellationReason.StopRequested);
-      if (abort) {
-        try { void runtime?.abort().catch(() => undefined); } catch {}
-      }
+      if (abort) void runtime?.abort().catch(() => undefined);
       if (runtime === undefined) throw new Error("missing containment responsibility");
       if (record.terminalContained !== true) {
         await runtime.contain();
