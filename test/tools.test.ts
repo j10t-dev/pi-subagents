@@ -3,12 +3,16 @@ import { Value } from "typebox/value";
 import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8, type AgentCompletion } from "../src/domain.ts";
 import { diagnosticsPath } from "../src/paths.ts";
 import { CompletionService, type AgentSummary, type ReceiveAgentResult } from "../src/completion-service.ts";
+import { MAX_AGGREGATE_RECEIVE_BYTES } from "../src/constants.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PublicStopOutcome } from "../src/controller.ts";
 import { deferred } from "./support/async.ts";
 import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
 import { launchSession, runningTransport as sharedRunningTransport, testRuntime } from "./support/launches.ts";
 import {
+  allocateFairOutputs,
+  buildFairOutputTable,
   createSubagentTools,
+  type FairAllocationStats,
   type SubagentToolController,
   type SubagentToolInput,
   type SubagentToolName,
@@ -628,26 +632,110 @@ describe("exact tool contracts", () => {
     expect(new TextEncoder().encode(rendered).byteLength).toBe(8_192);
   });
 
-  test("receive execute retains the complete inventory and CompletionService-bounded output", async () => {
-    const completions = new CompletionService();
-    for (let index = 0; index < 1_000; index++) completions.upsertAgent({
-      agentId: agentId(`agent-${index}`), state: AgentState.Stopped, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${index}.jsonl`),
-    });
-    await completions.publish({ agentId: agentId("agent-0"), runId: runId("deadbeef"), state: CompletionState.Completed,
-      output: truncateUtf8("a".repeat(40_000), 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/a.md"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/0.jsonl") });
-    await completions.publish({ agentId: agentId("agent-1"), runId: runId("cafebabe"), state: CompletionState.Completed,
-      output: truncateUtf8("b".repeat(40_000), 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/b.md"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/1.jsonl") });
-    const receive = createSubagentTools(new SubagentController({ completions })).receive_agent;
+  test("receive_agent fairly admits a small output beside an oversized output at the provider boundary", async () => {
+    const source = receiveFixture(["a".repeat(50_000), "b".repeat(2_000)]);
+    source.completions[0]!.output.originalBytes = 60_000;
+    source.completions[0]!.output.truncated = true;
+    const before = JSON.stringify(source);
+    const receive = createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent;
 
     const result = await receive.execute({});
-    const details = result.details as { agents: object[]; completions: Array<{ output: { text: string; retainedBytes: number; truncated: boolean } }> };
+    const contentDetails = receiveContentDetails(result.content);
 
-    expect(details.agents).toHaveLength(1_000);
-    expect(details.completions.map((completion) => completion.output.text.length)).toEqual([40_000, 10_000]);
-    expect(details.completions.map((completion) => completion.output.retainedBytes)).toEqual([40_000, 10_000]);
-    expect(details.completions[1]!.output.truncated).toBeTrue();
-    expect(result.content).toContain("a".repeat(1_000));
+    expect(result.details).toEqual(source);
+    expect(contentDetails.completions[1]!.output.text).toBe("b".repeat(2_000));
+    expect(contentDetails.completions[1]!.output.retainedBytes).toBe(2_000);
+    expect(contentDetails.completions[0]!.output.originalBytes).toBe(60_000);
+    expect(contentDetails.completions[0]!.output.truncated).toBeTrue();
+    expect(contentDetails.completions[0]!.output.retainedBytes).toBeGreaterThan(40_000);
+    expectProviderBoundedResult(source, result);
+    expect(JSON.stringify(source)).toBe(before);
     expect(receive.renderResult!(result)).not.toContain("a".repeat(100));
+  });
+
+  test("receive_agent applies deterministic fair queue remainder to mixed small and large outputs", async () => {
+    const source = receiveFixture(["a".repeat(50_000), "small", "b".repeat(50_000)]);
+    const receive = createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent;
+
+    const first = await receive.execute({});
+    const second = await receive.execute({});
+    const bounded = receiveContentDetails(first.content);
+    const firstLarge = bounded.completions[0]!.output.retainedBytes;
+    const secondLarge = bounded.completions[2]!.output.retainedBytes;
+
+    expect(bounded.completions[1]!.output.text).toBe("small");
+    expect(Math.abs(firstLarge - secondLarge)).toBeLessThanOrEqual(1);
+    expect(firstLarge).toBeGreaterThanOrEqual(secondLarge);
+    expect(second.content).toBe(first.content);
+    expectProviderBoundedResult(source, first);
+  });
+
+  test("receive_agent costs emoji and escaped control text as final JSON while retaining complete prefixes", async () => {
+    const source = receiveFixture(["😀".repeat(12_500), "\n\u0000\\\"".repeat(12_500)]);
+    const result = await createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent.execute({});
+    const bounded = receiveContentDetails(result.content);
+
+    expect(bounded.completions[0]!.output.text.endsWith("😀")).toBeTrue();
+    expect(bounded.completions[1]!.output.text.length).toBeGreaterThan(0);
+    expectProviderBoundedResult(source, result);
+  });
+
+  test("receive_agent preserves prior truncation metadata and does not mutate provider inputs", async () => {
+    const source = receiveFixture(["x".repeat(50_000), "y".repeat(1_000)]);
+    source.completions[0]!.output.originalBytes = 60_000;
+    source.completions[0]!.output.truncated = true;
+    const before = structuredClone(source);
+
+    const result = await createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent.execute({});
+    const bounded = receiveContentDetails(result.content);
+
+    expect(bounded.completions[0]!.output.originalBytes).toBe(60_000);
+    expect(bounded.completions[0]!.output.truncated).toBeTrue();
+    expect(source).toEqual(before);
+    expectProviderBoundedResult(source, result);
+  });
+
+  test("receive_agent compacts only provider content inventory metadata and preserves full renderer details", async () => {
+    const source = receiveFixture(["a".repeat(50_000)]);
+    source.agents = Array.from({ length: 500 }, (_, index) => ({
+      agentId: `agent-${index}`,
+      state: AgentState.Stopped,
+      transcriptPath: `/tmp/pi-subagents-test/${index}/${"path/".repeat(8)}session.jsonl`,
+      latestCompletionState: CompletionState.Completed,
+      latestOutputPath: `/tmp/pi-subagents-test/${index}/${"path/".repeat(8)}output.md`,
+    }));
+    const fullProjectedDetails = structuredClone(source);
+    const receive = createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent;
+
+    const result = await receive.execute({});
+    const contentDetails = receiveContentDetails(result.content);
+
+    expect(result.details).toEqual(fullProjectedDetails);
+    expect(contentDetails.agents).toHaveLength(500);
+    expect(contentDetails.agents[0]).toEqual({
+      agentId: "agent-0", state: AgentState.Stopped, latestCompletionState: CompletionState.Completed,
+    });
+    const fullAgents = (result.details as ReceiveBoundaryContent).agents;
+    expect(fullAgents[0]).toMatchObject({
+      transcriptPath: expect.stringContaining("session.jsonl"),
+      latestOutputPath: expect.stringContaining("output.md"),
+    });
+    expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
+    expect(result.content).toBe(JSON.stringify(contentDetails));
+    expect(receive.renderResult!(result)).toContain("latestOutputPath=");
+    expectProviderBoundedResult(source, result);
+  });
+
+  test("receive_agent fails closed when compact zero-text inventory metadata exceeds the cap", async () => {
+    const source = receiveFixture([]);
+    source.agents = Array.from({ length: 2_000 }, (_, index) => ({
+      agentId: `agent-${index}-${"x".repeat(30)}`,
+      state: AgentState.Stopped,
+      transcriptPath: `/tmp/pi-subagents-test/${index}.jsonl`,
+    }));
+
+    await expect(createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent.execute({}))
+      .rejects.toThrow("internal_error: internal agent result is invalid");
   });
 
   test("stop projects each successful public outcome without injected fields", async () => {
@@ -794,6 +882,320 @@ describe("exact tool contracts", () => {
     expect(JSON.stringify(details).length).toBeLessThan(1_024);
   });
 });
+
+describe("fair prefix cost tables", () => {
+  test.each([
+    ["ASCII", "A"],
+    ["multibyte", "é"],
+    ["surrogate pair", "😀"],
+    ["quote", '"'],
+    ["backslash", "\\"],
+    ["newline", "\n"],
+    ["NUL", "\0"],
+  ])("fair prefix accounts exactly for %s", (_name, text) => {
+    const retainedBytes = Buffer.byteLength(text, "utf8");
+    const table = buildFairOutputTable(text, retainedBytes, false);
+    const zero = projectedFairCompletion("", retainedBytes, false);
+
+    expect(table).toEqual(expect.objectContaining({
+      text,
+      originalRetainedBytes: retainedBytes,
+      previouslyTruncated: false,
+    }));
+    expect(table.prefixes[0]).toEqual({ endOffset: 0, retainedBytes: 0, serialisedDeltaBytes: 0 });
+    expect(table.prefixes.at(-1)?.endOffset).toBe(text.length);
+    expect(table.prefixes.at(-1)?.retainedBytes).toBe(retainedBytes);
+
+    for (const prefix of table.prefixes) {
+      const prefixText = text.slice(0, prefix.endOffset);
+      expect(Buffer.byteLength(prefixText, "utf8")).toBe(prefix.retainedBytes);
+      expect(Buffer.byteLength(JSON.stringify(projectedFairCompletion(prefixText, retainedBytes, false)), "utf8")
+        - Buffer.byteLength(JSON.stringify(zero), "utf8")).toBe(prefix.serialisedDeltaBytes);
+    }
+
+    expect(table.prefixes.slice(1).every((prefix, index) =>
+      prefix.retainedBytes > table.prefixes[index]!.retainedBytes)).toBeTrue();
+  });
+
+  test("fair prefix tracks mixed complete boundaries across decimal byte lengths", () => {
+    const text = "12345678ab😀é";
+    const retainedBytes = Buffer.byteLength(text, "utf8");
+    const table = buildFairOutputTable(text, retainedBytes, false);
+    const zero = projectedFairCompletion("", retainedBytes, false);
+
+    expect(table.prefixes).toHaveLength(13);
+    expect(table.prefixes.map((prefix) => prefix.endOffset)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13,
+    ]);
+    expect(table.prefixes.map((prefix) => prefix.retainedBytes)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 16,
+    ]);
+    expect(table.prefixes.slice(1).every((prefix, index) =>
+      prefix.retainedBytes > table.prefixes[index]!.retainedBytes)).toBeTrue();
+
+    for (const prefix of table.prefixes) {
+      const prefixText = text.slice(0, prefix.endOffset);
+      const measuredDelta = Buffer.byteLength(JSON.stringify(projectedFairCompletion(prefixText, retainedBytes, false)), "utf8")
+        - Buffer.byteLength(JSON.stringify(zero), "utf8");
+      expect(measuredDelta).toBe(prefix.serialisedDeltaBytes);
+    }
+  });
+
+  test("fair prefix preserves prior truncation when costing boolean metadata", () => {
+    const table = buildFairOutputTable("A", 1, true);
+    const final = table.prefixes.at(-1)!;
+    const zero = projectedFairCompletion("", 1, true);
+
+    expect(final.serialisedDeltaBytes).toBe(
+      Buffer.byteLength(JSON.stringify(projectedFairCompletion("A", 1, true)), "utf8")
+        - Buffer.byteLength(JSON.stringify(zero), "utf8"),
+    );
+  });
+
+  test("fair prefix rejects retained-byte metadata that does not match complete input", () => {
+    expect(() => buildFairOutputTable("é", 1, false)).toThrow(CodedError);
+    expect(() => buildFairOutputTable("é", 1, false)).toThrow("internal_error");
+  });
+});
+
+describe("nominal max-min allocation", () => {
+  const zeroTextSerialisedBytes = 1_000;
+
+  test("fully admits a 2 KB output and redistributes its unused share to a 60 KB output", () => {
+    const tables = [fairTable("a".repeat(60_000)), fairTable("b".repeat(2_000))];
+    const cap = zeroTextSerialisedBytes + 10_000;
+
+    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+
+    expect(allocation.prefixIndices[1]).toBe(tables[1]!.prefixes.length - 1);
+    expect(allocation.retainedBytes[1]).toBe(2_000);
+    expect(allocation.serialisedBytes).toBe(cap);
+    expect(allocation.retainedBytes[0]).toBeGreaterThan(5_000);
+    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+
+  test("gives the first equally large ASCII output the nominal remainder byte", () => {
+    const tables = [fairTable("a".repeat(1_000)), fairTable("b".repeat(1_000))];
+    const cap = zeroTextSerialisedBytes + 101;
+
+    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+    const deltas = selectedDeltas(allocation.prefixIndices, tables);
+
+    expect(deltas).toEqual([51, 50]);
+    expect(Math.abs(deltas[0]! - deltas[1]!)).toBeLessThanOrEqual(1);
+    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+
+  test("removes every demand below the waterline before redividing among large outputs", () => {
+    const tables = [fairTable("a".repeat(2)), fairTable("b".repeat(8)), fairTable("c".repeat(100)), fairTable("d".repeat(100))];
+    const cap = zeroTextSerialisedBytes + 50;
+
+    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+    const deltas = selectedDeltas(allocation.prefixIndices, tables);
+
+    expect(allocation.prefixIndices.slice(0, 2)).toEqual([
+      tables[0]!.prefixes.length - 1,
+      tables[1]!.prefixes.length - 1,
+    ]);
+    expect(deltas).toEqual([3, 9, 19, 19]);
+    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+
+  test("selects complete emoji and multibyte prefixes when a nominal share ends inside a code point", () => {
+    const tables = [fairTable("😀".repeat(10)), fairTable("é".repeat(10))];
+    const cap = zeroTextSerialisedBytes + 11;
+
+    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+
+    expect(allocation.prefixIndices).toEqual([1, 3]);
+    expect(allocation.retainedBytes).toEqual([4, 6]);
+    expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([4, 6]);
+    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+
+  test("uses exact escaped JSON cost rather than raw UTF-8 size", () => {
+    const tables = [fairTable("\n".repeat(100))];
+    const cap = zeroTextSerialisedBytes + 11;
+
+    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+
+    expect(allocation.prefixIndices).toEqual([5]);
+    expect(allocation.retainedBytes).toEqual([5]);
+    expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([10]);
+    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+
+  test("offers pooled unusable complete-prefix slack in queue order and restarts", () => {
+    const tables = [fairTable("😀".repeat(10)), fairTable("😀".repeat(10)), fairTable("😀".repeat(10))];
+    const cap = zeroTextSerialisedBytes + 17;
+
+    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+
+    expect(allocation.prefixIndices).toEqual([2, 1, 1]);
+    expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([8, 4, 4]);
+    expect(allocation.serialisedBytes).toBe(zeroTextSerialisedBytes + 16);
+    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+
+  test("keeps previous truncation metadata after full admission", () => {
+    const table = buildFairOutputTable("abc", 3, true);
+    const cap = zeroTextSerialisedBytes + table.prefixes.at(-1)!.serialisedDeltaBytes;
+
+    const allocation = allocateFairOutputs([table], zeroTextSerialisedBytes, cap);
+
+    expect(allocation.prefixIndices).toEqual([table.prefixes.length - 1]);
+    expect(allocation.retainedBytes).toEqual([3]);
+    expect(projectedFairCompletion("abc", 3, true)).toMatchObject({ output: { truncated: true } });
+    expectFairAllocationWithinCap(allocation.prefixIndices, [table], zeroTextSerialisedBytes, cap);
+  });
+
+  test("is deterministic across repeated calls and does not mutate inputs", () => {
+    const tables = [fairTable("😀".repeat(10)), fairTable("x".repeat(100)), fairTable("")];
+    const before = JSON.stringify(tables);
+    const cap = zeroTextSerialisedBytes + 31;
+
+    const first = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+    const second = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
+
+    expect(second).toEqual(first);
+    expect(JSON.stringify(tables)).toBe(before);
+    expectFairAllocationWithinCap(first.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+
+  test("returns zero-text bytes unchanged for zero outputs and empty outputs", () => {
+    const emptyTable = fairTable("");
+
+    const noOutputs = allocateFairOutputs([], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
+    const emptyOutput = allocateFairOutputs([emptyTable], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
+
+    expect(noOutputs).toEqual({ prefixIndices: [], retainedBytes: [], serialisedBytes: zeroTextSerialisedBytes });
+    expect(emptyOutput).toEqual({ prefixIndices: [0], retainedBytes: [0], serialisedBytes: zeroTextSerialisedBytes });
+    expectFairAllocationWithinCap(noOutputs.prefixIndices, [], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
+    expectFairAllocationWithinCap(emptyOutput.prefixIndices, [emptyTable], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
+  });
+
+  test("throws stable internal_error when zero text exceeds the cap", () => {
+    expect(() => allocateFairOutputs([], zeroTextSerialisedBytes, zeroTextSerialisedBytes - 1))
+      .toThrow("internal_error: internal agent result is invalid");
+  });
+
+  test("reports bounded full checks, searches, and admitted slack transitions", () => {
+    const tables = [fairTable("a"), fairTable(""), fairTable("😀".repeat(20)), fairTable("é".repeat(20)), fairTable("z".repeat(100))];
+    const stats: FairAllocationStats = { fullAdmissionChecks: 0, prefixSearches: 0, slackTransitions: 0 };
+    const cap = zeroTextSerialisedBytes + 32;
+
+    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap, stats);
+
+    expect(allocation.prefixIndices[0]).toBe(tables[0]!.prefixes.length - 1);
+    expect(stats.fullAdmissionChecks).toBeLessThanOrEqual(tables.length * tables.length);
+    expect(stats.prefixSearches).toBe(3);
+    expect(stats.slackTransitions).toBeLessThanOrEqual(
+      tables.reduce((total, table) => total + table.prefixes.length, 0),
+    );
+    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
+  });
+});
+
+interface ReceiveBoundaryOutput {
+  text: string;
+  originalBytes: number;
+  retainedBytes: number;
+  truncated: boolean;
+}
+
+interface ReceiveBoundaryCompletion {
+  agentId: string;
+  runId: string;
+  state: CompletionState;
+  output: ReceiveBoundaryOutput;
+  outputPath: string;
+  transcriptPath: string;
+}
+
+interface ReceiveBoundaryFixture {
+  completions: ReceiveBoundaryCompletion[];
+  agents: Array<Record<string, unknown>>;
+  timedOut: boolean;
+}
+
+interface ReceiveBoundaryContent {
+  completions: ReceiveBoundaryCompletion[];
+  agents: Array<Record<string, unknown>>;
+  timedOut: boolean;
+}
+
+function receiveFixture(texts: readonly string[]): ReceiveBoundaryFixture {
+  return {
+    completions: texts.map((text, index) => {
+      const retainedBytes = Buffer.byteLength(text, "utf8");
+      return {
+        agentId: `agent-${index}`,
+        runId: (index + 1).toString(16).padStart(8, "0"),
+        state: CompletionState.Completed,
+        output: { text, originalBytes: retainedBytes, retainedBytes, truncated: false },
+        outputPath: `/tmp/pi-subagents-test/${index}.output.md`,
+        transcriptPath: `/tmp/pi-subagents-test/${index}.session.jsonl`,
+      };
+    }),
+    agents: [],
+    timedOut: false,
+  };
+}
+
+function receiveContentDetails(content: string): ReceiveBoundaryContent {
+  return JSON.parse(content) as ReceiveBoundaryContent;
+}
+
+function expectProviderBoundedResult(
+  source: ReceiveBoundaryFixture,
+  result: { content: string; details: object },
+): void {
+  const bounded = receiveContentDetails(result.content);
+  expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
+  expect(result.content).toBe(JSON.stringify(bounded));
+  expect(bounded.completions).toHaveLength(source.completions.length);
+  for (const [index, selected] of bounded.completions.entries()) {
+    const input = source.completions[index]!;
+    expect(input.output.text.startsWith(selected.output.text)).toBeTrue();
+    expect(selected.output.retainedBytes).toBe(Buffer.byteLength(selected.output.text, "utf8"));
+    expect(selected.output.originalBytes).toBe(input.output.originalBytes);
+    expect(selected.output.truncated).toBe(
+      input.output.truncated || selected.output.retainedBytes < input.output.retainedBytes,
+    );
+    if (selected.output.truncated) expect(selected.outputPath).toBe(input.outputPath);
+  }
+}
+
+function fairTable(text: string, previouslyTruncated = false) {
+  return buildFairOutputTable(text, Buffer.byteLength(text, "utf8"), previouslyTruncated);
+}
+
+function selectedDeltas(prefixIndices: readonly number[], tables: readonly ReturnType<typeof fairTable>[]): number[] {
+  return prefixIndices.map((prefixIndex, index) => tables[index]!.prefixes[prefixIndex]!.serialisedDeltaBytes);
+}
+
+function expectFairAllocationWithinCap(
+  prefixIndices: readonly number[],
+  tables: readonly ReturnType<typeof fairTable>[],
+  zeroTextSerialisedBytes: number,
+  cap: number,
+): void {
+  const measured = zeroTextSerialisedBytes
+    + selectedDeltas(prefixIndices, tables).reduce((total, delta) => total + delta, 0);
+  expect(measured).toBeLessThanOrEqual(cap);
+}
+
+function projectedFairCompletion(text: string, originalRetainedBytes: number, previouslyTruncated: boolean): object {
+  const retainedBytes = Buffer.byteLength(text, "utf8");
+  return {
+    output: {
+      text,
+      originalBytes: originalRetainedBytes,
+      retainedBytes,
+      truncated: previouslyTruncated || retainedBytes < originalRetainedBytes,
+    },
+  };
+}
 
 function schemaDescription(schema: object): string | undefined {
   if (!("description" in schema)) return undefined;

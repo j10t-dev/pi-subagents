@@ -1,14 +1,12 @@
-import { MAX_AGGREGATE_RECEIVE_BYTES } from "./constants.ts";
 import {
   agentRunKey,
   AgentErrorCode,
   AgentState,
   CodedError,
-  truncateUtf8,
+  CompletionState,
   type AgentCompletion,
   type AgentId,
   type CommittedOutputPath,
-  type CompletionState,
   type Milliseconds,
   type RunId,
   type SessionPath,
@@ -79,7 +77,6 @@ export class CompletionService {
   private notifiedSinceEmpty = false;
   private liveOperationsStarted = false;
 
-  constructor(private readonly maxAggregateBytes: number = MAX_AGGREGATE_RECEIVE_BYTES) {}
 
   /** Registers or updates the live state of an owned agent (spawn, run start, run stop, ...). */
   upsertAgent(summary: AgentSummary): void {
@@ -273,26 +270,22 @@ export class CompletionService {
     }
     const drained = this.queue.splice(0, this.queue.length);
     this.notifiedSinceEmpty = false;
-    return this.applyAggregateBudgetLocked(drained);
-  }
-
-  /**
-   * Clones each completion and recomputes `retainedBytes`/`truncated` against the remaining
-   * aggregate byte budget, in queue order. Never mutates the persisted completion values.
-   */
-  private applyAggregateBudgetLocked(completions: readonly AgentCompletion[]): AgentCompletion[] {
-    let remaining = this.maxAggregateBytes;
-    return completions.map((completion) => {
-      const budget = Math.max(0, remaining);
-      const admitted = truncateUtf8(completion.output.text, budget);
-      remaining -= admitted.retainedBytes;
-      return { ...completion, output: {
-        text: admitted.text,
-        originalBytes: completion.output.originalBytes,
-        retainedBytes: admitted.retainedBytes,
-        truncated: completion.output.truncated || admitted.retainedBytes < completion.output.originalBytes,
-      } };
-    });
+    return drained.map((completion) => ({
+      ...completion,
+      output: { ...completion.output },
+      ...(completion.state === CompletionState.Failed ? { error: { ...completion.error } } : {}),
+      ...(completion.usage === undefined
+        ? {}
+        : {
+            usage: {
+              ...completion.usage,
+              usage: {
+                ...completion.usage.usage,
+                cost: { ...completion.usage.usage.cost },
+              },
+            },
+          }),
+    }));
   }
 
   private upsertCompletionSummaryLocked(completion: AgentCompletion): void {

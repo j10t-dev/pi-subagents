@@ -57,7 +57,7 @@ describe("context safety", () => {
     expect(decoder.pendingBytes).toBe(0);
   });
 
-  test("one receive batch retains at most 50 KB and the service remains usable", async () => {
+  test("receive_agent provider content retains at most 50 KB and the service remains usable", async () => {
     const service = new CompletionService();
     for (const [index, id] of ["deadbeef", "cafebabe"].entries()) {
       await service.publish({ agentId: testAgentId(`context-${index}`), runId: runId(id), state: CompletionState.Completed,
@@ -65,9 +65,26 @@ describe("context safety", () => {
         outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/output/${id}.output`),
         transcriptPath: testSessionPath(`/tmp/pi-subagents-test/sessions/${id}.jsonl`) });
     }
-    const first = await service.receive();
-    expect(first.completions.reduce((bytes, item) => bytes + item.output.retainedBytes, 0)).toBe(MAX_AGGREGATE_RECEIVE_BYTES);
-    expect((await service.receive()).completions).toEqual([]);
+    const receive = createSubagentTools(new SubagentController({ completions: service })).receive_agent;
+    const first = await receive.execute({});
+    const details = receiveDetails(first.details);
+    const providerDetails = receiveDetails(requireRecord(JSON.parse(first.content)));
+    expect(Buffer.byteLength(first.content)).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
+    expect(first.content).toBe(JSON.stringify(JSON.parse(first.content)));
+    expect(details.completions.reduce((bytes, item) => bytes + outputBytes(item), 0)).toBe(2 * MAX_COMPLETION_OUTPUT_BYTES);
+    const providerBytes = providerDetails.completions.map(outputBytes);
+    expect(providerBytes).toHaveLength(2);
+    expect(Math.abs(providerBytes[0]! - providerBytes[1]!)).toBeLessThanOrEqual(1);
+    for (const completion of providerDetails.completions) {
+      const output = requireRecord(completion.output);
+      const text = requireString(output, "text");
+      expect("x".repeat(MAX_COMPLETION_OUTPUT_BYTES).startsWith(text)).toBeTrue();
+      expect(outputBytes(completion)).toBe(Buffer.byteLength(text, "utf8"));
+      expect(output.originalBytes).toBe(MAX_COMPLETION_OUTPUT_BYTES);
+      expect(output.truncated).toBeTrue();
+      expect(requireString(completion, "outputPath")).toStartWith("/tmp/pi-subagents-test/output/");
+    }
+    expect(receiveDetails((await receive.execute({})).details).completions).toEqual([]);
   });
 
   test("published safety limits retain their exact operator contract", () => {

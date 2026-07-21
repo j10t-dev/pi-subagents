@@ -213,12 +213,12 @@ describe("controller orchestration scenarios", () => {
     }
   });
 
-  test("15 aggregate budget truncates later inline output while sidecars remain authoritative", async () => {
-    const service = new CompletionService(4);
+  test("15 unconfigured completion service preserves full completions while sidecars remain authoritative", async () => {
+    const service = new CompletionService();
     await service.publish(completion(A, R1, "1234"));
     await service.publish(completion(B, R1, "later"));
     const received = await service.receive();
-    expect(received.completions.map((item) => item.output.text)).toEqual(["1234", ""]);
+    expect(received.completions.map((item) => item.output.text)).toEqual(["1234", "later"]);
     expect(String(received.completions[1]?.outputPath)).toBe("/tmp/pi-subagents-test/agent-b-deadbeef.txt");
   });
 

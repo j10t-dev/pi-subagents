@@ -64,6 +64,144 @@ export const subagentToolSchemas = {
   stop_agent: stopAgentSchema,
 } as const;
 
+export interface FairPrefix {
+  readonly endOffset: number;
+  readonly retainedBytes: number;
+  readonly serialisedDeltaBytes: number;
+}
+
+export interface FairOutputTable {
+  readonly text: string;
+  readonly originalRetainedBytes: number;
+  readonly previouslyTruncated: boolean;
+  readonly prefixes: readonly FairPrefix[];
+}
+
+export interface FairAllocation {
+  readonly prefixIndices: readonly number[];
+  readonly retainedBytes: readonly number[];
+  readonly serialisedBytes: number;
+}
+
+export interface FairAllocationStats {
+  fullAdmissionChecks: number;
+  prefixSearches: number;
+  slackTransitions: number;
+}
+
+/**
+ * Builds exact JSON projection costs at each complete Unicode code-point boundary.
+ * The caller's retained-byte value represents the unmodified persisted output.
+ */
+export function buildFairOutputTable(
+  text: string,
+  retainedBytes: number,
+  previouslyTruncated: boolean,
+): FairOutputTable {
+  const encoder = new TextEncoder();
+  const originalRetainedBytes = retainedBytes;
+  const zeroTruncated = previouslyTruncated || 0 < originalRetainedBytes;
+  const prefixes: FairPrefix[] = [{ endOffset: 0, retainedBytes: 0, serialisedDeltaBytes: 0 }];
+  let endOffset = 0;
+  let prefixRetainedBytes = 0;
+  let serialisedPayloadBytes = 0;
+
+  for (const codePoint of text) {
+    endOffset += codePoint.length;
+    prefixRetainedBytes += encoder.encode(codePoint).byteLength;
+    serialisedPayloadBytes += encoder.encode(JSON.stringify(codePoint).slice(1, -1)).byteLength;
+    const truncated = previouslyTruncated || prefixRetainedBytes < originalRetainedBytes;
+    const serialisedDeltaBytes = serialisedPayloadBytes
+      + String(prefixRetainedBytes).length - 1
+      + String(truncated).length - String(zeroTruncated).length;
+    prefixes.push({ endOffset, retainedBytes: prefixRetainedBytes, serialisedDeltaBytes });
+  }
+
+  if (prefixRetainedBytes !== originalRetainedBytes) throw new CodedError(AgentErrorCode.InternalError);
+  return { text, originalRetainedBytes, previouslyTruncated, prefixes };
+}
+
+/** Allocates provider-visible serialised bytes by nominal max-min shares. */
+export function allocateFairOutputs(
+  tables: readonly FairOutputTable[],
+  zeroTextSerialisedBytes: number,
+  cap: number,
+  stats?: FairAllocationStats,
+): FairAllocation {
+  if (zeroTextSerialisedBytes > cap) throw new CodedError(AgentErrorCode.InternalError);
+
+  const prefixIndices = tables.map(() => 0);
+  let remaining = cap - zeroTextSerialisedBytes;
+  const active = tables.flatMap((table, index) => table.text.length === 0 ? [] : [index]);
+
+  while (active.length > 0) {
+    const share = Math.floor(remaining / active.length);
+    let admittedFull = false;
+    for (let position = 0; position < active.length; position++) {
+      if (stats !== undefined) stats.fullAdmissionChecks++;
+      const tableIndex = active[position]!;
+      const table = tables[tableIndex]!;
+      const finalIndex = table.prefixes.length - 1;
+      const fullDelta = table.prefixes[finalIndex]!.serialisedDeltaBytes;
+      if (fullDelta > share) continue;
+      prefixIndices[tableIndex] = finalIndex;
+      remaining -= fullDelta;
+      active.splice(position, 1);
+      admittedFull = true;
+      break;
+    }
+    if (admittedFull) continue;
+
+    const remainder = remaining % active.length;
+    for (let position = 0; position < active.length; position++) {
+      const tableIndex = active[position]!;
+      prefixIndices[tableIndex] = fairPrefixAtMost(
+        tables[tableIndex]!.prefixes,
+        share + (position < remainder ? 1 : 0),
+      );
+      if (stats !== undefined) stats.prefixSearches++;
+    }
+    break;
+  }
+
+  let slack = cap - zeroTextSerialisedBytes;
+  for (let index = 0; index < tables.length; index++) {
+    slack -= tables[index]!.prefixes[prefixIndices[index]!]!.serialisedDeltaBytes;
+  }
+  let advanced = true;
+  while (advanced) {
+    advanced = false;
+    for (let index = 0; index < tables.length; index++) {
+      const table = tables[index]!;
+      const currentIndex = prefixIndices[index]!;
+      const next = table.prefixes[currentIndex + 1];
+      if (next === undefined) continue;
+      const increment = next.serialisedDeltaBytes - table.prefixes[currentIndex]!.serialisedDeltaBytes;
+      if (increment > slack) continue;
+      prefixIndices[index] = currentIndex + 1;
+      slack -= increment;
+      if (stats !== undefined) stats.slackTransitions++;
+      advanced = true;
+      break;
+    }
+  }
+
+  const retainedBytes = prefixIndices.map((prefixIndex, index) =>
+    tables[index]!.prefixes[prefixIndex]!.retainedBytes);
+  return { prefixIndices, retainedBytes, serialisedBytes: cap - slack };
+}
+
+function fairPrefixAtMost(prefixes: readonly FairPrefix[], allowance: number): number {
+  let low = 0;
+  let high = prefixes.length - 1;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (prefixes[middle]!.serialisedDeltaBytes <= allowance) low = middle;
+    else high = middle - 1;
+  }
+  return low;
+}
+
 export type SubagentToolName = keyof typeof subagentToolSchemas;
 export type SubagentToolInput<K extends SubagentToolName> =
   Static<(typeof subagentToolSchemas)[K]>;
@@ -233,68 +371,82 @@ function projectReceive(value: ReceiveAgentResult): object {
   };
 }
 
-/** Keeps the complete inventory while re-budgeting inline output so provider-visible JSON stays bounded. */
+/** Bounds only provider content; full projected details remain available to renderers. */
 function boundReceiveContent(value: object): object {
   if (jsonBytes(value) <= MAX_AGGREGATE_RECEIVE_BYTES) return value;
   const source = requiredRecord(value);
   const completions = requiredArray(source, "completions");
-  const retained = completions.reduce<number>((total, completion) => {
-    const output = requiredRecord(requiredRecord(completion).output);
-    return total + requiredNonnegativeInteger(output, "retainedBytes");
-  }, 0);
-  let low = 0;
-  let high = retained;
-  let best = rebudgetReceive(source, completions, 0);
-  if (jsonBytes(best) > MAX_AGGREGATE_RECEIVE_BYTES) {
-    const agents = requiredArray(source, "agents").map((value) => {
-      const agent = requiredRecord(value);
-      return {
-        agentId: requiredString(agent, "agentId"),
-        state: requiredString(agent, "state"),
-        ...optionalStringContentField(agent, "currentRunId"),
-        ...optionalStringContentField(agent, "latestCompletionState"),
-      };
-    });
-    const compactSource = { ...source, agents };
-    if (jsonBytes(rebudgetReceive(compactSource, completions, 0)) > MAX_AGGREGATE_RECEIVE_BYTES) throw invalidPublicResult();
-    return boundReceiveContent(compactSource);
+  let selectedSource = source;
+  let zeroText = materialiseReceive(selectedSource, completions, completions.map(() => 0));
+  let zeroTextSerialisedBytes = jsonBytes(zeroText);
+
+  if (zeroTextSerialisedBytes > MAX_AGGREGATE_RECEIVE_BYTES) {
+    selectedSource = { ...source, agents: compactReceiveAgents(requiredArray(source, "agents")) };
+    zeroText = materialiseReceive(selectedSource, completions, completions.map(() => 0));
+    zeroTextSerialisedBytes = jsonBytes(zeroText);
+    if (zeroTextSerialisedBytes > MAX_AGGREGATE_RECEIVE_BYTES) throw invalidPublicResult();
   }
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    const candidate = rebudgetReceive(source, completions, middle);
-    if (jsonBytes(candidate) <= MAX_AGGREGATE_RECEIVE_BYTES) {
-      best = candidate;
-      low = middle + 1;
-    } else high = middle - 1;
+
+  const tables = completions.map((value) => {
+    const output = requiredRecord(requiredRecord(value).output);
+    return buildFairOutputTable(
+      requiredString(output, "text"),
+      requiredNonnegativeInteger(output, "retainedBytes"),
+      requiredBoolean(output, "truncated"),
+    );
+  });
+  const allocation = allocateFairOutputs(
+    tables,
+    zeroTextSerialisedBytes,
+    MAX_AGGREGATE_RECEIVE_BYTES,
+  );
+  const selected = materialiseReceive(selectedSource, completions, allocation.prefixIndices, tables);
+  const measuredBytes = jsonBytes(selected);
+  if (measuredBytes !== allocation.serialisedBytes || measuredBytes > MAX_AGGREGATE_RECEIVE_BYTES) {
+    throw invalidPublicResult();
   }
-  if (jsonBytes(best) > MAX_AGGREGATE_RECEIVE_BYTES) throw invalidPublicResult();
-  return best;
+  return selected;
+}
+
+function compactReceiveAgents(agents: unknown[]): object[] {
+  return agents.map((value) => {
+    const agent = requiredRecord(value);
+    return {
+      agentId: requiredString(agent, "agentId"),
+      state: requiredString(agent, "state"),
+      ...optionalStringContentField(agent, "currentRunId"),
+      ...optionalStringContentField(agent, "latestCompletionState"),
+    };
+  });
 }
 
 function optionalStringContentField(value: Record<string, unknown>, key: string): Record<string, string> {
   return value[key] === undefined ? {} : { [key]: requiredString(value, key) };
 }
 
-function rebudgetReceive(
+function materialiseReceive(
   source: Record<string, unknown>,
   completions: unknown[],
-  outputBudget: number,
+  prefixIndices: readonly number[],
+  tables?: readonly FairOutputTable[],
 ): object {
-  let remaining = outputBudget;
-  const boundedCompletions = completions.map((value) => {
+  const boundedCompletions = completions.map((value, index) => {
     const completion = requiredRecord(value);
     const output = requiredRecord(completion.output);
-    const text = requiredString(output, "text");
-    const originalBytes = requiredNonnegativeInteger(output, "originalBytes");
-    const boundedOutput = truncateUtf8(text, remaining);
-    remaining -= boundedOutput.retainedBytes;
+    const inputRetainedBytes = requiredNonnegativeInteger(output, "retainedBytes");
+    const previouslyTruncated = requiredBoolean(output, "truncated");
+    const prefixIndex = prefixIndices[index];
+    if (prefixIndex === undefined) throw invalidPublicResult();
+    const prefix = tables?.[index]?.prefixes[prefixIndex];
+    const text = prefix === undefined ? "" : tables![index]!.text.slice(0, prefix.endOffset);
+    const retainedBytes = prefix?.retainedBytes ?? 0;
     return {
       ...completion,
       output: {
-        text: boundedOutput.text,
-        originalBytes,
-        retainedBytes: boundedOutput.retainedBytes,
-        truncated: boundedOutput.retainedBytes < originalBytes,
+        text,
+        originalBytes: requiredNonnegativeInteger(output, "originalBytes"),
+        retainedBytes,
+        truncated: previouslyTruncated || retainedBytes < inputRetainedBytes,
       },
     };
   });

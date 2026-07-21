@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 
-import { AgentState, utf8Bytes } from "../src/domain.ts";
+import { AgentState, truncateUtf8, utf8Bytes } from "../src/domain.ts";
 import { CompletionService, type AgentSummary } from "../src/completion-service.ts";
 import type { AgentCompletion } from "../src/domain.ts";
 import {
@@ -199,60 +199,39 @@ describe("CompletionService.receive", () => {
     expect(service.queuedCount()).toBe(0);
   });
 
-  test("recomputes retainedBytes/truncated against the aggregate budget in queue order", async () => {
-    const service = new CompletionService(10);
-    await service.publish(
-      completion({
-        agentId: AGENT,
-        output: { text: "0123456789", originalBytes: utf8Bytes(10), retainedBytes: utf8Bytes(10), truncated: false },
-      }),
-    );
-    await service.publish(
-      completion({
-        agentId: OTHER_AGENT,
-        output: { text: "abcdefghij", originalBytes: utf8Bytes(10), retainedBytes: utf8Bytes(10), truncated: false },
-      }),
-    );
-
-    const result = await service.receive();
-    expect(result.completions[0]?.output.text).toBe("0123456789");
-    expect(result.completions[0]?.output.truncated).toBe(false);
-    expect(result.completions[1]?.output.text).toBe("");
-    expect(result.completions[1]?.output.truncated).toBe(true);
+  test("drains an immutable clone without aggregate truncation", async () => {
+    const service = new CompletionService();
+    const original = completion({ output: truncateUtf8("x".repeat(60_000), 50_000) });
+    await service.publish(original);
+    const [drained] = (await service.receive()).completions;
+    expect(drained).not.toBe(original);
+    expect(drained?.output).not.toBe(original.output);
+    expect(drained?.output).toEqual(original.output);
+    expect(Number(original.output.retainedBytes)).toBe(50_000);
   });
 
-  test("never mutates the persisted completion object", async () => {
-    const service = new CompletionService(3);
-    const original = completion({
-      output: { text: "hello", originalBytes: utf8Bytes(5), retainedBytes: utf8Bytes(5), truncated: false },
-    });
+  test("clones failed errors and nested usage without mutating persisted completions", async () => {
+    const service = new CompletionService();
+    const usage = { turns: 1, usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 6, reasoning: 7, totalTokens: 27,
+      cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } } };
+    const original = {
+      ...completion({
+        output: truncateUtf8("failed", 50_000),
+        usage,
+      }),
+      state: "failed" as const,
+      error: { code: "protocol_error" as const, message: "failure" },
+    };
     await service.publish(original);
 
-    const result = await service.receive();
-    expect(result.completions[0]).not.toBe(original);
-    expect(original.output.truncated).toBe(false);
-    expect(original.output.text).toBe("hello");
-  });
-
-  test("aggregate rebudget preserves persisted original size and truncation history", async () => {
-    const persisted = completion({
-      output: { text: "x".repeat(50_000), originalBytes: utf8Bytes(100_000), retainedBytes: utf8Bytes(50_000), truncated: true },
-    });
-    const fullAllowance = new CompletionService(50_000);
-    await fullAllowance.publish(persisted);
-    const fullyAdmitted = (await fullAllowance.receive()).completions[0]!.output;
-    expect(fullyAdmitted.text).toBe("x".repeat(50_000));
-    expect(fullyAdmitted.originalBytes).toBe(utf8Bytes(100_000));
-    expect(fullyAdmitted.retainedBytes).toBe(utf8Bytes(50_000));
-    expect(fullyAdmitted.truncated).toBeTrue();
-
-    const laterTruncation = new CompletionService(20_000);
-    await laterTruncation.publish(persisted);
-    const rebudgeted = (await laterTruncation.receive()).completions[0]!.output;
-    expect(rebudgeted.text).toBe("x".repeat(20_000));
-    expect(rebudgeted.originalBytes).toBe(utf8Bytes(100_000));
-    expect(rebudgeted.retainedBytes).toBe(utf8Bytes(20_000));
-    expect(rebudgeted.truncated).toBeTrue();
+    const [drained] = (await service.receive()).completions;
+    if (drained?.state !== "failed") throw new Error("expected failed completion");
+    expect(drained).not.toBe(original);
+    expect(drained.error).not.toBe(original.error);
+    expect(drained.usage).not.toBe(usage);
+    expect(drained.usage?.usage).not.toBe(usage.usage);
+    expect(drained.usage?.usage.cost).not.toBe(usage.usage.cost);
+    expect(drained).toEqual(original);
   });
 
   test("snapshotAgents includes every owned agent, running or completed", async () => {

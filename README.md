@@ -62,7 +62,7 @@ Child sessions are stored beneath the extension state directory, partitioned by 
 - stderr tail: 50 KB;
 - persisted completion output: 50 KB;
 - persisted and model-visible error: 10 KB;
-- aggregate completion output per `receive_agent`: 50 KB;
+- final provider-visible JSON per `receive_agent`: 50 KB, with nominal provider-visible text bytes allocated by deterministic max-min fair sharing before serialisation;
 - bounded transcript recovery tail: 32 MiB.
 
 Oversized or malformed records are discarded or converted to bounded diagnostics. Full output remains in the sidecar or transcript. A later `receive_agent` and unrelated parent tools remain usable.
