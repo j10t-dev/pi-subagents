@@ -19,7 +19,6 @@ import { BoundedJsonlDecoder } from "../src/jsonl.ts";
 import { OutputStore } from "../src/output-store.ts";
 import { RpcRunClient } from "../src/rpc-client.ts";
 import { createSubagentTools } from "../src/tools.ts";
-import { UIForwarder } from "../src/ui-forwarder.ts";
 import { containmentReceiptPath, diagnosticsPath, outputPath as outputPathIn, sessionPath } from "../src/paths.ts";
 import {
   testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath,
@@ -27,6 +26,7 @@ import {
 } from "./support/brands.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort } from "./support/extension-api.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
+import { fakeUiForwarder } from "./support/ui-forwarders.ts";
 
 const FAKE_CHILD = join(import.meta.dir, "fixtures", "fake-rpc-child.mjs");
 
@@ -320,10 +320,7 @@ function hostileLaunch(
       exited: new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal }))),
       terminate: () => { child.kill(); } }),
     outputStore: store,
-    uiForwarder: new UIForwarder({ hasUI: false, ui: {
-      select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined,
-      notify: () => {}, setStatus: () => {}, setWidget: () => {},
-    } }),
+    uiForwarder: fakeUiForwarder(),
     agentId: session.agentId,
     runAttemptId: session.attemptId,
   });
@@ -361,10 +358,7 @@ function fakeClient(scenario: string): { client: RpcRunClient; store: OutputStor
       exited: new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal }))),
       terminate: () => { child.kill(); } }),
     outputStore: store,
-    uiForwarder: new UIForwarder({ hasUI: false, ui: {
-      select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined,
-      notify: () => {}, setStatus: () => {}, setWidget: () => {},
-    } }),
+    uiForwarder: fakeUiForwarder(),
     agentId: testAgentId(`context-${scenario}`), runAttemptId: testAttemptId(`attempt-${scenario}`),
   });
   return { client, store, close: async () => { await client.shutdown(); state.cleanup(); } };

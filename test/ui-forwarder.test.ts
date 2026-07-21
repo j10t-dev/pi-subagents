@@ -9,6 +9,7 @@ import type {
 } from "../src/schemas.ts";
 import { UIForwarder, type ExtensionUIContextLike } from "../src/ui-forwarder.ts";
 import { deferred } from "./support/async.ts";
+import { fakeUiForwarder } from "./support/ui-forwarders.ts";
 
 const AGENT_A = agentId("agent-a");
 const AGENT_B = agentId("agent-b");
@@ -118,6 +119,12 @@ describe("UIForwarder broker", () => {
     await expect(first).resolves.toEqual({ type: "extension_ui_response", id: "failed", cancelled: true });
     await expect(second).resolves.toEqual({ type: "extension_ui_response", id: "next", confirmed: true });
     expect(order).toEqual(["[agent-a] Failed", "[agent-b] Next"]);
+  });
+
+  test("fake disabled UI forwarder cancels confirmations", async () => {
+    await expect(forward(fakeUiForwarder(), AGENT_A, confirm("fake-disabled"))).resolves.toEqual({
+      type: "extension_ui_response", id: "fake-disabled", cancelled: true,
+    });
   });
 
   test("returns immediate correlated cancellation without invoking absent UI", async () => {

@@ -12,6 +12,7 @@ import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-
 import { authoritativeSettlement, RpcRunClient } from "../src/rpc-client.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
 import { deferred } from "./support/async.ts";
+import { fakeUiForwarder } from "./support/ui-forwarders.ts";
 import type { ExtensionUIContextLike } from "../src/ui-forwarder.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
@@ -21,6 +22,7 @@ const AGENT: AgentId = agentId("agent-1");
 const validUsage: Usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 1, reasoning: 1, totalTokens: 2,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const evidenceUsage = validUsage;
+const messageEndEvent = (text: string) => `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], usage: evidenceUsage, stopReason: "stop" } })}\n`;
 const invalidUsageCases = [
   ["negative token", (usage: Usage) => ({ ...usage, input: -1 })],
   ["NaN token", (usage: Usage) => ({ ...usage, output: Number.NaN })],
@@ -257,7 +259,7 @@ describe("RpcRunClient", () => {
   test("uses an injected launch transport without mutating model defaults through RPC", async () => {
     const marker = join(workDir, "commands");
     const outputStore = new OutputStore({ workDir });
-    const forwarder = new UIForwarder({ hasUI: false, ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {} } });
+    const forwarder = fakeUiForwarder();
     const child = spawn(process.execPath, [FIXTURE], { cwd: workDir, env: { ...process.env, FAKE_RPC_COMMAND_MARKER: marker }, stdio: ["pipe", "pipe", "pipe"] });
     let launches = 0;
     const client = new RpcRunClient({
@@ -561,7 +563,7 @@ describe("RpcRunClient", () => {
         terminate: () => { terminated++; },
       }),
       outputStore,
-      uiForwarder: new UIForwarder({ hasUI: false, ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {} } }),
+      uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
       runAttemptId: createRunAttemptId(),
     });
@@ -597,7 +599,7 @@ describe("RpcRunClient", () => {
     const client = new RpcRunClient({
       launchTransport: async () => ({ stdin: new PassThrough(), stdout, stderr: new PassThrough(), exited: new Promise(() => {}), terminate: () => { terminated++; } }),
       outputStore,
-      uiForwarder: new UIForwarder({ hasUI: false, ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {} } }),
+      uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
       runAttemptId: createRunAttemptId(),
     });
@@ -616,15 +618,14 @@ describe("RpcRunClient", () => {
     const client = new RpcRunClient({
       launchTransport: async () => ({ stdin: new PassThrough(), stdout, stderr: new PassThrough(), exited: new Promise(() => {}), terminate: () => { terminated++; } }),
       outputStore,
-      uiForwarder: new UIForwarder({ hasUI: false, ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {} } }),
+      uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
       runAttemptId: createRunAttemptId(),
     });
     await client.start();
     client.bindRun(runId);
-    const event = (text: string) => `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], usage: evidenceUsage, stopReason: "stop" } })}\n`;
-    expect(() => stdout.write(event("first"))).not.toThrow();
-    stdout.write(event("second"));
+    expect(() => stdout.write(messageEndEvent("first"))).not.toThrow();
+    stdout.write(messageEndEvent("second"));
     await expect(client.waitSettled()).resolves.toMatchObject({ reason: "process_exited" });
     expect(terminated).toBe(1);
     expect(outputStore.currentOutput(runId)).toEqual({ output: expect.objectContaining({ text: "" }), transportIncomplete: true });
@@ -637,23 +638,22 @@ describe("RpcRunClient", () => {
     const outputStore = new ReentrantDiscardOutputStore({ workDir, durableFileSystem: failingDirectorySyncFileSystem(workDir, 2) });
     const stdout = new PassThrough();
     let terminated = 0;
-    const event = (text: string) => `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], usage: evidenceUsage, stopReason: "stop" } })}\n`;
     const client = new RpcRunClient({
       launchTransport: async () => ({
         stdin: new PassThrough(), stdout, stderr: new PassThrough(), exited: new Promise(() => {}),
         terminate: () => { terminated++; },
       }),
       outputStore,
-      uiForwarder: new UIForwarder({ hasUI: false, ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {} } }),
+      uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
       runAttemptId: createRunAttemptId(),
     });
     await client.start();
     client.bindRun(runId);
     const dispatchData = stdout.listeners("data")[0] as (chunk: Buffer) => void;
-    outputStore.onDiscard = () => dispatchData(Buffer.from(event("re-entered")));
+    outputStore.onDiscard = () => dispatchData(Buffer.from(messageEndEvent("re-entered")));
 
-    stdout.write(event("first"));
+    stdout.write(messageEndEvent("first"));
     await expect(client.waitSettled()).resolves.toMatchObject({ reason: "process_exited" });
     await client.shutdown();
 
@@ -768,7 +768,10 @@ describe("RpcRunClient", () => {
     const calls: string[] = [];
     let terminated = false;
     const forwarder = new UIForwarder({ hasUI: true, ui: {
-      select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined,
+      select: async () => undefined,
+      confirm: async () => false,
+      input: async () => undefined,
+      editor: async () => undefined,
       notify: () => calls.push("notify"), setStatus: () => calls.push("status"), setWidget: () => calls.push("widget"),
     } });
     const client = new RpcRunClient({
