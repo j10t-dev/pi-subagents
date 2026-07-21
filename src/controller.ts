@@ -15,20 +15,29 @@ import {
   type SessionEntryId,
   type SessionPath,
   type ContainmentReceiptPath,
-  type AbsolutePath,
   type RunAttemptId,
-  type VerifiedContainmentReceiptPath,
   verifiedContainmentReceiptPath,
   isPublicPreflightError,
 } from "./domain.ts";
 import type { EffectiveChildSelection } from "./child-selection.ts";
 import { RunController, classifyTerminal, type RunRecord, type RunRuntime, type Settlement, type StopResult } from "./run-controller.ts";
-import { foldAgentEvents, type AgentEventAppender, type RestoredAgentRecord } from "./persistence.ts";
+import { foldAgentEvents, type RestoredAgentRecord } from "./persistence.ts";
 import type { RpcRunClient } from "./rpc-client.ts";
 import { classifyAssignmentEntries } from "./assignment-identity.ts";
 import { delayWithAbort, waitWithAbort } from "./async-primitives.ts";
 import { ASSIGNMENT_IDENTITY_POLL_MS, ASSIGNMENT_IDENTITY_TIMEOUT_MS } from "./constants.ts";
 import type { ContainmentDescriptor } from "./containment.ts";
+import {
+  RestorationApplicationError,
+  applyRestoration,
+  collectRestorationEvidence,
+  planRestoration,
+  type RestorationContainmentDecision,
+  type RestorationPort,
+  type RestoredTerminalObligation,
+  type StagedRestorePlan,
+} from "./restoration.ts";
+export type { RestorationContainmentDecision, RestorationPort } from "./restoration.ts";
 
 export interface SpawnAgentRequest { task: string; model?: string; cwd?: string; tools?: string[] }
 
@@ -120,32 +129,6 @@ export interface ParentLifecyclePort {
   warn?(message: string): void;
 }
 
-export type RestorationContainmentDecision =
-  | { kind: "contained"; receipt: VerifiedContainmentReceiptPath }
-  | { kind: "requires-containment"; runtime: RunRuntime }
-  | { kind: "unresolved-historical"; runtime: RunRuntime };
-
-export interface RestorationPort {
-  /** Parent branch state root used to contain every restored durable path. */
-  stateRoot: AbsolutePath;
-  getBranch(): readonly { type: string; customType?: string; data?: unknown }[];
-  resolveContainment(input: {
-    attemptId: RunAttemptId;
-    receiptPath: ContainmentReceiptPath;
-    descriptor?: ContainmentDescriptor;
-    eventVersion: 1 | 2;
-  }): Promise<RestorationContainmentDecision>;
-  firstUserEntryAfter(sessionPath: SessionPath, cursor: SessionEntryId | null): Promise<RunId | undefined>;
-  finaliseContained(
-    record: RestoredAgentRecord,
-    runId: RunId,
-    settlement:
-      | { kind: "interrupted" }
-      | { kind: "cancelled"; reason: CancellationReason },
-  ): Promise<AgentCompletion>;
-  appender: AgentEventAppender;
-}
-
 export interface SubagentControllerOptions {
   capacity?: number;
   completions?: CompletionService;
@@ -156,38 +139,6 @@ export interface SubagentControllerOptions {
   onStatusChange?: () => void;
   identityDeadline?: () => AbortSignal;
   identityDelay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
-}
-
-interface RestoredCompletionIntent {
-  readonly type: "completed";
-  readonly record: RestoredAgentRecord;
-  readonly runId: RunId;
-  readonly settlement:
-    | { kind: "interrupted" }
-    | { kind: "cancelled"; reason: CancellationReason };
-}
-
-interface RestoredFinalisationObligation {
-  readonly kind: "finalise";
-  readonly record: RestoredAgentRecord;
-  readonly settlement:
-    | { kind: "interrupted" }
-    | { kind: "cancelled"; reason: CancellationReason };
-  readonly start?: { runId: RunId; attemptId: RunAttemptId };
-}
-
-interface RestoredCompletionObligation {
-  readonly kind: "restore-completion";
-  readonly record: RestoredAgentRecord;
-}
-
-type RestoredTerminalObligation = RestoredFinalisationObligation | RestoredCompletionObligation;
-
-interface StagedRestorePlan {
-  readonly restored: RestoredAgentRecord[];
-  readonly runtimeRecords: readonly RunRecord[];
-  readonly durableWrites: readonly RestoredCompletionIntent[];
-  readonly obligations: ReadonlyMap<AgentId, RestoredTerminalObligation>;
 }
 
 interface ControllerOperation {
@@ -396,191 +347,37 @@ export class SubagentController {
       if (plan === undefined) {
         const folded = foldAgentEvents(this.restoration.getBranch(), this.restoration.stateRoot);
         for (const diagnostic of folded.invalidEvents) this.parent?.warn?.(diagnostic);
-        const restored: RestoredAgentRecord[] = [];
-        const intents: RestoredCompletionIntent[] = [];
-        const obligations = new Map<AgentId, RestoredTerminalObligation>();
-        const containmentDecisions = new Map<string, Promise<RestorationContainmentDecision>>();
-        const runtimes = new Map<AgentId, RunRuntime>();
-        const historical = new Set<AgentId>();
-        const resolveContainment = async (input: {
-          path: ContainmentReceiptPath | undefined;
-          attemptId: RunAttemptId | undefined;
-          descriptor?: ContainmentDescriptor;
-          eventVersion: 1 | 2;
-        }): Promise<{ contained: boolean; decision: RestorationContainmentDecision }> => {
-          if (input.path === undefined || input.attemptId === undefined) {
-            return { contained: false, decision: { kind: "requires-containment", runtime: unavailableRuntime() } };
-          }
-          const key = `${input.path}\0${input.attemptId}\0${input.eventVersion}\0${input.descriptor?.scopePath ?? ""}`;
-          let pending = containmentDecisions.get(key);
-          if (pending === undefined) {
-            pending = this.restoration!.resolveContainment({
-              attemptId: input.attemptId,
-              receiptPath: input.path,
-              ...(input.descriptor === undefined ? {} : { descriptor: input.descriptor }),
-              eventVersion: input.eventVersion,
-            });
-            containmentDecisions.set(key, pending);
-          }
-          let decision: RestorationContainmentDecision;
-          try { decision = await pending; }
-          catch { decision = { kind: "requires-containment", runtime: unavailableRuntime() }; }
-          if (decision.kind === "contained") return { contained: true, decision };
-          if (decision.kind === "unresolved-historical") return { contained: false, decision };
-          try {
-            await decision.runtime.contain();
-            return { contained: true, decision };
-          } catch {
-            return { contained: false, decision };
-          }
-        };
-
-        for (const record of folded.agents.values()) {
-          const activeInput = record.pendingLaunch !== undefined
-            ? {
-                path: record.pendingLaunch.containmentReceiptPath,
-                attemptId: record.pendingLaunch.attemptId,
-                ...("containment" in record.pendingLaunch ? { descriptor: record.pendingLaunch.containment } : {}),
-                eventVersion: record.pendingLaunchEventVersion ?? 1,
-              }
-            : record.currentAttemptId !== undefined
-              ? {
-                  path: record.currentReceiptPath,
-                  attemptId: record.currentAttemptId,
-                  ...(record.currentContainment === undefined ? {} : { descriptor: record.currentContainment }),
-                  eventVersion: record.currentEventVersion ?? 1,
-                }
-              : {
-                  path: record.latestCompletionReceiptPath,
-                  attemptId: record.latestCompletionAttemptId,
-                  ...(record.latestCompletionContainment === undefined ? {} : { descriptor: record.latestCompletionContainment }),
-                  eventVersion: record.latestCompletionEventVersion ?? 1,
-                };
-          const resolution = await resolveContainment(activeInput);
-          if (resolution.decision.kind === "contained") {
-            const receipt = resolution.decision.receipt;
-            runtimes.set(record.agentId, { abort: async () => {}, contain: async () => receipt });
-          } else {
-            runtimes.set(record.agentId, resolution.decision.runtime);
-            if (resolution.decision.kind === "unresolved-historical") historical.add(record.agentId);
-          }
-          let candidate = record;
-          if (record.latestCompletion !== undefined && !resolution.contained) candidate = withoutLatestCompletion(record);
-          const contained = resolution.contained;
-          if (record.pendingLaunch !== undefined && contained) {
-            const settlement = { kind: "interrupted" as const };
-            let nativeRunId: RunId | undefined;
-            try { nativeRunId = await this.restoration.firstUserEntryAfter(record.sessionPath, record.pendingLaunch.previousLeafId); }
-            catch {
-              this.warnContainment(record.agentId);
-              restored.push(asUncontained(candidate));
-              obligations.set(record.agentId, { kind: "finalise", record, settlement });
-              continue;
-            }
-            if (nativeRunId === undefined) {
-              restored.push(asStopped(candidate));
-            } else {
-              const active = asActiveRestored(record, nativeRunId, AgentState.Settling);
-              restored.push(active);
-              intents.push({ type: "completed", record, runId: nativeRunId, settlement });
-              obligations.set(record.agentId, { kind: "finalise", record, settlement, start: { runId: nativeRunId, attemptId: record.pendingLaunch.attemptId } });
-            }
-          } else if (record.pendingLaunch !== undefined) {
-            this.warnContainment(record.agentId);
-            restored.push(asUncontained(candidate));
-            obligations.set(record.agentId, { kind: "finalise", record, settlement: { kind: "interrupted" } });
-          } else if (record.state === AgentState.Running && record.currentRunId !== undefined) {
-            const settlement = { kind: "interrupted" as const };
-            const active = asActiveRestored(record, record.currentRunId, AgentState.Settling);
-            restored.push(active);
-            obligations.set(record.agentId, { kind: "finalise", record, settlement });
-            if (contained) intents.push({ type: "completed", record, runId: record.currentRunId, settlement });
-            else this.warnContainment(record.agentId);
-          } else if (record.state === AgentState.Stopping && record.currentRunId !== undefined) {
-            const settlement = { kind: "cancelled" as const, reason: record.pendingStopReason ?? CancellationReason.StopRequested };
-            const active = asActiveRestored(record, record.currentRunId, AgentState.Stopping);
-            restored.push(active);
-            obligations.set(record.agentId, { kind: "finalise", record, settlement });
-            if (contained) intents.push({ type: "completed", record, runId: record.currentRunId, settlement });
-            else this.warnContainment(record.agentId);
-          } else if (record.state === AgentState.Stopped && record.latestCompletion !== undefined && candidate.latestCompletion !== undefined) {
-            restored.push(candidate);
-          } else if (record.state === AgentState.Stopped && record.latestCompletion !== undefined) {
-            this.warnContainment(record.agentId);
-            restored.push(asUncontained(candidate));
-            obligations.set(record.agentId, { kind: "restore-completion", record });
-            if (activeInput.path !== undefined && activeInput.attemptId !== undefined) {
-              runtimes.set(record.agentId, this.completedRestorationRuntime({
-                attemptId: activeInput.attemptId,
-                receiptPath: activeInput.path,
-                ...(activeInput.descriptor === undefined ? {} : { descriptor: activeInput.descriptor }),
-                eventVersion: activeInput.eventVersion,
-              }));
-            }
-          } else if (record.state === AgentState.Stopped) {
-            restored.push(record);
-          } else {
-            this.warnContainment(record.agentId);
-            restored.push(asUncontained(candidate));
-          }
-        }
-
-        const runtimeRecords = restored.map((record) => {
-          const runtime = record.state === AgentState.Stopped ? undefined : runtimes.get(record.agentId);
-          const preNative = record.pendingLaunch !== undefined && record.currentRunId === undefined && record.state !== AgentState.Stopped;
-          const responsibility = historical.has(record.agentId) ? "historical-unresolved" as const : preNative ? "pre-native" as const : undefined;
-          return { agentId: record.agentId, state: record.state, transcriptPath: record.sessionPath,
-            ...(record.currentRunId ? { runId: record.currentRunId } : {}),
-            ...(runtime === undefined ? {} : { runtime }),
-            ...(responsibility === undefined ? {} : { containmentResponsibility: responsibility }),
-            ...(preNative && obligations.has(record.agentId) ? { restoredTerminalObligation: true as const } : {}) };
-        });
-        plan = { restored, runtimeRecords, durableWrites: intents, obligations };
+        const evidence = await collectRestorationEvidence(
+          folded,
+          this.restoration,
+          (input) => this.completedRestorationRuntime(input),
+        );
+        plan = planRestoration(folded, evidence);
+        for (const agentIdValue of plan.warnings) this.warnContainment(agentIdValue);
         this.stagedRestorePlan = plan;
       }
 
-      try { admission.reserve(plan.runtimeRecords); }
-      catch (error) { this.stagedRestorePlan = undefined; throw error; }
-
+      let restored: readonly RestoredAgentRecord[];
       try {
-        for (const obligation of plan.obligations.values()) {
-          if (obligation.kind === "finalise" && obligation.start !== undefined) {
-            await this.appendRestoredRunStarted(obligation.record.agentId, obligation.start.runId, obligation.start.attemptId);
-          }
-        }
-        for (const intent of plan.durableWrites) {
-          const completion = await this.restoration.finaliseContained(intent.record, intent.runId, intent.settlement);
-          this.durableCompletions.set(agentRunKey(intent.record.agentId, intent.runId), completion);
-        }
-        for (const intent of plan.durableWrites) {
-          const completion = this.durableCompletions.get(agentRunKey(intent.record.agentId, intent.runId));
-          if (completion === undefined) throw new Error("invalid_state: restored durable completion unavailable");
-          await this.restoration.appender.appendRunCompleted(completion);
-        }
-        for (const intent of plan.durableWrites) {
-          const completion = this.durableCompletions.get(agentRunKey(intent.record.agentId, intent.runId));
-          if (completion === undefined) throw new Error("invalid_state: restored durable completion unavailable");
-          const stopped = asStopped(intent.record, completion);
-          const index = plan.restored.findIndex((record) => record.agentId === intent.record.agentId);
-          if (index >= 0) plan.restored[index] = stopped;
-          admission.replace({ agentId: stopped.agentId, state: AgentState.Stopped, transcriptPath: stopped.sessionPath });
-        }
-        for (const record of plan.restored) {
-          const obligation = plan.obligations.get(record.agentId);
-          if (record.state !== AgentState.Stopped && obligation !== undefined) this.restoredRecords.set(record.agentId, obligation);
-        }
-        admission.commit();
+        restored = await applyRestoration(plan, admission, this.restoration, {
+          durableCompletions: this.durableCompletions,
+          restoredStartedAppends: this.restoredStartedAppends,
+          restoredRecords: this.restoredRecords,
+        });
       } catch (error) {
-        for (const [agentIdValue, obligation] of plan.obligations) this.restoredRecords.set(agentIdValue, obligation);
-        admission.commit();
-        this.restorationApplied = true;
+        if (!(error instanceof RestorationApplicationError)) {
+          this.stagedRestorePlan = undefined;
+          throw error;
+        }
+        if (!error.admissionCommitted) throw error.cause;
         this.stagedRestorePlan = undefined;
-        const failedRestore = this.completions.restore(plan.restored.map(completionInventory));
+        this.restorationApplied = true;
+        const failedRestore = this.completions.restore(error.restored.map(completionInventory));
         this.restorationBackPingCount = failedRestore.backPingCount;
-        throw error;
+        throw error.cause;
       }
 
-      const result = this.completions.restore(plan.restored.map(completionInventory));
+      const result = this.completions.restore(restored.map(completionInventory));
       this.restorationBackPingCount = result.backPingCount;
       this.restorationApplied = true;
       this.stagedRestorePlan = undefined;
@@ -900,29 +697,6 @@ function completionInventory(record: RestoredAgentRecord) {
   return { agentId: record.agentId, state: record.state, sessionPath: record.sessionPath,
     ...(record.currentRunId ? { currentRunId: record.currentRunId } : {}),
     ...(record.latestCompletion ? { latestCompletion: record.latestCompletion } : {}) };
-}
-
-function asActiveRestored(
-  record: RestoredAgentRecord,
-  runId: RunId,
-  state: typeof AgentState.Settling | typeof AgentState.Stopping,
-): RestoredAgentRecord {
-  const { latestCompletion: _completion, ...rest } = record;
-  return { ...rest, state, currentRunId: runId };
-}
-
-function asStopped(record: RestoredAgentRecord, latestCompletion?: AgentCompletion): RestoredAgentRecord {
-  const { currentRunId: _run, pendingLaunch: _launch, pendingStopReason: _reason, ...durable } = record;
-  return { ...durable, state: AgentState.Stopped, ...(latestCompletion === undefined ? {} : { latestCompletion }) };
-}
-
-function asUncontained(record: RestoredAgentRecord): RestoredAgentRecord {
-  return { ...record, state: record.state === AgentState.Stopping || record.pendingLaunch !== undefined ? AgentState.Stopping : AgentState.Settling };
-}
-
-function withoutLatestCompletion(record: RestoredAgentRecord): RestoredAgentRecord {
-  const { latestCompletion: _completion, latestCompletionAttemptId: _attempt, latestCompletionReceiptPath: _receipt, ...rest } = record;
-  return rest;
 }
 
 function publicError(error: unknown, fallbackCode: AgentErrorCode): Error {

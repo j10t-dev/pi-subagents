@@ -2,13 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { AgentErrorCode, AgentState, CompletionState, CodedError, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8, verifiedContainmentReceiptPath } from "../src/domain.ts";
 import { diagnosticsPath } from "../src/paths.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PreparationScope } from "../src/controller.ts";
-import type { RunRuntime } from "../src/run-controller.ts";
+import type { RestoreAdmission, RunRuntime } from "../src/run-controller.ts";
 import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testEntryId, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
 import { completedCompletion } from "./support/messages.ts";
 import { launchSession, runningTransport, testRuntime } from "./support/launches.ts";
 import { deferred } from "./support/async.ts";
 import { testBarrier } from "./support/barriers.ts";
-import { testRestorationPort } from "./support/restoration.ts";
+import { restoreRuns } from "./support/controllers.ts";
+import { launchEntry, spawnedEntry, testRestorationPort } from "./support/restoration.ts";
 
 /** Post-native-identity seams, each of which must own settlement against a stop/shutdown contender. */
 const postIdentitySeams = ["bindRun", "persistRunStarted", "waitSettled"] as const;
@@ -43,7 +44,7 @@ describe("parent lifecycle wiring", () => {
         },
       },
     });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/shutdown-complete"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/shutdown-complete"),
       runtime: { abort: async () => {}, contain: async () => { containments++; return testVerifiedReceiptPath("/tmp/pi-subagents-test/shutdown-complete.receipt"); } } }]);
 
     await expect(c.shutdown()).rejects.toThrow("cleanup failed");
@@ -63,7 +64,7 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownComplete: async () => { cleanups++; },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/shutdown-complete-retained"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/shutdown-complete-retained"),
       runtime: { abort: async () => {}, contain: async () => { throw new Error("still populated"); } } }]);
 
     await expect(c.shutdown()).rejects.toThrow("containment_failed:");
@@ -132,6 +133,49 @@ describe("parent lifecycle wiring", () => {
     expect((failure as CodedError).code).toBe(AgentErrorCode.InvalidAgent);
     expect(String((failure as CodedError).diagnosticsPath)).toBe("/tmp/send-prepare-coded.log");
     expect((failure as CodedError).message).toBe("invalid_agent: unknown or unowned agent");
+  });
+
+  test("rollback replacement failure releases uncommitted admission and retries without marking restoration applied", async () => {
+    const firstAgent = testAgentId("restore-rollback-a");
+    const secondAgent = testAgentId("restore-rollback-b");
+    const original = new Error("second replacement unavailable");
+    const recovery = new Error("rollback replacement unavailable");
+    let admissions = 0;
+    let commits = 0;
+    let releases = 0;
+    let branchReads = 0;
+    const c = new SubagentController({ restoration: testRestorationPort({
+      getBranch: () => {
+        branchReads++;
+        return [
+          spawnedEntry({ agentId: firstAgent, sessionPath: testSessionPath("/tmp/pi-subagents-test/restore-rollback-a.jsonl") }, 1),
+          launchEntry({ agentId: firstAgent, attemptId: testAttemptId("restore-rollback-a") }, 1),
+          spawnedEntry({ agentId: secondAgent, sessionPath: testSessionPath("/tmp/pi-subagents-test/restore-rollback-b.jsonl") }, 1),
+          launchEntry({ agentId: secondAgent, attemptId: testAttemptId("restore-rollback-b") }, 1),
+        ];
+      },
+      firstUserEntryAfter: async (path) => String(path).includes("rollback-b") ? testRunId("feedface") : testRunId("cafebabe"),
+    }) });
+    c.runs.beginRestore = async (): Promise<RestoreAdmission> => {
+      const thisAdmission = ++admissions;
+      return {
+        reserve: () => {},
+        replace: (record) => {
+          if (thisAdmission !== 1) return;
+          if (record.agentId === secondAgent && record.state === AgentState.Stopped) throw original;
+          if (record.agentId === firstAgent && record.state !== AgentState.Stopped) throw recovery;
+        },
+        commit: () => { commits++; },
+        release: () => { releases++; },
+      };
+    };
+
+    const firstError = await c.restore().catch((error: unknown) => error);
+    expect(firstError).toBe(original);
+    expect({ admissions, commits, releases, branchReads }).toEqual({ admissions: 1, commits: 0, releases: 1, branchReads: 1 });
+
+    await expect(c.restore()).resolves.toBeUndefined();
+    expect({ admissions, commits, releases, branchReads }).toEqual({ admissions: 2, commits: 1, releases: 2, branchReads: 1 });
   });
 
   test("restore waits for preparation admitted before RunController launch admission", async () => {
@@ -421,7 +465,7 @@ describe("parent lifecycle wiring", () => {
       },
       prepareSend: async () => { throw new Error("unused"); },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/closed-before-spawn"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/closed-before-spawn"),
       runtime: { abort: async () => {}, contain: async () => { await containing.enterAndWait(); return testVerifiedReceiptPath("/tmp/pi-subagents-test/closed-before-spawn.receipt"); } } }]);
 
     const shuttingDown = c.shutdown();
@@ -475,7 +519,7 @@ describe("parent lifecycle wiring", () => {
         return { session: surrenderSession("closed-before-send"), createLaunch: async () => { counters.createLaunch++; throw new Error("must not launch"); } };
       },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/closed-before-send"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/closed-before-send"),
       runtime: { abort: async () => {}, contain: async () => { await containing.enterAndWait(); return testVerifiedReceiptPath("/tmp/pi-subagents-test/closed-before-send.receipt"); } } }]);
     c.runs.register({ agentId: idle, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/idle-before-send") });
 
@@ -551,7 +595,7 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { trace.push("shutdownStart"); },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-order"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-order"),
       runtime: { abort: async () => { trace.push("abort"); }, contain: async () => { trace.push("contain"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-order.receipt"); } } }]);
 
     await c.shutdown();
@@ -568,7 +612,7 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { starts++; },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-concurrent"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-concurrent"),
       runtime: { abort: async () => {}, contain: async () => { await contain.promise; return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-concurrent.receipt"); } } }]);
 
     const first = c.shutdown();
@@ -589,7 +633,7 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { starts++; },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-retry"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-retry"),
       runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("still alive"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-retry.receipt"); } } }]);
 
     await expect(c.shutdown()).rejects.toThrow("containment_failed:");
@@ -607,7 +651,7 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       shutdownStart: () => { trace.push("shutdownStart"); throw new Error("UI cleanup failed"); },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-throws"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/hook-throws"),
       runtime: { abort: async () => { trace.push("abort"); }, contain: async () => { trace.push("contain"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/hook-throws.receipt"); } } }]);
 
     await expect(c.shutdown()).resolves.toBeUndefined();
@@ -636,7 +680,7 @@ describe("parent lifecycle wiring", () => {
     let containments = 0;
     const id = agentId("shutdown-retry");
     const c = new SubagentController({ capacity: 1 });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/retry"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/retry"),
       runtime: { abort: async () => {}, contain: async () => { if (++containments === 1) throw new Error("raw containment detail"); return testVerifiedReceiptPath("/tmp/pi-subagents-test/retry.receipt"); } } }]);
 
     const first = c.shutdown();
@@ -658,7 +702,7 @@ describe("parent lifecycle wiring", () => {
     const gate = deferred<void>();
     let rejected = false;
     const c = new SubagentController({ capacity: 2 });
-    c.runs.restore([
+    await restoreRuns(c.runs, [
       { agentId: agentId("shutdown-fails"), runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/fails"),
         runtime: { abort: async () => {}, contain: async () => { throw new Error("raw failure"); } } },
       { agentId: agentId("shutdown-waits"), runId: runId("cafebabe"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/waits"),
@@ -684,7 +728,7 @@ describe("parent lifecycle wiring", () => {
         return { agentId: record.agentId, runId: record.runId!, state: CompletionState.Cancelled, reason: "parent_shutdown" as const, output: truncateUtf8("", 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/result.md"), transcriptPath: record.transcriptPath };
       },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/terminal"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/terminal"),
       runtime: testRuntime({ contain: async () => testVerifiedReceiptPath("/tmp/pi-subagents-test/terminal.receipt") }) }]);
 
     await expect(c.shutdown()).rejects.toThrow("terminal_persistence_failed: child was contained but its terminal record could not be persisted");
@@ -703,7 +747,7 @@ describe("parent lifecycle wiring", () => {
       prepareSend: async () => { throw new Error("unused"); },
       finaliseRun: async () => { throw new Error("raw append detail"); },
     } });
-    c.runs.restore([{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/terminal-code"),
+    await restoreRuns(c.runs, [{ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/terminal-code"),
       runtime: { abort: async () => {}, contain: async () => { containments++; return testVerifiedReceiptPath("/tmp/pi-subagents-test/terminal-code.receipt"); } } }]);
 
     const outcome = await c.stop(id);
@@ -1323,7 +1367,7 @@ describe("parent lifecycle wiring", () => {
   test("tree blocks active ownership and switch/fork warn", async () => {
     const warnings: string[] = [];
     const c = new SubagentController({ parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => { warnings.push(message); } } });
-    c.runs.restore([{ agentId: agentId("a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: runId("deadbeef") }]);
+    await restoreRuns(c.runs, [{ agentId: agentId("a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: runId("deadbeef") }]);
     expect(c.beforeTree()).toBeFalse();
     expect(c.beforeSwitch()).toBeTrue();
     expect(c.beforeFork()).toBeTrue();

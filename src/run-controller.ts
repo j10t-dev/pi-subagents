@@ -294,28 +294,6 @@ export class RunController {
     }
   }
 
-  restore(records: Iterable<RunRecord>): void {
-    const restored = [...records];
-    this.preflightRestore(restored);
-
-    const inserted: LiveRecord[] = [];
-    try {
-      for (const record of restored) {
-        const live: LiveRecord = { ...record, mutex: new Mutex() };
-        if (record.containmentResponsibility !== undefined && record.runId === undefined) live.preRunContainment = true;
-        if (record.state !== AgentState.Stopped) live.reservation = this.semaphore.acquireInherited();
-        this.agents.set(record.agentId, live);
-        inserted.push(live);
-      }
-    } catch (error) {
-      for (const live of inserted) {
-        this.agents.delete(live.agentId);
-        live.reservation?.release();
-      }
-      throw error;
-    }
-  }
-
   preflightRestore(records: Iterable<RunRecord>): void {
     const restoredIds = new Set<AgentId>();
     for (const record of records) {

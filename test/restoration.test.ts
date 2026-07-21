@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { AgentEventAppender } from "../src/persistence.ts";
+import { AgentEventAppender, foldAgentEvents } from "../src/persistence.ts";
+import {
+  RestorationApplicationError,
+  applyRestoration,
+  collectRestorationEvidence,
+  planRestoration,
+  type RestorationApplicationState,
+} from "../src/restoration.ts";
+import type { RestoreAdmission } from "../src/run-controller.ts";
 import { firstUserEntryAfterCursor } from "../src/pi-composition.ts";
 import { SubagentController, type RestorationPort } from "../src/controller.ts";
 import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testMilliseconds, testModelSpec, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
@@ -8,7 +16,422 @@ import { testBarrier } from "./support/barriers.ts";
 import { testRuntime } from "./support/launches.ts";
 import { completedEntry, launchEntry, spawnedEntry, startedEntry, stoppingEntry, testRestorationPort, type RestorationEventEntry } from "./support/restoration.ts";
 import { completedCompletion } from "./support/messages.ts";
-import { AgentEventType, CancellationReason, CompletionState, agentId, runId, truncateUtf8 } from "../src/domain.ts";
+import { AgentEventType, AgentState, CancellationReason, CompletionState, agentRunKey, truncateUtf8 } from "../src/domain.ts";
+
+describe("restoration evidence collection", () => {
+  test("a stopped agent without an action performs no containment or session lookup", async () => {
+    let resolutions = 0;
+    let lookups = 0;
+    const evidence = await collectRestorationEvidence(
+      foldAgentEvents([spawned()], "/tmp"),
+      testRestorationPort({
+        resolveContainment: async () => { resolutions++; throw new Error("must not resolve"); },
+        firstUserEntryAfter: async () => { lookups++; throw new Error("must not look up"); },
+      }),
+      () => testRuntime(),
+    );
+
+    expect(evidence.size).toBe(0);
+    expect({ resolutions, lookups }).toEqual({ resolutions: 0, lookups: 0 });
+  });
+
+  test("identical actions share one complete containment decision", async () => {
+    const registry = foldAgentEvents([spawned(), launch()], "/tmp");
+    const action = registry.actions[0]!;
+    const secondAgent = testAgentId("agent-b");
+    const secondRecord = { ...registry.agents.get(action.agentId)!, agentId: secondAgent };
+    registry.agents.set(secondAgent, secondRecord);
+    registry.actions.push({ ...action, agentId: secondAgent });
+    let resolutions = 0;
+    let containments = 0;
+    const evidence = await collectRestorationEvidence(registry, testRestorationPort({
+      resolveContainment: async () => {
+        resolutions++;
+        return { kind: "requires-containment", runtime: testRuntime({ contain: async () => {
+          containments++;
+          return testVerifiedReceiptPath();
+        } }) };
+      },
+    }), () => testRuntime());
+
+    expect({ resolutions, containments }).toEqual({ resolutions: 1, containments: 1 });
+    expect(evidence.get(action.agentId)?.containment.kind).toBe("contained");
+    expect(evidence.get(secondAgent)?.containment.kind).toBe("contained");
+  });
+
+  test("requires-containment contains once and preserves its runtime after success", async () => {
+    const registry = foldAgentEvents([spawned(), launch(), started()], "/tmp");
+    let containments = 0;
+    const runtime = testRuntime({ contain: async () => {
+      containments++;
+      return testVerifiedReceiptPath();
+    } });
+    const evidence = await collectRestorationEvidence(registry, testRestorationPort({
+      resolveContainment: async () => ({ kind: "requires-containment", runtime }),
+    }), () => testRuntime());
+
+    expect(containments).toBe(1);
+    expect(evidence.get(testAgentId())?.containment).toEqual({ kind: "contained", runtime });
+  });
+
+  test("resolver and containment errors become uncontained evidence", async () => {
+    const registry = foldAgentEvents([spawned(), launch(), started()], "/tmp");
+    const action = registry.actions[0]!;
+    const secondAgent = testAgentId("agent-b");
+    registry.agents.set(secondAgent, { ...registry.agents.get(action.agentId)!, agentId: secondAgent });
+    registry.actions.push({ ...action, agentId: secondAgent, attemptId: testAttemptId("other") });
+    const evidence = await collectRestorationEvidence(registry, testRestorationPort({
+      resolveContainment: async (input) => input.attemptId === testAttemptId("other")
+        ? { kind: "requires-containment", runtime: testRuntime({ contain: async () => { throw new Error("containment failed"); } }) }
+        : Promise.reject(new Error("resolver failed")),
+    }), () => testRuntime());
+
+    expect(evidence.get(action.agentId)?.containment.kind).toBe("uncontained");
+    expect(evidence.get(secondAgent)?.containment.kind).toBe("uncontained");
+  });
+
+  test("historical decisions stay distinct without containment", async () => {
+    const registry = foldAgentEvents([spawned(), launch(), started()], "/tmp");
+    let containments = 0;
+    const runtime = testRuntime({ contain: async () => { containments++; return testVerifiedReceiptPath(); } });
+    const evidence = await collectRestorationEvidence(registry, testRestorationPort({
+      resolveContainment: async () => ({ kind: "unresolved-historical", runtime }),
+    }), () => testRuntime());
+
+    expect(evidence.get(testAgentId())?.containment).toEqual({ kind: "historical-unresolved", runtime });
+    expect(containments).toBe(0);
+  });
+
+  test("completed-receipt failure uses completed runtime for retry", async () => {
+    const registry = foldAgentEvents([spawned(), launch(), started(), completed()], "/tmp");
+    const retryRuntime = testRuntime();
+    let completedInputs = 0;
+    const evidence = await collectRestorationEvidence(registry, testRestorationPort({
+      resolveContainment: async () => ({ kind: "requires-containment", runtime: testRuntime({ contain: async () => { throw new Error("invalid receipt"); } }) }),
+    }), () => { completedInputs++; return retryRuntime; });
+
+    expect(completedInputs).toBe(1);
+    expect(evidence.get(testAgentId())?.containment).toEqual({ kind: "uncontained", runtime: retryRuntime });
+  });
+
+  test("historically unresolved completed receipts use the re-resolving completed runtime", async () => {
+    const registry = foldAgentEvents([spawned(), launch(), started(), completed()], "/tmp");
+    const retryRuntime = testRuntime();
+    const evidence = await collectRestorationEvidence(registry, testRestorationPort({
+      resolveContainment: async () => ({ kind: "unresolved-historical", runtime: testRuntime() }),
+    }), () => retryRuntime);
+
+    expect(evidence.get(testAgentId())?.containment).toEqual({ kind: "historical-unresolved", runtime: retryRuntime });
+  });
+
+  test("only contained launches look up their cursor and convert lookup outcomes", async () => {
+    const registry = foldAgentEvents([spawned(), launch()], "/tmp");
+    const action = registry.actions[0]!;
+    if (action.type !== "reconcile_launch") throw new Error("expected launch action");
+    const noRunAgent = testAgentId("agent-b");
+    const failedAgent = testAgentId("agent-c");
+    const uncontainedAgent = testAgentId("agent-d");
+    for (const agentIdValue of [noRunAgent, failedAgent, uncontainedAgent]) {
+      registry.agents.set(agentIdValue, { ...registry.agents.get(action.agentId)!, agentId: agentIdValue });
+      registry.actions.push({ ...action, agentId: agentIdValue, ...(agentIdValue === uncontainedAgent ? { attemptId: testAttemptId("blocked") } : {}) });
+    }
+    const lookups: string[] = [];
+    const evidence = await collectRestorationEvidence(registry, testRestorationPort({
+      resolveContainment: async (input) => input.attemptId === testAttemptId("blocked")
+        ? { kind: "requires-containment", runtime: testRuntime({ contain: async () => { throw new Error("blocked"); } }) }
+        : { kind: "contained", receipt: testVerifiedReceiptPath() },
+      firstUserEntryAfter: async (path, cursor) => {
+        lookups.push(`${path}:${cursor}`);
+        if (lookups.length === 1) return testRunId("cafebabe");
+        if (lookups.length === 2) return undefined;
+        throw new Error("session unavailable");
+      },
+    }), () => testRuntime());
+
+    expect(evidence.get(uncontainedAgent)?.containment.kind).toBe("uncontained");
+    expect(lookups).toEqual([
+      `${registry.agents.get(action.agentId)!.sessionPath}:${action.previousLeafId}`,
+      `${registry.agents.get(noRunAgent)!.sessionPath}:${action.previousLeafId}`,
+      `${registry.agents.get(failedAgent)!.sessionPath}:${action.previousLeafId}`,
+    ]);
+    expect(evidence.get(action.agentId)?.launchIdentity).toEqual({ kind: "run-found", runId: testRunId("cafebabe") });
+    expect(evidence.get(noRunAgent)?.launchIdentity).toEqual({ kind: "no-run" });
+    expect(evidence.get(failedAgent)?.launchIdentity).toEqual({ kind: "lookup-failed" });
+  });
+});
+
+describe("restoration application", () => {
+  test("applies durable work in transactional order before committing stopped records", async () => {
+    const trace: string[] = [];
+    const { plan, port: basePort } = await applicationFixture();
+    const port = testRestorationPort({
+      ...basePort,
+      finaliseContained: async (_record, id) => {
+        trace.push("finalise:output");
+        return completedCompletion({ runId: id });
+      },
+      appender: new AgentEventAppender((_type, event) => {
+        trace.push((event as { eventType: AgentEventType }).eventType === AgentEventType.RunStarted ? "append:run-started" : "append:run-completed");
+      }),
+    });
+    const admission = tracedAdmission(trace);
+    const state = applicationState();
+
+    const restored = await applyRestoration(plan, admission, port, state);
+
+    expect(trace).toEqual([
+      "reserve",
+      "append:run-started",
+      "finalise:output",
+      "append:run-completed",
+      "replace:stopped",
+      "commit",
+    ]);
+    expect(restored).toMatchObject([{ state: AgentState.Stopped, latestCompletion: { runId: testRunId("cafebabe") } }]);
+    expect(state.durableCompletions.has(agentRunKey(testAgentId(), testRunId("cafebabe")))).toBeTrue();
+    expect(state.restoredRecords.size).toBe(0);
+  });
+
+  test("keeps batch durable phases non-interleaved and installs stopped ownership before commit", async () => {
+    const trace: string[] = [];
+    const { plan, port: basePort } = await multiApplicationFixture();
+    const port = testRestorationPort({
+      ...basePort,
+      finaliseContained: async (record, id) => {
+        trace.push(`finalise:${record.agentId}`);
+        return completedCompletion({ agentId: record.agentId, runId: id });
+      },
+      appender: new AgentEventAppender((_type, event) => {
+        const restoredEvent = event as { eventType: AgentEventType; payload: { agentId: string } };
+        trace.push(`${restoredEvent.eventType === AgentEventType.RunStarted ? "start" : "complete"}:${restoredEvent.payload.agentId}`);
+      }),
+    });
+    const restoredRecords = new Map(plan.obligations);
+    const remove = restoredRecords.delete.bind(restoredRecords);
+    restoredRecords.delete = (agentIdValue) => {
+      trace.push(`ownership:stopped:${agentIdValue}`);
+      return remove(agentIdValue);
+    };
+    const state: RestorationApplicationState = {
+      durableCompletions: new Map(),
+      restoredStartedAppends: new Set(),
+      restoredRecords,
+    };
+    const admission: RestoreAdmission = {
+      reserve: () => { trace.push("reserve"); },
+      replace: (record) => { trace.push(`replace:${record.agentId}`); },
+      commit: () => { trace.push("commit"); },
+      release: () => {},
+    };
+
+    await applyRestoration(plan, admission, port, state);
+
+    expect(trace).toEqual([
+      "reserve",
+      `start:${testAgentId()}`,
+      `start:${testAgentId("agent-b")}`,
+      `finalise:${testAgentId()}`,
+      `finalise:${testAgentId("agent-b")}`,
+      `complete:${testAgentId()}`,
+      `complete:${testAgentId("agent-b")}`,
+      `replace:${testAgentId()}`,
+      `replace:${testAgentId("agent-b")}`,
+      `ownership:stopped:${testAgentId()}`,
+      `ownership:stopped:${testAgentId("agent-b")}`,
+      "commit",
+    ]);
+    expect(restoredRecords.size).toBe(0);
+  });
+
+  test("a post-reserve failure commits every terminal obligation and reports the planned inventory", async () => {
+    const trace: string[] = [];
+    const failure = new Error("output unavailable");
+    const { plan, port: basePort } = await applicationFixture();
+    const port = testRestorationPort({
+      ...basePort,
+      finaliseContained: async () => { trace.push("finalise:output"); throw failure; },
+      appender: new AgentEventAppender((_type, event) => {
+        trace.push((event as { eventType: AgentEventType }).eventType === AgentEventType.RunStarted ? "append:run-started" : "append:run-completed");
+      }),
+    });
+    const state = applicationState();
+
+    const error = await applyRestoration(plan, tracedAdmission(trace), port, state).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(RestorationApplicationError);
+    expect((error as RestorationApplicationError).cause).toBe(failure);
+    expect((error as RestorationApplicationError).restored).toBe(plan.restored);
+    expect(trace).toEqual(["reserve", "append:run-started", "finalise:output", "commit"]);
+    expect([...state.restoredRecords.keys()]).toEqual([...plan.obligations.keys()]);
+  });
+
+  test("a RunStarted append failure retains the original record, capacity, and obligation", async () => {
+    const failure = new Error("start append unavailable");
+    const trace: string[] = [];
+    const { plan, port: basePort } = await applicationFixture();
+    const port = testRestorationPort({
+      ...basePort,
+      finaliseContained: async () => { throw new Error("must not finalise"); },
+      appender: new AgentEventAppender((_type, event) => {
+        trace.push((event as { eventType: AgentEventType }).eventType);
+        throw failure;
+      }),
+    });
+    let active = 0;
+    let committed: readonly { state: AgentState }[] = [];
+    const admission: RestoreAdmission = {
+      reserve: (records) => { active = [...records].filter((record) => record.state !== AgentState.Stopped).length; },
+      replace: () => { throw new Error("must not replace"); },
+      commit: () => { committed = plan.runtimeRecords; },
+      release: () => {},
+    };
+    const state = applicationState();
+
+    const error = await applyRestoration(plan, admission, port, state).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(RestorationApplicationError);
+    expect((error as RestorationApplicationError).cause).toBe(failure);
+    expect(trace).toEqual([AgentEventType.RunStarted]);
+    expect(active).toBe(1);
+    expect(committed).toBe(plan.runtimeRecords);
+    expect([...state.restoredRecords.keys()]).toEqual([...plan.obligations.keys()]);
+  });
+
+  test("a replacement failure rolls earlier replacements back before committing retained obligations", async () => {
+    const { plan, port } = await multiApplicationFixture();
+    const state = applicationState();
+    const failure = new Error("second replacement unavailable");
+    const staged = new Map<string, (typeof plan.runtimeRecords)[number]>();
+    const trace: string[] = [];
+    let active = 0;
+    let committed: readonly (typeof plan.runtimeRecords)[number][] = [];
+    const admission: RestoreAdmission = {
+      reserve: (records) => {
+        for (const record of records) staged.set(record.agentId, record);
+        active = [...staged.values()].filter((record) => record.state !== AgentState.Stopped).length;
+      },
+      replace: (record) => {
+        trace.push(`replace:${record.agentId}:${record.state}`);
+        if (record.agentId === testAgentId("agent-b") && record.state === AgentState.Stopped) throw failure;
+        const previous = staged.get(record.agentId)!;
+        if (previous.state !== AgentState.Stopped && record.state === AgentState.Stopped) active--;
+        if (previous.state === AgentState.Stopped && record.state !== AgentState.Stopped) active++;
+        staged.set(record.agentId, record);
+      },
+      commit: () => { trace.push("commit"); committed = [...staged.values()]; },
+      release: () => {},
+    };
+
+    const error = await applyRestoration(plan, admission, port, state).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(RestorationApplicationError);
+    expect((error as RestorationApplicationError).cause).toBe(failure);
+    expect(trace).toEqual([
+      `replace:${testAgentId()}:stopped`,
+      `replace:${testAgentId("agent-b")}:stopped`,
+      `replace:${testAgentId()}:settling`,
+      "commit",
+    ]);
+    expect(active).toBe(2);
+    expect(committed).toEqual(plan.runtimeRecords);
+    expect([...state.restoredRecords.keys()]).toEqual([...plan.obligations.keys()]);
+    expect(committed.every((record) => record.state !== AgentState.Stopped && state.restoredRecords.has(record.agentId))).toBeTrue();
+  });
+
+  test("a rollback failure skips recovery commit and preserves both application and rollback causes", async () => {
+    const { plan, port } = await multiApplicationFixture();
+    const state = applicationState();
+    const original = new Error("second replacement unavailable");
+    const recovery = new Error("rollback replacement unavailable");
+    let commits = 0;
+    const admission: RestoreAdmission = {
+      reserve: () => {},
+      replace: (record) => {
+        if (record.agentId === testAgentId("agent-b") && record.state === AgentState.Stopped) throw original;
+        if (record.agentId === testAgentId() && record.state !== AgentState.Stopped) throw recovery;
+      },
+      commit: () => { commits++; },
+      release: () => {},
+    };
+
+    const error = await applyRestoration(plan, admission, port, state).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(RestorationApplicationError);
+    expect((error as RestorationApplicationError).cause).toBe(original);
+    expect((error as RestorationApplicationError).recoveryCause).toBe(recovery);
+    expect((error as RestorationApplicationError).admissionCommitted).toBeFalse();
+    expect(commits).toBe(0);
+    expect([...state.restoredRecords.keys()]).toEqual([...plan.obligations.keys()]);
+  });
+
+  test("a recovery commit failure preserves application classification and the original commit cause", async () => {
+    const { plan, port } = await applicationFixture();
+    const state = applicationState();
+    const original = new Error("normal commit unavailable");
+    const recovery = new Error("recovery commit unavailable");
+    let commits = 0;
+    const admission: RestoreAdmission = {
+      reserve: () => {},
+      replace: () => {},
+      commit: () => { throw ++commits === 1 ? original : recovery; },
+      release: () => {},
+    };
+
+    const error = await applyRestoration(plan, admission, port, state).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(RestorationApplicationError);
+    expect((error as RestorationApplicationError).cause).toBe(original);
+    expect((error as RestorationApplicationError & { recoveryCause?: unknown }).recoveryCause).toBe(recovery);
+    expect((error as RestorationApplicationError & { admissionCommitted?: boolean }).admissionCommitted).toBeFalse();
+    expect(commits).toBe(2);
+    expect([...state.restoredRecords.keys()]).toEqual([...plan.obligations.keys()]);
+  });
+
+  test("a staged retry reuses durable work without duplicate appends or stale stopped obligations", async () => {
+    const { plan, port: basePort } = await applicationFixture();
+    let starts = 0;
+    let completionAttempts = 0;
+    let finalisations = 0;
+    const port = testRestorationPort({
+      ...basePort,
+      finaliseContained: async (_record, id) => {
+        finalisations++;
+        return completedCompletion({ runId: id });
+      },
+      appender: new AgentEventAppender((_type, event) => {
+        const eventType = (event as { eventType: AgentEventType }).eventType;
+        if (eventType === AgentEventType.RunStarted) starts++;
+        if (eventType === AgentEventType.RunCompleted && ++completionAttempts === 1) throw new Error("disk unavailable");
+      }),
+    });
+    const state = applicationState();
+
+    await expect(applyRestoration(plan, tracedAdmission([]), port, state)).rejects.toBeInstanceOf(RestorationApplicationError);
+    await expect(applyRestoration(plan, tracedAdmission([]), port, state)).resolves.toMatchObject([{ state: AgentState.Stopped }]);
+
+    expect({ starts, completionAttempts, finalisations }).toEqual({ starts: 1, completionAttempts: 2, finalisations: 1 });
+    expect(state.restoredRecords.size).toBe(0);
+  });
+
+  test("a reserve failure escapes raw without committing or installing obligations", async () => {
+    const failure = new Error("reserve unavailable");
+    const { plan, port } = await applicationFixture();
+    const state = applicationState();
+    const admission: RestoreAdmission = {
+      reserve: () => { throw failure; },
+      replace: () => { throw new Error("must not replace"); },
+      commit: () => { throw new Error("must not commit"); },
+      release: () => {},
+    };
+
+    const error = await applyRestoration(plan, admission, port, state).catch((caught: unknown) => caught);
+
+    expect(error).toBe(failure);
+    expect(error).not.toBeInstanceOf(RestorationApplicationError);
+    expect(state.restoredRecords.size).toBe(0);
+    expect(state.durableCompletions.size).toBe(0);
+  });
+});
 
 describe("branch restoration", () => {
   test("a missing non-null restoration cursor is session unavailable and never scans from zero", () => {
@@ -501,6 +924,21 @@ describe("branch restoration", () => {
     expect(c.runs.activeCount()).toBe(1);
   });
 
+  test("a reserve failure clears the staged plan before restoration retry", async () => {
+    const conflictingBranch = [spawned()];
+    let reads = 0;
+    const restoration = port(conflictingBranch, true, []);
+    restoration.getBranch = () => reads++ === 0 ? conflictingBranch : [];
+    const c = new SubagentController({ restoration });
+    c.runs.register({ agentId: testAgentId(), state: AgentState.Stopped, transcriptPath: testSessionPath() });
+
+    await expect(c.restore()).rejects.toThrow("invalid_agent:");
+    await expect(c.restore()).resolves.toBeUndefined();
+
+    expect(reads).toBe(2);
+    expect(c.runs.snapshots()).toHaveLength(1);
+  });
+
   test("repeated restore is idempotent", async () => {
     const writes: unknown[] = [];
     const c = new SubagentController({ restoration: port([spawned(), launch(), started()], true, writes) });
@@ -662,6 +1100,40 @@ describe("branch restoration", () => {
     });
   }
 });
+
+async function applicationFixture() {
+  const registry = foldAgentEvents([spawned(), launch()], "/tmp");
+  const port = testRestorationPort({ firstUserEntryAfter: async () => testRunId("cafebabe") });
+  const evidence = await collectRestorationEvidence(registry, port, () => testRuntime());
+  return { plan: planRestoration(registry, evidence), port };
+}
+
+async function multiApplicationFixture() {
+  const registry = foldAgentEvents([
+    spawned(),
+    launch(),
+    spawnedFor("agent-b", "b.jsonl"),
+    launchFor("agent-b", "attempt-b"),
+  ], "/tmp");
+  const port = testRestorationPort({
+    firstUserEntryAfter: async (path) => String(path).endsWith("b.jsonl") ? testRunId("feedface") : testRunId("cafebabe"),
+  });
+  const evidence = await collectRestorationEvidence(registry, port, () => testRuntime());
+  return { plan: planRestoration(registry, evidence), port };
+}
+
+function applicationState(): RestorationApplicationState {
+  return { durableCompletions: new Map(), restoredStartedAppends: new Set(), restoredRecords: new Map() };
+}
+
+function tracedAdmission(trace: string[]): RestoreAdmission {
+  return {
+    reserve: () => { trace.push("reserve"); },
+    replace: (record) => { trace.push(`replace:${record.state}`); },
+    commit: () => { trace.push("commit"); },
+    release: () => {},
+  };
+}
 
 function spawned() { return spawnedEntry({ agentId: testAgentId(), sessionPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), cwd: testAbsolutePath("/tmp"), provider: "p", modelId: testModelSpec("m"), tools: [] }, 1); }
 function spawnedFor(id: string, path: string) { return spawnedEntry({ agentId: testAgentId(id), sessionPath: testSessionPath(`/tmp/pi-subagents-test/${path.split("/").at(-1)!}`), cwd: testAbsolutePath("/tmp"), provider: "p", modelId: testModelSpec("m"), tools: [] }, 1); }

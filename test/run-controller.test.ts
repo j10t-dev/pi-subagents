@@ -10,7 +10,7 @@ import {
 import { testBarrier } from "./support/barriers.ts";
 import { testAgentId, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
 import { deferred } from "./support/async.ts";
-import { registerStopped, testRunController } from "./support/controllers.ts";
+import { registerStopped, restoreRuns, testRunController } from "./support/controllers.ts";
 import { testRuntime } from "./support/launches.ts";
 
 type AdoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>) => void;
@@ -88,23 +88,23 @@ describe("RunController arbitration", () => {
     expect((error as CodedError).message).toBe("capacity_exceeded: maximum concurrent runs exceeded");
   });
 
-  test("direct restore inherits every prior-session obligation above capacity", () => {
+  test("restoreRuns inherits every prior-session obligation above capacity", async () => {
     const c = testRunController({ capacity: 1 });
     const records = [
       { agentId: testAgentId("first"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/first"), runId: testRunId("deadbeef"), runtime: testRuntime() },
       { agentId: testAgentId("second"), state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/second"), runId: testRunId("cafebabe"), runtime: testRuntime() },
     ];
-    c.restore(records);
+    await restoreRuns(c, records);
     expect(c.snapshots()).toHaveLength(2);
     expect(c.activeCount()).toBe(2);
   });
 
-  test("restore cannot overwrite an existing record or leak its reservation", () => {
+  test("restoreRuns cannot overwrite an existing record or leak its reservation", async () => {
     const c = testRunController({ capacity: 2 });
     const existing = { agentId: testAgentId("existing"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing"), runId: testRunId("deadbeef") };
-    c.restore([existing]);
+    await restoreRuns(c, [existing]);
 
-    expect(() => c.restore([{ ...existing, state: AgentState.Stopped }])).toThrow("invalid_agent:");
+    await expect(restoreRuns(c, [{ ...existing, state: AgentState.Stopped }])).rejects.toThrow("invalid_agent:");
     expect(c.snapshots()).toEqual([existing]);
     expect(c.activeCount()).toBe(1);
   });
@@ -145,7 +145,7 @@ describe("RunController arbitration", () => {
       onRelease: () => { releases++; },
     });
     const id = testAgentId("restored-pre-run");
-    c.restore([{
+    await restoreRuns(c, [{
       agentId: id, state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre"),
       containmentResponsibility: "historical-unresolved",
       runtime: { abort: async () => { throw new Error("must not abort"); }, contain: async () => {
@@ -244,7 +244,7 @@ describe("RunController arbitration", () => {
     let publications = 0;
     const c = testRunController({ onTerminal: () => { publications++; } });
     const id = testAgentId("restored");
-    c.restore([{ agentId: id, state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: testRunId("deadbeef") }]);
+    await restoreRuns(c, [{ agentId: id, state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: testRunId("deadbeef") }]);
     const result = await c.settle(id, testRunId("deadbeef"), { kind: "completed" });
     expect(result).toMatchObject({ status: "containment_failed", agentState: AgentState.Settling });
     expect(c.snapshot(id)?.state).toBe(AgentState.Settling);

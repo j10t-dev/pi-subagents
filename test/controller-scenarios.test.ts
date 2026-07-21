@@ -35,7 +35,7 @@ import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testModelSpec, testReceiptPath, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
 import { agentSummary, assistantMessage, completedCompletion, testUsage } from "./support/messages.ts";
 import { testRuntime } from "./support/launches.ts";
-import { testRunController } from "./support/controllers.ts";
+import { restoreRuns, testRunController } from "./support/controllers.ts";
 import { extensionApiForTest } from "./support/extension-api.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
@@ -111,7 +111,7 @@ describe("controller orchestration scenarios", () => {
 
   test("07 stopped child resumes after parent restart", async () => {
     const runs = controller();
-    runs.restore([{ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
+    await restoreRuns(runs, [{ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
     const resumed = await runs.launch(A, async () => ({ status: "accepted", runId: R2, runtime: runtime() }));
     expect(resumed).toMatchObject({ status: "running", agentId: A, runId: R2 });
   });
@@ -140,7 +140,7 @@ describe("controller orchestration scenarios", () => {
   test("11 send_input rejects running, settling and stopping without mutating runs", async () => {
     for (const state of [AgentState.Running, AgentState.Settling, AgentState.Stopping]) {
       const runs = controller();
-      runs.restore([{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
+      await restoreRuns(runs, [{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
       await expect(runs.launch(A, async () => ({ status: "accepted", runId: R2, runtime: runtime() }))).rejects.toThrow("invalid_state:");
       expect(runs.snapshot(A)).toMatchObject({ state, runId: R1 });
     }
@@ -177,7 +177,7 @@ describe("controller orchestration scenarios", () => {
           return value;
         },
       }, parent: { isBusy: () => false, sendMessage: (message) => { pings.push(message); }, warn: (message) => { warnings.push(message); } } });
-      host.runs.restore([{ agentId: A, state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl"), runId: R1,
+      await restoreRuns(host.runs, [{ agentId: A, state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl"), runId: R1,
         runtime: { abort: async () => {}, contain: async () => { contained++; return verifyContainmentReceipt(receiptPath, testAttemptId("attempt")).path; } } }]);
 
       expect(boundary === "fork" ? host.beforeFork() : host.beforeSwitch()).toBeTrue();
@@ -205,10 +205,10 @@ describe("controller orchestration scenarios", () => {
     }
   });
 
-  test("14 tree navigation is cancelled for running, settling and stopping ownership", () => {
+  test("14 tree navigation is cancelled for running, settling and stopping ownership", async () => {
     for (const state of [AgentState.Running, AgentState.Settling, AgentState.Stopping]) {
       const host = new SubagentController({ parent: { isBusy: () => false, sendMessage: () => {} } });
-      host.runs.restore([{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
+      await restoreRuns(host.runs, [{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
       expect(host.beforeTree()).toBeFalse();
     }
   });
@@ -352,7 +352,7 @@ describe("controller orchestration scenarios", () => {
     const assignment = "Additional context without protocol markers";
     let prompted = "";
     const host = controllerWithNativeLaunch(A, R2, (message) => { prompted = message; });
-    host.runs.restore([{ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
+    await restoreRuns(host.runs, [{ agentId: A, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
 
     const resumed = await host.sendInput(A, assignment);
 
