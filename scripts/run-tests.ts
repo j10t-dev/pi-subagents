@@ -14,17 +14,29 @@ export async function runTestGroups(
   groups: readonly TestGroup[],
   run: (group: TestGroup) => Promise<number>,
 ): Promise<number> {
-  for (const group of groups) {
-    if (group.files.length === 0) continue;
-    const exitCode = await run(group);
-    if (exitCode !== 0) return exitCode;
-  }
-  return 0;
+  const runnable = groups.filter((group) => group.files.length > 0);
+  const results = await Promise.allSettled(runnable.map((group) => run(group)));
+  const rejected = results.find((result) => result.status === "rejected");
+  if (rejected !== undefined) throw rejected.reason;
+  const failed = results
+    .flatMap((result) => result.status === "fulfilled" ? [result.value] : [])
+    .find((exitCode) => exitCode !== 0);
+  return failed ?? 0;
+}
+
+export function testCommandArguments(group: TestGroup): string[] {
+  return [
+    "test",
+    ...group.files,
+    "--timeout",
+    "20000",
+    ...(group.name === "integration" ? ["--concurrent", "--max-concurrency", "12"] : []),
+  ];
 }
 
 function spawnGroup(root: string, group: TestGroup): Promise<number> {
   return new Promise((resolveExit, reject) => {
-    const child = spawn(process.execPath, ["test", ...group.files, "--timeout", "20000"], {
+    const child = spawn(process.execPath, testCommandArguments(group), {
       cwd: root,
       stdio: "inherit",
     });

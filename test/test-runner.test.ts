@@ -14,7 +14,7 @@ import {
   type TestGroup,
   type TestGroupName,
 } from "../scripts/test-groups.ts";
-import { runTestGroups } from "../scripts/run-tests.ts";
+import { runTestGroups, testCommandArguments } from "../scripts/run-tests.ts";
 import { temporaryTree as createTemporaryTree } from "./support/temp-state.ts";
 
 const REPOSITORY_ROOT = join(import.meta.dir, "..");
@@ -188,22 +188,101 @@ describe("parseRequestedGroups", () => {
 });
 
 describe("runTestGroups", () => {
-  test("skips empty groups and fails fast on the first non-zero exit", async () => {
+  test("runs every non-empty group concurrently", async () => {
+    const attempted: string[] = [];
+    const release = Promise.withResolvers<void>();
+    const groups: TestGroup[] = [
+      { name: "unit", files: ["test/domain.test.ts"] },
+      { name: "transport", files: ["test/rpc-client.test.ts"] },
+      { name: "integration", files: ["test/pi-integration.test.ts"] },
+    ];
+
+    const running = runTestGroups(groups, async (group) => {
+      attempted.push(group.name);
+      await release.promise;
+      return 0;
+    });
+
+    try {
+      expect(attempted).toEqual(["unit", "transport", "integration"]);
+      release.resolve();
+      expect(await running).toBe(0);
+    } finally {
+      release.resolve();
+      await running;
+    }
+  });
+
+  test("waits for every group before propagating a rejection", async () => {
+    const release = Promise.withResolvers<void>();
+    let siblingSettled = false;
+    const groups: TestGroup[] = [
+      { name: "transport", files: ["test/rpc-client.test.ts"] },
+      { name: "integration", files: ["test/pi-integration.test.ts"] },
+    ];
+
+    let settlement: { error: Error | undefined; siblingSettled: boolean } | undefined;
+    const observed = runTestGroups(groups, async (group) => {
+      if (group.name === "transport") throw new Error("spawn failed");
+      await release.promise;
+      siblingSettled = true;
+      return 0;
+    }).then(
+      () => ({ error: undefined, siblingSettled }),
+      (error: Error) => ({ error, siblingSettled }),
+    ).then((result) => {
+      settlement = result;
+      return result;
+    });
+
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+    const settlementBeforeSibling = settlement;
+    release.resolve();
+    const result = await observed;
+    expect(settlementBeforeSibling).toBeUndefined();
+    expect(result.error?.message).toBe("spawn failed");
+    expect(result.siblingSettled).toBeTrue();
+  });
+
+  test("waits for every started group and returns the first non-zero exit", async () => {
     const attempted: string[] = [];
     const groups: TestGroup[] = [
       { name: "unit", files: [] },
       { name: "transport", files: ["test/rpc-client.test.ts"] },
       { name: "process", files: ["test/watchdog.test.ts"] },
-      { name: "controller", files: ["test/controller.test.ts"] },
+      { name: "integration", files: ["test/pi-integration.test.ts"] },
     ];
 
     const exitCode = await runTestGroups(groups, async (group) => {
       attempted.push(group.name);
-      return group.name === "process" ? 17 : 0;
+      if (group.name === "transport") return 17;
+      if (group.name === "process") return 23;
+      return 0;
     });
 
     expect(exitCode).toBe(17);
-    expect(attempted).toEqual(["transport", "process"]);
+    expect(attempted).toEqual(["transport", "process", "integration"]);
+  });
+});
+
+describe("testCommandArguments", () => {
+  test("enables bounded concurrency only for the integration group", () => {
+    expect(testCommandArguments({
+      name: "integration",
+      files: ["test/pi-integration.test.ts"],
+    })).toEqual([
+      "test",
+      "test/pi-integration.test.ts",
+      "--timeout",
+      "20000",
+      "--concurrent",
+      "--max-concurrency",
+      "12",
+    ]);
+    expect(testCommandArguments({
+      name: "unit",
+      files: ["test/domain.test.ts"],
+    })).toEqual(["test", "test/domain.test.ts", "--timeout", "20000"]);
   });
 });
 
