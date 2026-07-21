@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { closeSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { MAX_SESSION_RECOVERY_BYTES } from "../src/constants.ts";
@@ -97,15 +96,17 @@ function assistantEntry(id: string, text: string) {
 
 describe("OutputStore", () => {
   let workDir: string;
+  let workState: ReturnType<typeof temporaryStateRoot>;
   let store: OutputStore;
 
   beforeEach(() => {
-    workDir = mkdtempSync(join(tmpdir(), "output-store-test-"));
+    workState = temporaryStateRoot("output-store-test-");
+    workDir = workState.path;
     store = new OutputStore({ workDir });
   });
 
   afterEach(() => {
-    rmSync(workDir, { recursive: true, force: true });
+    workState.cleanup();
   });
 
   test("stages pre-run-ID assistant events into an attempt workspace", () => {

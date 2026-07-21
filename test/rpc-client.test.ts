@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, watch, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, readdirSync, watch, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -14,6 +13,7 @@ import { authoritativeSettlement, RpcRunClient } from "../src/rpc-client.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
 import { deferred } from "./support/async.ts";
 import type { ExtensionUIContextLike } from "../src/ui-forwarder.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-rpc-child.mjs");
 const AGENT: AgentId = agentId("agent-1");
@@ -148,13 +148,15 @@ function makeClient(
 
 describe("RpcRunClient", () => {
   let workDir: string;
+  let workState: ReturnType<typeof temporaryStateRoot>;
 
   beforeEach(() => {
-    workDir = mkdtempSync(join(tmpdir(), "rpc-client-test-"));
+    workState = temporaryStateRoot("rpc-client-test-");
+    workDir = workState.path;
   });
 
   afterEach(() => {
-    rmSync(workDir, { recursive: true, force: true });
+    workState.cleanup();
   });
 
   test("issues unique, non-empty request IDs across commands", async () => {

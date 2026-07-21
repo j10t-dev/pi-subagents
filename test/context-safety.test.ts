@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 
@@ -27,6 +26,7 @@ import {
   testSessionPath,
 } from "./support/brands.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort } from "./support/extension-api.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const FAKE_CHILD = join(import.meta.dir, "fixtures", "fake-rpc-child.mjs");
 
@@ -170,7 +170,8 @@ function hostileController(): {
   controller: SubagentController;
   close(): Promise<void>;
 } {
-  const root = mkdtempSync(join(tmpdir(), "pi-context-controller-"));
+  const state = temporaryStateRoot("pi-context-controller-");
+  const root: string = state.path;
   const clients = new Set<RpcRunClient>();
   const stores = new Map<string, OutputStore>();
   let sequence = 0;
@@ -215,7 +216,7 @@ function hostileController(): {
   return { controller, close: async () => {
     await controller.shutdown();
     await Promise.all([...clients].map((client) => client.shutdown().catch(() => undefined)));
-    rmSync(root, { recursive: true, force: true });
+    state.cleanup();
   } };
 }
 
@@ -349,7 +350,8 @@ function hostileLaunch(
 function fakeClient(scenario: string): { client: RpcRunClient; store: OutputStore; close: () => Promise<void> } {
   // Bun defers disposal of closed child-process epoll handles across this large process suite.
   Bun.gc(true);
-  const dir = mkdtempSync(join(tmpdir(), "pi-context-safety-"));
+  const state = temporaryStateRoot("pi-context-safety-");
+  const dir: string = state.path;
   const store = new OutputStore({ workDir: dir });
   const child = spawn(process.execPath, [FAKE_CHILD], {
     cwd: dir, env: { ...process.env, FAKE_RPC_SCENARIO: scenario }, stdio: ["pipe", "pipe", "pipe"],
@@ -365,5 +367,5 @@ function fakeClient(scenario: string): { client: RpcRunClient; store: OutputStor
     } }),
     agentId: testAgentId(`context-${scenario}`), runAttemptId: testAttemptId(`attempt-${scenario}`),
   });
-  return { client, store, close: async () => { await client.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
+  return { client, store, close: async () => { await client.shutdown(); state.cleanup(); } };
 }

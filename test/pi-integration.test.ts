@@ -7,7 +7,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   openSync,
   readFileSync,
   readlinkSync,
@@ -18,7 +17,6 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,6 +33,7 @@ import {
   resolveIntegrationCli,
 } from "./support/pi-integration-harness.ts";
 import { testAttemptId, testVerifiedReceiptPath } from "./support/brands.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 clearManagedChildEnvironment(process.env);
 
@@ -44,7 +43,8 @@ const LIFECYCLE_TOOLS = ["spawn_agent", "send_input", "receive_agent", "stop_age
 
 describe("installed Pi integration prerequisites", () => {
   test("the literal command-v Pi launcher registers the extension in a real parent session", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-literal-launcher-"));
+    const state = temporaryStateRoot("pi-literal-launcher-");
+    const root: string = state.path;
     const agentDir = join(root, "agent");
     const extensions = join(agentDir, "extensions");
     const project = join(root, "project");
@@ -74,12 +74,13 @@ describe("installed Pi integration prerequisites", () => {
       expect(client.getStderr()).not.toContain("pi-subagents disabled:");
     } finally {
       await client.stop();
-      rmSync(root, { recursive: true, force: true });
+      state.cleanup();
     }
   }, 30_000);
 
   test("normal launcher registers four lifecycle tools and runs one deterministic child without network access", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-real-integration-"));
+    const state = temporaryStateRoot("pi-real-integration-");
+    const root: string = state.path;
     const agentDir = join(root, "agent");
     const extensions = join(agentDir, "extensions");
     const project = join(root, "project");
@@ -119,11 +120,13 @@ describe("installed Pi integration prerequisites", () => {
       expect(client.getStderr()).not.toContain("http");
     } finally {
       await client.stop();
+      state.cleanup();
     }
   }, 30_000);
 
   test("a restarted parent restores and resumes a legacy unqualified persisted model", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-real-restore-"));
+    const state = temporaryStateRoot("pi-real-restore-");
+    const root: string = state.path;
     const agentDir = join(root, "agent");
     const extensions = join(agentDir, "extensions");
     const project = join(root, "project");
@@ -175,11 +178,13 @@ describe("installed Pi integration prerequisites", () => {
       expect(transcript).toContain('"model":"luna"');
     } finally {
       await second.stop();
+      state.cleanup();
     }
   }, 40_000);
 
   test("trusted discovery, child tool suppression, extension-owned model suffixes and unavailable tools", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-real-matrix-"));
+    const state = temporaryStateRoot("pi-real-matrix-");
+    const root: string = state.path;
     const agentDir = join(root, "agent");
     const extensions = join(agentDir, "extensions");
     const project = join(root, "project");
@@ -224,7 +229,7 @@ describe("installed Pi integration prerequisites", () => {
       const transcript = readFileSync(findChildTranscript(agentDir, first.agentId), "utf8");
       expect(transcript).toContain('"thinkingLevel":"minimal"');
       expect(transcript).toContain('"provider":"mock-provider"');
-    } finally { await client.stop(); }
+    } finally { await client.stop(); state.cleanup(); }
   }, 40_000);
 
   test("real composition surrenders containment exactly once before constructing a launch", () => {
@@ -240,12 +245,17 @@ describe("installed Pi integration prerequisites", () => {
   });
 
   test("a no-process containment receipt is accepted for the matching attempt", () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-receipt-"));
-    const path = join(root, "receipt.json");
-    const attempt = "attempt-real-pi";
-    writeFileSync(path, JSON.stringify({ version: 1, attemptId: attempt, pgid: null, outcome: "no_process", timestamp: new Date().toISOString() }));
-    expect(String(verifyContainmentReceipt(containmentReceiptPath(path, path), testAttemptId(attempt), Date.now() - 1_000).path)).toBe(path);
-    expect(readFileSync(path, "utf8")).toContain(attempt);
+    const state = temporaryStateRoot("pi-receipt-");
+    const root: string = state.path;
+    try {
+      const path = join(root, "receipt.json");
+      const attempt = "attempt-real-pi";
+      writeFileSync(path, JSON.stringify({ version: 1, attemptId: attempt, pgid: null, outcome: "no_process", timestamp: new Date().toISOString() }));
+      expect(String(verifyContainmentReceipt(containmentReceiptPath(path, path), testAttemptId(attempt), Date.now() - 1_000).path)).toBe(path);
+      expect(readFileSync(path, "utf8")).toContain(attempt);
+    } finally {
+      state.cleanup();
+    }
   });
 });
 
@@ -263,7 +273,8 @@ describe("deterministic network-free real-Pi matrix", () => {
   }, 30_000);
 
   test("state snapshots detect modifications to existing file contents", () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-state-snapshot-"));
+    const state = temporaryStateRoot("pi-state-snapshot-");
+    const root: string = state.path;
     try {
       const path = join(root, "state.json");
       writeFileSync(path, "before");
@@ -271,7 +282,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       writeFileSync(path, "after!");
       expect(snapshotTree(root)).not.toEqual(before);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      state.cleanup();
     }
   });
 
@@ -857,7 +868,8 @@ async function withFixture(
   childEnvironment?: (paths: Pick<RealFixture, "root" | "agentDir" | "project" | "childLaunchDir">) => NodeJS.ProcessEnv,
   beforeStart?: (paths: Pick<RealFixture, "root" | "agentDir" | "project" | "childLaunchDir">) => void,
 ): Promise<void> {
-  const root = mkdtempSync(join(tmpdir(), `pi-real-${name}-`));
+  const state = temporaryStateRoot(`pi-real-${name}-`);
+  const root: string = state.path;
   const agentDir = join(root, "agent");
   const project = join(root, "project");
   const external = join(root, "external");
@@ -900,7 +912,7 @@ async function withFixture(
     await run({ client, options, root, agentDir, project, external, childLaunchDir });
   } finally {
     await client.stop();
-    rmSync(root, { recursive: true, force: true });
+    state.cleanup();
   }
 }
 

@@ -1,20 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ContainmentAttempt, ContainmentOutcome } from "../src/containment.ts";
 import { createRunAttemptId, verifiedContainmentReceiptPath } from "../src/domain.ts";
 import type { AbsolutePath, ContainmentReceiptPath, RunAttemptId, VerifiedContainmentReceiptPath } from "../src/domain.ts";
 import { WatchdogClient, verifyContainmentReceipt } from "../src/watchdog-client.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const clients: WatchdogClient[] = [];
-const directories: string[] = [];
+const directories: ReturnType<typeof temporaryStateRoot>[] = [];
 afterEach(async () => {
   await Promise.allSettled(clients.splice(0).map((client) => client.close()));
   Bun.gc(true);
-  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  for (const directory of directories.splice(0)) directory.cleanup();
 });
 
 describe("cgroup-v2 watchdog", () => {
@@ -274,7 +274,7 @@ function watchdogFixture(options: { blockEmpty?: boolean; killFailure?: boolean;
 }
 
 function temporaryDirectory(prefix: string): string {
-  const directory = mkdtempSync(join(tmpdir(), prefix));
-  directories.push(directory);
-  return directory;
+  const state = temporaryStateRoot(prefix);
+  directories.push(state);
+  return state.path;
 }

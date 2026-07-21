@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { buildRpcLaunchSpec, resolvePiInvocation } from "../src/pi-launcher.ts";
 import { testAbsolutePath, testModelSpec } from "./support/brands.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 describe("resolvePiInvocation", () => {
   test("uses Node with the exact parent script", () => {
@@ -83,11 +83,17 @@ describe("buildRpcLaunchSpec", () => {
     expect(Object.isFrozen(spec)).toBe(true);
   });
   test("adds trust only for realpath-contained cwd", () => {
-    const root = mkdtempSync(join(tmpdir(), "launcher-")); mkdirSync(join(root, "project", "child"), { recursive: true }); mkdirSync(join(root, "outside"));
-    symlinkSync(join(root, "outside"), join(root, "project", "escape"));
-    const base = { invocation: { command: testAbsolutePath("/pi"), argsPrefix: [] }, childSessionDir: testAbsolutePath("/sessions"), effectiveTools: [], effectiveModel: testModelSpec("x"), effectiveThinking: "low" as const, trustedRoot: testAbsolutePath(join(root, "project")), childDepth: 1, maxDepth: 1, maxConcurrentRuns: 4 };
-    expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "child")) }).args).toContain("--approve");
-    expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project2")) }).args).not.toContain("--approve");
-    expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "escape")) }).args).not.toContain("--approve");
+    const state = temporaryStateRoot("launcher-");
+    const root: string = state.path;
+    try {
+      mkdirSync(join(root, "project", "child"), { recursive: true }); mkdirSync(join(root, "outside"));
+      symlinkSync(join(root, "outside"), join(root, "project", "escape"));
+      const base = { invocation: { command: testAbsolutePath("/pi"), argsPrefix: [] }, childSessionDir: testAbsolutePath("/sessions"), effectiveTools: [], effectiveModel: testModelSpec("x"), effectiveThinking: "low" as const, trustedRoot: testAbsolutePath(join(root, "project")), childDepth: 1, maxDepth: 1, maxConcurrentRuns: 4 };
+      expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "child")) }).args).toContain("--approve");
+      expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project2")) }).args).not.toContain("--approve");
+      expect(buildRpcLaunchSpec({ ...base, cwd: testAbsolutePath(join(root, "project", "escape")) }).args).not.toContain("--approve");
+    } finally {
+      state.cleanup();
+    }
   });
 });

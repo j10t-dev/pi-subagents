@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { resolveCgroupV2Backend, type CgroupFileSystem } from "../src/cgroup-v2.ts";
 import type { AbsolutePath, ContainmentReceiptPath, RunAttemptId } from "../src/domain.ts";
 import { createRunAttemptId } from "../src/domain.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const NODE = Bun.which("node") ?? (() => { throw new Error("production abrupt-controller test requires Node on PATH"); })();
 
@@ -22,7 +22,8 @@ const phases: string[] = [
 
 describe("abrupt controller restoration matrix", () => {
   test("production backend contains every survivor after only the watchdog is killed", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "abrupt-controller-production-"));
+    const state = temporaryStateRoot("abrupt-controller-production-");
+    const directory: string = state.path;
     const attemptId = createRunAttemptId();
     const parentSessionId = `abrupt-production-${process.pid}-${Date.now()}`;
     const receipt = join(directory, "receipt.json") as ContainmentReceiptPath;
@@ -100,12 +101,13 @@ describe("abrupt controller restoration matrix", () => {
         try { process.kill(report.watchdogPid, "SIGKILL"); } catch { /* process already exited */ }
       }
       await backend.shutdown().catch(() => undefined);
-      rmSync(directory, { recursive: true, force: true });
+      state.cleanup();
     }
   }, 30_000);
 
   test.each(phases)("reports watchdog, launcher, and Pi identity for %s", async (phase) => {
-    const directory = mkdtempSync(join(tmpdir(), "abrupt-controller-"));
+    const state = temporaryStateRoot("abrupt-controller-");
+    const directory: string = state.path;
     const attemptId = createRunAttemptId();
     const parentSessionId = "abrupt-parent";
     const root = join(directory, "root");
@@ -163,7 +165,7 @@ describe("abrupt controller restoration matrix", () => {
       if (watchdogPid !== undefined) {
         try { process.kill(-watchdogPid, "SIGKILL"); } catch { /* process already exited */ }
       }
-      rmSync(directory, { recursive: true, force: true });
+      state.cleanup();
     }
   }, 15_000);
 });

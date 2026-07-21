@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawn as spawnProcess, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -338,14 +337,15 @@ describe("controller orchestration scenarios", () => {
   });
 
   test("22 partial assistant output is discarded and prior committed output remains authoritative", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-subagents-controller-"));
+    const state = temporaryStateRoot("pi-subagents-controller-");
+    const dir: string = state.path;
     try {
       const store = new OutputStore({ workDir: dir }); const attempt = createRunAttemptId();
       store.beginAttempt(attempt); const path = store.bindRun(attempt, R1);
       store.onMessageEnd(R1, assistant("committed"));
       store.onMessageStart(R1, assistant("")); store.onTextDelta(R1, 0, "partial"); store.discardPartial(R1);
       expect(readFileSync(path, "utf8")).toBe("committed");
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    } finally { state.cleanup(); }
   });
 
   test("23 NEEDS_CONTEXT resume sends the clean literal assignment through the stopped-agent path", async () => {

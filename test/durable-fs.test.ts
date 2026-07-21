@@ -3,19 +3,18 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
-  mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   renameSync,
-  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 import {
   ensureDurableDirectorySync,
@@ -23,16 +22,16 @@ import {
   type DurableFileSystem,
 } from "../src/durable-fs.ts";
 
-const roots: string[] = [];
+const roots: ReturnType<typeof temporaryStateRoot>[] = [];
 
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) root.cleanup();
 });
 
 function root(): string {
-  const value = mkdtempSync(join(tmpdir(), "durable-fs-test-"));
-  roots.push(value);
-  return value;
+  const state = temporaryStateRoot("durable-fs-test-");
+  roots.push(state);
+  return state.path;
 }
 
 function retrySyncAdapter(failedParent: string, trace: string[]): DurableFileSystem {

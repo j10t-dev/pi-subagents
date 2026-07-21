@@ -1,7 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 
 import {
   cgroupScopeName,
@@ -13,6 +11,7 @@ import {
 import { PublicPreflightError, runAttemptId, verifiedContainmentReceiptPath } from "../src/domain.ts";
 import type { ContainmentDescriptor } from "../src/containment.ts";
 import { absolutePath, containmentReceiptPath } from "../src/paths.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const MOUNT = "/sys/fs/cgroup";
 const CURRENT = `${MOUNT}/user.slice/pi.scope`;
@@ -200,7 +199,8 @@ describe("cgroup-v2", () => {
   });
 
   test("terminate creates a no-process scope, proves empty, durably publishes v2 receipt, then removes", async () => {
-    const state = mkdtempSync(join(tmpdir(), "pi-cgroup-receipt-"));
+    const root = temporaryStateRoot("pi-cgroup-receipt-");
+    const state: string = root.path;
     try {
       const fs = baseFs();
       const receipt = containmentReceiptPath(state, "attempt.json");
@@ -224,11 +224,12 @@ describe("cgroup-v2", () => {
         "read:cgroup.events:populated 0",
         `rmdir:${ATTEMPT}`,
       ]);
-    } finally { rmSync(state, { recursive: true, force: true }); }
+    } finally { root.cleanup(); }
   });
 
   test("termination kills before polling an initially empty scope", async () => {
-    const state = mkdtempSync(join(tmpdir(), "pi-cgroup-termination-"));
+    const root = temporaryStateRoot("pi-cgroup-termination-");
+    const state: string = root.path;
     try {
       const fs = baseFs();
       const resolved = backend(fs, { receiptPathFor: () => containmentReceiptPath(state, "attempt.json") });
@@ -244,7 +245,7 @@ describe("cgroup-v2", () => {
         "read:cgroup.events:populated 0",
         `rmdir:${ATTEMPT}`,
       ]);
-    } finally { rmSync(state, { recursive: true, force: true }); }
+    } finally { root.cleanup(); }
   });
 
   test("cleanup removes a proven-empty nested cgroup subtree leaf-first", async () => {
@@ -288,7 +289,8 @@ describe("cgroup-v2", () => {
   });
 
   test("receipt publication gates cleanup and failed first cleanup is retried by shutdown", async () => {
-    const state = mkdtempSync(join(tmpdir(), "pi-cgroup-retry-"));
+    const root = temporaryStateRoot("pi-cgroup-retry-");
+    const state: string = root.path;
     try {
       const fs = baseFs();
       fs.failure = "attempt-remove-once";
@@ -301,11 +303,12 @@ describe("cgroup-v2", () => {
       expect(fs.directories.has(ATTEMPT)).toBeFalse();
       expect(fs.trace.filter((entry) => entry === `rmdir:${ATTEMPT}`)).toHaveLength(2);
       expect(fs.diagnostics).toContain("containment_unavailable:attempt cleanup failed");
-    } finally { rmSync(state, { recursive: true, force: true }); }
+    } finally { root.cleanup(); }
   });
 
   test("shutdown rejects a genuine attempt-removal retry error and remains retryable without re-containing", async () => {
-    const state = mkdtempSync(join(tmpdir(), "pi-cgroup-retry-error-"));
+    const root = temporaryStateRoot("pi-cgroup-retry-error-");
+    const state: string = root.path;
     try {
       const fs = baseFs();
       fs.failure = "attempt-remove-twice";
@@ -322,7 +325,7 @@ describe("cgroup-v2", () => {
       await expect(resolved.shutdown()).resolves.toBeUndefined();
       expect(fs.trace.filter((entry) => entry === "write:cgroup.kill:1")).toHaveLength(1);
       expect(fs.directories.has(ATTEMPT)).toBeFalse();
-    } finally { rmSync(state, { recursive: true, force: true }); }
+    } finally { root.cleanup(); }
   });
 
   test("shutdown removes empty parent then only an auto-created root", async () => {

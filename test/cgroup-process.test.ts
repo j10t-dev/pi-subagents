@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { accessSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { constants } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,12 +10,14 @@ import { testAbsolutePath } from "./support/brands.ts";
 import { isContainedPath } from "../src/paths.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
 import { WatchdogClient, verifyContainmentReceipt } from "../src/watchdog-client.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const SETSID = resolveSetsid();
 
 describe("production cgroup-v2 process containment", () => {
   test("kills a setsid descendant outside the launcher process group", async () => {
-    const state = mkdtempSync(join(tmpdir(), "pi-cgroup-process-"));
+    const stateRoot = temporaryStateRoot("pi-cgroup-process-");
+    const state: string = stateRoot.path;
     const pidPath = join(state, "pids.json");
     const backend = resolveCgroupV2Backend({
       parentSessionId: `setsid-process-${process.pid}-${Date.now()}`,
@@ -65,12 +66,13 @@ describe("production cgroup-v2 process containment", () => {
     } finally {
       await client?.close().catch(() => undefined);
       await backend.shutdown().catch(() => undefined);
-      rmSync(state, { recursive: true, force: true });
+      stateRoot.cleanup();
     }
   }, 30_000);
 
   test("configured-root descendants remain nested beneath the ancestor attempt", async () => {
-    const state = mkdtempSync(join(tmpdir(), "pi-cgroup-nested-"));
+    const stateRoot = temporaryStateRoot("pi-cgroup-nested-");
+    const state: string = stateRoot.path;
     const readyPath = join(state, "nested-ready.json");
     const bootstrap = resolveCgroupV2Backend({
       parentSessionId: `nested-bootstrap-${process.pid}-${Date.now()}`,
@@ -115,7 +117,7 @@ describe("production cgroup-v2 process containment", () => {
       await ancestorClient?.close().catch(() => undefined);
       await ancestor?.shutdown().catch(() => undefined);
       await bootstrap.shutdown().catch(() => undefined);
-      rmSync(state, { recursive: true, force: true });
+      stateRoot.cleanup();
     }
   }, 30_000);
 });

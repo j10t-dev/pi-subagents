@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
+import { temporaryStateRoot } from "./support/temp-state.ts";
+
 const children = new Set<ChildProcess>();
-const directories: string[] = [];
+const directories: ReturnType<typeof temporaryStateRoot>[] = [];
 
 afterEach(async () => {
   await Promise.all([...children].map(async (child) => {
@@ -22,13 +23,14 @@ afterEach(async () => {
   }));
   children.clear();
   Bun.gc(true);
-  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  for (const directory of directories.splice(0)) directory.cleanup();
 });
 
 describe("launcher membership barrier", () => {
   test("does not expose an environment-controlled filesystem write before initialisation", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "pi-launcher-environment-"));
-    directories.push(directory);
+    const state = temporaryStateRoot("pi-launcher-environment-");
+    const directory: string = state.path;
+    directories.push(state);
     const marker = join(directory, "forbidden-marker.json");
     const child = spawn(process.execPath, [join(import.meta.dir, "../launcher.mjs")], {
       env: { ...process.env, PI_SUBAGENTS_TEST_LAUNCHER_MARKER: marker },
@@ -144,8 +146,9 @@ describe("launcher membership barrier", () => {
 });
 
 function launchFixture(command: { args: string[]; replaceMarker?: boolean }) {
-  const directory = mkdtempSync(join(tmpdir(), "pi-launcher-barrier-"));
-  directories.push(directory);
+  const state = temporaryStateRoot("pi-launcher-barrier-");
+  const directory: string = state.path;
+  directories.push(state);
   const marker = join(directory, "marker");
   const args = command.replaceMarker
     ? command.args.map((value) => value.replace("PID_MARKER", marker))
