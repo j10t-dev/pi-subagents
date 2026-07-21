@@ -369,7 +369,7 @@ describe("Pi subagents extension", () => {
     const h = harness();
     const log: string[] = [];
     let refreshStatus = (): void => { throw new Error("status refresh was not wired"); };
-    let value = "agents: 1 running, 0 result ready";
+    let value = "agents: 1 running, 0 results ready";
     createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: (_context, _api, refresh) => {
         refreshStatus = refresh;

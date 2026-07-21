@@ -725,13 +725,13 @@ describe("branch restoration", () => {
     });
   }
 
-  test("re-exposes only the latest completion and uses a non-triggering next-turn ping", async () => {
+  test("re-exposes only the latest completion without a restoration ping", async () => {
     const pings: unknown[] = [];
     const branch = [spawned(), launch(), started(), completed("deadbeef"), launch("attempt-2"), started("feedface", "attempt-2"), completed("feedface")];
     const c = new SubagentController({ restoration: port(branch, true, []), parent: { isBusy: () => false, sendMessage: async (_text, options) => { pings.push(options); } } });
     await c.restore();
     expect((await c.receive()).completions.map((value) => value.runId as string)).toEqual(["feedface"]);
-    expect(pings).toEqual([{ deliverAs: "nextTurn", triggerTurn: false }]);
+    expect(pings).toEqual([]);
   });
 
   test("invalid latest-completion receipt retains capacity and does not expose completion", async () => {
@@ -939,16 +939,60 @@ describe("branch restoration", () => {
     expect(c.runs.snapshots()).toHaveLength(1);
   });
 
-  test("repeated restore is idempotent", async () => {
+  test("repeated restore is idempotent and sends no parent message", async () => {
     const writes: unknown[] = [];
-    const c = new SubagentController({ restoration: port([spawned(), launch(), started()], true, writes) });
+    const pings: unknown[] = [];
+    const c = new SubagentController({
+      restoration: port([spawned(), launch(), started()], true, writes),
+      parent: { isBusy: () => false, sendMessage: async (_text, options) => { pings.push(options); } },
+    });
     await c.restore();
     await c.restore();
     expect(writes).toHaveLength(1);
-    expect((await c.receive()).completions).toHaveLength(1);
+    expect(c.runs.activeCount()).toBe(0);
+    expect((await c.receive()).completions).toMatchObject([{ agentId: testAgentId(), runId: testRunId("deadbeef") }]);
+    expect(pings).toEqual([]);
   });
 
-  test("a second restore caller joins the in-flight receipt decision and shares one durable record, reservation, completion, and next-turn ping", async () => {
+  test("a restore retry sends no parent message after preserving durable work", async () => {
+    const writes: unknown[] = [];
+    const pings: unknown[] = [];
+    let completionAttempts = 0;
+    const restoration = port([
+      spawned(), launch(),
+      spawnedFor("agent-b", "/tmp/b.jsonl"), launchFor("agent-b", "attempt-b"), startedFor("agent-b", "feedface", "attempt-b"),
+      completedEntry({
+        agentId: testAgentId("agent-b"), runId: testRunId("feedface"),
+        transcriptPath: testSessionPath("/tmp/pi-subagents-test/b.jsonl"),
+        outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/feedface.md"), output: truncateUtf8("ready", 50_000),
+      }, 1),
+    ], true, writes, testRunId("cafebabe"));
+    const appendCompleted = restoration.appender.appendRunCompleted.bind(restoration.appender);
+    restoration.appender.appendRunCompleted = async (completion) => {
+      if (++completionAttempts === 1) throw new Error("disk unavailable");
+      return appendCompleted(completion);
+    };
+    const c = new SubagentController({ capacity: 1, restoration, parent: {
+      isBusy: () => false,
+      sendMessage: async (_text, options) => { pings.push(options); },
+    } });
+
+    await expect(c.restore()).rejects.toThrow("disk unavailable");
+    expect(c.runs.snapshot(testAgentId())?.state).toBe("settling");
+    expect(c.runs.activeCount()).toBe(1);
+    pings.length = 0;
+
+    await c.stop(testAgentId());
+    expect(c.runs.activeCount()).toBe(0);
+    expect(writes.map((value) => (value as { eventType: string }).eventType)).toEqual([AgentEventType.RunStarted, AgentEventType.RunCompleted]);
+    pings.length = 0;
+
+    await c.restore();
+    expect(pings).toEqual([]);
+    expect((await c.receive()).completions.map((value) => value.runId)).toEqual([testRunId("feedface"), testRunId("cafebabe")]);
+  });
+
+  test("a second restore caller joins the in-flight receipt decision and shares one durable record, reservation, and completion", async () => {
     let validations = 0;
     const deciding = testBarrier("shared-receipt-decision");
     const writes: unknown[] = [], pings: unknown[] = [];
@@ -970,7 +1014,7 @@ describe("branch restoration", () => {
     expect(c.runs.snapshots()).toHaveLength(1);
     expect(c.runs.activeCount()).toBe(0);
     expect(c.completions.queuedCount()).toBe(1);
-    expect(pings).toEqual([{ deliverAs: "nextTurn", triggerTurn: false }]);
+    expect(pings).toEqual([]);
   });
 
   test("restore failure clears the in-flight promise and retry does not duplicate durable appends", async () => {

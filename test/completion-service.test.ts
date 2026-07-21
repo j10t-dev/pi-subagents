@@ -312,7 +312,7 @@ describe("CompletionService.restore", () => {
   });
   test("re-queues each agent's latest completion for duplicate-visibility delivery", async () => {
     const service = new CompletionService();
-    const restoreResult = service.restore([
+    expect(service.restore([
       {
         agentId: AGENT,
         state: AgentState.Stopped,
@@ -325,11 +325,11 @@ describe("CompletionService.restore", () => {
         sessionPath: SESSION_PATH,
         currentRunId: RUN,
       },
-    ]);
+    ])).toBeUndefined();
 
-    expect(restoreResult.backPingCount).toBe(1);
+    expect(service.queuedCount()).toBe(1);
     const result = await service.receive();
-    expect(result.completions.length).toBe(1);
+    expect(result.completions).toMatchObject([{ agentId: AGENT, runId: RUN }]);
     expect(result.agents.map((a) => a.agentId).sort()).toEqual([AGENT, OTHER_AGENT].sort());
   });
 });

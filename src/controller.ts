@@ -163,7 +163,6 @@ export class SubagentController {
   private restored = false;
   private restoreInFlight: Promise<void> | undefined;
   private restorationApplied = false;
-  private restorationBackPingCount = 0;
   private stagedRestorePlan: StagedRestorePlan | undefined;
   private readonly restoredStartedAppends = new Set<ReturnType<typeof agentRunKey>>();
   private readonly restoredRecords = new Map<AgentId, RestoredTerminalObligation>();
@@ -298,7 +297,7 @@ export class SubagentController {
     // A failed ping keeps the key pending: the queue entry is already durable and visible to the
     // next `receive_agent`, and a re-publication of the same completion retries the notification.
     try {
-      await this.ping(result.queueSize, "runtime");
+      await this.ping(result.queueSize);
       this.pendingNotifications.delete(key);
     } catch { /* retried by the next publication of this completion */ }
   }
@@ -330,7 +329,6 @@ export class SubagentController {
 
   private async restoreOwned(): Promise<void> {
     if (this.restorationApplied) {
-      await this.notifyRestored(this.restorationBackPingCount);
       this.restored = true;
       return;
     }
@@ -372,16 +370,13 @@ export class SubagentController {
         if (!error.admissionCommitted) throw error.cause;
         this.stagedRestorePlan = undefined;
         this.restorationApplied = true;
-        const failedRestore = this.completions.restore(error.restored.map(completionInventory));
-        this.restorationBackPingCount = failedRestore.backPingCount;
+        this.completions.restore(error.restored.map(completionInventory));
         throw error.cause;
       }
 
-      const result = this.completions.restore(restored.map(completionInventory));
-      this.restorationBackPingCount = result.backPingCount;
+      this.completions.restore(restored.map(completionInventory));
       this.restorationApplied = true;
       this.stagedRestorePlan = undefined;
-      await this.notifyRestored(result.backPingCount);
       this.restored = true;
     } finally {
       admission.release();
@@ -396,13 +391,10 @@ export class SubagentController {
     this.restoredStartedAppends.add(key);
   }
 
-  async notifyRestored(count: number): Promise<void> {
-    if (count > 0 && !this.suppressPings) await this.ping(count, "restored");
-  }
-
   status(): string {
     const active = this.runs.snapshots().filter((a) => a.state !== AgentState.Stopped).length;
-    return `agents: ${active} running, ${this.completions.queuedCount()} result ready`;
+    const ready = this.completions.queuedCount();
+    return `agents: ${active} running, ${ready} result${ready === 1 ? "" : "s"} ready`;
   }
 
   beforeTree(): boolean {
@@ -618,10 +610,9 @@ export class SubagentController {
     return true;
   }
 
-  private async ping(count: number, kind: "runtime" | "restored"): Promise<void> {
+  private async ping(count: number): Promise<void> {
     if (this.parent === undefined) return;
     const text = `${count} agent completion${count === 1 ? " is" : "s are"} ready. Call receive_agent to collect ${count === 1 ? "it" : "them"}.`;
-    if (kind === "restored") return void await this.parent.sendMessage(text, { deliverAs: "nextTurn", triggerTurn: false });
     await this.parent.sendMessage(text, { deliverAs: "followUp", triggerTurn: !this.parent.isBusy() });
   }
 

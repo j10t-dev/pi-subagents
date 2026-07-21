@@ -53,11 +53,6 @@ export interface RestorableAgent {
   latestCompletion?: AgentCompletion;
 }
 
-export interface RestoreResult {
-  /** Number of agents whose latest completion became queued again for delivery. */
-  backPingCount: number;
-}
-
 interface CompletionWaiter {
   readonly id: symbol;
   wake(): void;
@@ -215,9 +210,8 @@ export class CompletionService {
    * completion for duplicate-visibility delivery, per restoration semantics. This startup-only
    * mutation is sealed as soon as a live upsert, publish, or receive operation begins.
    */
-  restore(records: Iterable<RestorableAgent>): RestoreResult {
+  restore(records: Iterable<RestorableAgent>): void {
     if (this.liveOperationsStarted) throw new Error("invalid_state: restoration is sealed after live completion operations begin");
-    let backPingCount = 0;
     for (const record of records) {
       const summary: AgentSummary = {
         agentId: record.agentId,
@@ -237,11 +231,9 @@ export class CompletionService {
         if (!this.publishedRuns.has(key)) {
           this.publishedRuns.add(key);
           this.queue.push(record.latestCompletion);
-          backPingCount += 1;
         }
       }
     }
-    return { backPingCount };
   }
 
   /** Full inventory of every owned agent, including agents with no completion yet. */

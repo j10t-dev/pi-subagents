@@ -9,7 +9,7 @@ import { launchSession, runningTransport, testRuntime } from "./support/launches
 import { deferred } from "./support/async.ts";
 import { testBarrier } from "./support/barriers.ts";
 import { restoreRuns } from "./support/controllers.ts";
-import { launchEntry, spawnedEntry, testRestorationPort } from "./support/restoration.ts";
+import { completedEntry, launchEntry, spawnedEntry, startedEntry, testRestorationPort } from "./support/restoration.ts";
 
 /** Post-native-identity seams, each of which must own settlement against a stop/shutdown contender. */
 const postIdentitySeams = ["bindRun", "persistRunStarted", "waitSettled"] as const;
@@ -19,6 +19,9 @@ const TEST_SELECTION = Object.freeze({
   thinkingLevel: "high" as const,
   tools: Object.freeze(["read"]),
 });
+
+const A = agentId("agent-a");
+const R1 = runId("deadbeef");
 
 function preparationScopeTypeFixture(scope: PreparationScope): void {
   // @ts-expect-error detached work is scheduling-only and has no awaitable result
@@ -881,7 +884,7 @@ describe("parent lifecycle wiring", () => {
       "output:bind_run", "persist:run_started", "return:running",
     ]);
     expect(await Promise.race([statusRefresh.then(() => true), Bun.sleep(100).then(() => false)])).toBeTrue();
-    expect(c.status()).toBe("agents: 0 running, 0 result ready");
+    expect(c.status()).toBe("agents: 0 running, 0 results ready");
   });
 
   test("resolves exact identity only after agent_start and polls pending snapshots", async () => {
@@ -1332,6 +1335,36 @@ describe("parent lifecycle wiring", () => {
     }
   }
 
+  test.each([
+    [0, 0, "agents: 0 running, 0 results ready"],
+    [1, 1, "agents: 1 running, 1 result ready"],
+    [2, 2, "agents: 2 running, 2 results ready"],
+  ] as const)("status uses independent count pluralisation for %s running and %s ready", async (running, ready, expected) => {
+    const controller = new SubagentController();
+    const runningAgents = [A, agentId("running-b")];
+    const runningRuns = [R1, runId("cafebabe")];
+    const readyAgents = [agentId("ready-a"), agentId("ready-b")];
+    const readyRuns = [runId("feedface"), runId("facefeed")];
+
+    await restoreRuns(controller.runs, runningAgents.slice(0, running).map((agentIdValue, index) => ({
+      agentId: agentIdValue,
+      runId: runningRuns[index]!,
+      state: AgentState.Running,
+      transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${agentIdValue}`),
+    })));
+    for (const index of Array.from({ length: ready }, (_, value) => value)) {
+      await controller.publish(completedCompletion({
+        agentId: readyAgents[index]!,
+        runId: readyRuns[index]!,
+        output: truncateUtf8(`result-${readyRuns[index]}`, 50_000),
+        outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${readyRuns[index]}.md`),
+        transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${readyAgents[index]}`),
+      }));
+    }
+
+    expect(controller.status()).toBe(expected);
+  });
+
   test("runtime back-pings use followUp while busy and triggerTurn while idle, once per epoch", async () => {
     const sent: object[] = [];
     let busy = true;
@@ -1356,12 +1389,20 @@ describe("parent lifecycle wiring", () => {
     expect(pings).toBe(2);
   });
 
-  test("restoration emits nextTurn without triggering a turn", async () => {
-    const sent: object[] = [];
-    const c = new SubagentController({ parent: { isBusy: () => false, sendMessage: async (_text, options) => { sent.push(options); } } });
-    c.completions.restore([{ agentId: agentId("a"), state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion("deadbeef") }]);
-    await c.notifyRestored(1);
-    expect(sent).toEqual([{ deliverAs: "nextTurn", triggerTurn: false }]);
+  test("restoration sends no message and leaves the completion collectable", async () => {
+    const sent: Array<{ text: string; options: object }> = [];
+    const controller = new SubagentController({
+      restoration: completedRestorationPort(),
+      parent: {
+        isBusy: () => false,
+        sendMessage: async (text, options) => { sent.push({ text, options }); },
+      },
+    });
+
+    await controller.restore();
+    expect(sent).toEqual([]);
+    const result = await controller.receive();
+    expect(result.completions).toMatchObject([{ agentId: A, runId: R1 }]);
   });
 
   test("tree blocks active ownership and switch/fork warn", async () => {
@@ -1374,6 +1415,17 @@ describe("parent lifecycle wiring", () => {
     expect(warnings).toHaveLength(3);
   });
 });
+
+function completedRestorationPort() {
+  return testRestorationPort({
+    getBranch: () => [
+      spawnedEntry({ agentId: A }),
+      launchEntry({ agentId: A }),
+      startedEntry({ agentId: A, runId: R1 }),
+      completedEntry({ agentId: A, runId: R1 }),
+    ],
+  });
+}
 
 function completion(id: string) {
   return completedCompletion({

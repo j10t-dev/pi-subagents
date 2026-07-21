@@ -105,8 +105,10 @@ describe("controller orchestration scenarios", () => {
 
   test("06 restored parent collects an earlier uncollected completion", async () => {
     const service = new CompletionService();
-    expect(service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "old") }])).toEqual({ backPingCount: 1 });
+    service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "old") }]);
+    expect(service.queuedCount()).toBe(1);
     expect((await service.receive()).completions[0]?.output.text).toBe("old");
+    expect(service.queuedCount()).toBe(0);
   });
 
   test("07 stopped child resumes after parent restart", async () => {
