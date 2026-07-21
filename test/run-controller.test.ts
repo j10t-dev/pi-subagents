@@ -475,6 +475,35 @@ describe("RunController arbitration", () => {
     expect(c.activeCount()).toBe(0);
   });
 
+  test("a synchronous abort throw does not prevent authoritative containment or terminal finalisation", async () => {
+    const trace: string[] = [];
+    const c = testRunController({
+      onStopping: () => { trace.push("persist:stopping"); },
+      onTerminal: (_record, settlement) => { trace.push(`publish:${settlement.kind}`); },
+      onRelease: () => { trace.push("release"); },
+    });
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({
+      status: "accepted",
+      runId: testRunId("deadbeef"),
+      runtime: {
+        abort: () => { trace.push("abort:threw"); throw new Error("abort transport failed"); },
+        contain: async () => { trace.push("contain:receipt"); return testVerifiedReceiptPath(); },
+      },
+    }));
+
+    expect(await c.stop(id, CancellationReason.StopRequested)).toEqual({ status: "stopped", agentId: id, runId: testRunId("deadbeef") });
+    expect(trace).toEqual([
+      "persist:stopping",
+      "abort:threw",
+      "contain:receipt",
+      "publish:cancelled",
+      "release",
+    ]);
+    expect(c.snapshot(id)?.state).toBe(AgentState.Stopped);
+    expect(c.activeCount()).toBe(0);
+  });
+
   test.each([CancellationReason.StopRequested, CancellationReason.ParentShutdown])(
     "the winning %s cancellation reason reaches terminal finalisation",
     async (reason) => {
