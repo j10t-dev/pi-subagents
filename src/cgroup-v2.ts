@@ -32,12 +32,17 @@ import { isContainedPath } from "./paths.ts";
 
 const UNAVAILABLE_PREFIX = "containment_unavailable:";
 
+export interface CgroupStat {
+  isDirectory(): boolean;
+  readonly mode: number;
+}
+
 export interface CgroupFileSystem {
   readFile(path: string): string;
   writeFile(path: string, value: string): void;
   mkdir(path: string, mode: number): void;
   realpath(path: string): string;
-  stat(path: string): { isDirectory(): boolean };
+  stat(path: string): CgroupStat;
   removeDirectory(path: string): void;
   /** Returns direct directory-entry names, matching `readdirSync(path)`. */
   list(path: string): readonly string[];
@@ -69,30 +74,28 @@ export function cgroupScopeName(value: string): string {
 }
 
 export function resolveCgroupV2Backend(options: CgroupV2Options): ContainmentBackend {
-  const fs = options.fs ?? nodeFileSystem;
+  const fs = options.fs ?? nodeCgroupFileSystem;
   const mountReal = canonicalDirectory(fs, options.mountPath ?? "/sys/fs/cgroup", "mount");
   if (options.configuredRoot !== undefined &&
       (!isAbsolute(options.configuredRoot) || options.configuredRoot.includes("\0"))) {
     unavailable("configured root");
   }
-  const resolution = options.configuredRoot === undefined
+  const root = options.configuredRoot === undefined
     ? resolveDefaultRoot(
       fs,
       mountReal,
       options.selfCgroupText ?? readFileSync("/proc/self/cgroup", "utf8"),
     )
-    : {
-      root: canonicalContainedDirectory(fs, mountReal, options.configuredRoot, "configured root"),
-      autoCreatedRoot: false,
-    };
-  const parentCandidate = join(resolution.root, cgroupScopeName(options.parentSessionId));
-  if (directoryExists(fs, parentCandidate)) {
-    requireDirectory(fs, parentCandidate, "parent scope");
-  } else {
+    : canonicalContainedDirectory(fs, mountReal, options.configuredRoot, "configured root");
+  const parentCandidate = join(root, cgroupScopeName(options.parentSessionId));
+  const parentStat = probeDirectoryStrict(fs, parentCandidate, "parent scope");
+  if (parentStat === undefined) {
     filesystemOperation("parent scope", () => fs.mkdir(parentCandidate, 0o700));
+  } else if (!parentStat.isDirectory()) {
+    unavailable("parent scope");
   }
-  const parentReal = canonicalContainedDirectory(fs, resolution.root, parentCandidate, "parent scope");
-  return new CgroupV2Backend(fs, resolution.root, parentReal, resolution.autoCreatedRoot, options);
+  const parentReal = canonicalContainedDirectory(fs, root, parentCandidate, "parent scope");
+  return new CgroupV2Backend(fs, root, parentReal, options);
 }
 
 export type ContainmentProvider =
@@ -125,7 +128,6 @@ class CgroupV2Backend implements ContainmentBackend {
     private readonly fs: CgroupFileSystem,
     root: string,
     parentScope: string,
-    private readonly autoCreatedRoot: boolean,
     private readonly options: CgroupV2Options,
   ) {
     this.root = root as AbsolutePath;
@@ -205,8 +207,7 @@ class CgroupV2Backend implements ContainmentBackend {
     for (const attempt of [...this.attempts.values()]) {
       await attempt.retryCleanup();
     }
-    const parentRemoved = this.removeIntermediate(this.parentScope, "parent scope");
-    if (parentRemoved && this.autoCreatedRoot) this.removeIntermediate(this.root, "root");
+    this.removeIntermediate(this.parentScope, "parent scope");
   }
 
   ensureNoProcessScope(scope: string): void {
@@ -405,23 +406,27 @@ function resolveDefaultRoot(
   fs: CgroupFileSystem,
   mountReal: string,
   selfCgroupText: string,
-): { root: string; autoCreatedRoot: boolean } {
+): string {
   const unified = parseUnifiedPath(selfCgroupText);
   const current = resolve(mountReal, `.${unified}`);
   assertContained(mountReal, current, "parent cgroup");
   const currentReal = canonicalContainedDirectory(fs, mountReal, current, "parent cgroup");
   const rootCandidate = join(currentReal, "pi-subagents");
-  if (directoryExists(fs, rootCandidate)) {
-    return {
-      root: canonicalContainedDirectory(fs, mountReal, rootCandidate, "root"),
-      autoCreatedRoot: false,
-    };
+
+  const existing = probeDirectoryStrict(fs, rootCandidate, "root");
+  if (existing === undefined) {
+    try {
+      fs.mkdir(rootCandidate, 0o700);
+    } catch (error) {
+      if (error instanceof TypeError) throw error;
+      if (errorCode(error) !== "EEXIST") unavailable("root");
+    }
   }
-  filesystemOperation("root", () => fs.mkdir(rootCandidate, 0o700));
-  return {
-    root: canonicalContainedDirectory(fs, mountReal, rootCandidate, "root"),
-    autoCreatedRoot: true,
-  };
+
+  const resolved = probeDirectoryStrict(fs, rootCandidate, "root");
+  if (resolved === undefined) unavailable("root");
+  requirePrivateDirectory(resolved, "root");
+  return canonicalContainedDirectory(fs, mountReal, rootCandidate, "root");
 }
 
 function parseUnifiedPath(text: string): string {
@@ -474,6 +479,24 @@ function requireDirectory(fs: CgroupFileSystem, path: string, label: string): vo
   if (!stat.isDirectory()) unavailable(label);
 }
 
+function probeDirectoryStrict(
+  fs: CgroupFileSystem,
+  path: string,
+  label: string,
+): CgroupStat | undefined {
+  try {
+    return fs.stat(path);
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    if (errorCode(error) === "ENOENT") return undefined;
+    unavailable(label);
+  }
+}
+
+function requirePrivateDirectory(stat: CgroupStat, label: string): void {
+  if (!stat.isDirectory() || (stat.mode & 0o777) !== 0o700) unavailable(label);
+}
+
 function directoryExists(fs: CgroupFileSystem, path: string): boolean {
   try {
     fs.stat(path);
@@ -519,13 +542,9 @@ class CgroupUnavailableError extends Error {
 }
 
 function errorCode(error: unknown): string | undefined {
-  if (typeof error === "object" && error !== null && "code" in error) {
-    const code = Reflect.get(error, "code");
-    if (typeof code === "string") return code;
-  }
-  return error instanceof Error && /^(?:ENOENT|ENOTEMPTY)$/.test(error.message)
-    ? error.message
-    : undefined;
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const code = Reflect.get(error, "code");
+  return typeof code === "string" ? code : undefined;
 }
 
 function bestEffort(operation: () => void): void {
@@ -554,7 +573,7 @@ function defaultProbe(): ProbeProcess {
   };
 }
 
-const nodeFileSystem: CgroupFileSystem = {
+export const nodeCgroupFileSystem: CgroupFileSystem = {
   readFile: (path) => readFileSync(path, "utf8"),
   writeFile: (path, value) => writeFileSync(path, value),
   mkdir: (path, mode) => mkdirSync(path, { mode }),

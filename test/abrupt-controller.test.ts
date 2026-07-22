@@ -298,8 +298,14 @@ class RestorationFs implements CgroupFileSystem {
     if (path.endsWith("/cgroup.kill")) this.files.set(path.replace("cgroup.kill", "cgroup.events"), "populated 0\n");
   }
   mkdir(path: string): void { this.add(path); }
-  realpath(path: string): string { if (!this.directories.has(path)) throw new Error("ENOENT"); return path; }
-  stat(path: string): { isDirectory(): boolean } { if (!this.directories.has(path)) throw new Error("ENOENT"); return { isDirectory: () => true }; }
+  realpath(path: string): string {
+    if (!this.directories.has(path)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return path;
+  }
+  stat(path: string): { isDirectory(): boolean; mode: number } {
+    if (!this.directories.has(path)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return { isDirectory: () => true, mode: 0o700 };
+  }
   removeDirectory(path: string): void { this.directories.delete(path); }
   list(): readonly string[] { return []; }
   private add(path: string): void {
