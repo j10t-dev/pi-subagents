@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { accessSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import {
+  accessSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmdirSync,
+  writeFileSync,
+} from "node:fs";
 import { constants } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +80,65 @@ describe("production cgroup-v2 process containment", () => {
     }
   }, 30_000);
 
+  test("adopts exactly one concurrent production default-root creation", async () => {
+    const membership = `${currentUnifiedPath().replace(/\/$/, "")}/${raceScratchName()}`;
+    if (membership.split("/").includes("..")) throw new Error(`unsafe cgroup membership: ${membership}`);
+    const scratch = join("/sys/fs/cgroup", membership);
+    const barrierRoot = temporaryStateRoot("pi-cgroup-root-race-");
+    const barrier = barrierRoot.path;
+    const arrivalA = join(barrier, "a.arrived");
+    const arrivalB = join(barrier, "b.arrived");
+    const releasePath = join(barrier, "release");
+    let first: RaceFixture | undefined;
+    let second: RaceFixture | undefined;
+    try {
+      mkdirSync(scratch, { mode: 0o700 });
+      first = spawnRaceFixture(membership, scratch, "a", barrier, `race-parent-a-${process.pid}-${Date.now()}`);
+      second = spawnRaceFixture(membership, scratch, "b", barrier, `race-parent-b-${process.pid}-${Date.now()}`);
+      await waitForFiles([arrivalA, arrivalB], 10_000);
+      writeFileSync(releasePath, "release", { flag: "wx" });
+
+      const results = await Promise.all([first.result, second.result]);
+      expect(results.map((result) => result.mkdirOutcome).sort()).toEqual(["EEXIST", "created"]);
+      expect(new Set(results.map((result) => result.parentScope)).size).toBe(2);
+      expect(results.every((result) => result.root === join(scratch, "pi-subagents"))).toBeTrue();
+      expect(existsSync(join(scratch, "pi-subagents"))).toBeTrue();
+      trimEmptyCgroupTree(scratch);
+      expect(existsSync(scratch)).toBeFalse();
+    } finally {
+      if (!existsSync(releasePath)) {
+        try { writeFileSync(releasePath, "release", { flag: "wx" }); } catch { /* another cleaner released it */ }
+      }
+      for (const fixture of [first, second]) fixture?.child.kill();
+      const settlements = await Promise.allSettled([first?.result, second?.result].filter(isDefined));
+      const failures = settlements.filter((result) => result.status === "rejected");
+      const diagnostics = [first, second].filter(isDefined).map((fixture) => fixture.diagnostic()).join("\n");
+      trimEmptyCgroupTreeBestEffort(scratch);
+      barrierRoot.cleanup();
+      if (failures.length > 0 && diagnostics.length > 0) throw new Error(`race fixture failure:\n${diagnostics}`);
+    }
+  }, 30_000);
+
+  test("waits for a successful fixture stdout pipe to close before parsing", async () => {
+    const stateRoot = temporaryStateRoot("pi-cgroup-delayed-stdout-");
+    const fixture = join(stateRoot.path, "delayed-stdout.cjs");
+    writeFileSync(fixture, [
+      'const { spawn } = require("node:child_process");',
+      'spawn(process.execPath, ["-e", `setTimeout(() => process.stdout.write(JSON.stringify({ id: "a", root: "/root", parentScope: "/scope", mkdirOutcome: "created" }) + "\\\\n"), 50)`], { stdio: ["ignore", "inherit", "inherit"] }).unref();',
+    ].join("\n"));
+    try {
+      const race = spawnRaceFixture("/", "/unused", "a", stateRoot.path, "delayed-stdout", fixture);
+      const result = await race.result.catch((error: unknown) => {
+        throw new Error(`delayed stdout fixture failed: ${error instanceof Error ? error.message : String(error)}; ${race.diagnostic()}`);
+      });
+      expect(result).toEqual({
+        id: "a", root: "/root", parentScope: "/scope", mkdirOutcome: "created",
+      });
+    } finally {
+      stateRoot.cleanup();
+    }
+  });
+
   test("configured-root descendants remain nested beneath the ancestor attempt", async () => {
     const stateRoot = temporaryStateRoot("pi-cgroup-nested-");
     const state: string = stateRoot.path;
@@ -121,6 +190,101 @@ describe("production cgroup-v2 process containment", () => {
     }
   }, 30_000);
 });
+
+interface RaceFixtureResult {
+  readonly id: "a" | "b";
+  readonly root: string;
+  readonly parentScope: string;
+  readonly mkdirOutcome: "created" | "EEXIST";
+}
+
+interface RaceFixture {
+  readonly child: ChildProcess;
+  readonly result: Promise<RaceFixtureResult>;
+  diagnostic(): string;
+}
+
+function currentUnifiedPath(): string {
+  const text = readFileSync("/proc/self/cgroup", "utf8").trim();
+  const match = /^0::(\/(?:[^/\n]+(?:\/[^/\n]+)*)?)$/.exec(text);
+  if (match?.[1] === undefined) throw new Error(`unexpected unified cgroup: ${text}`);
+  if (match[1].split("/").includes("..")) throw new Error(`unsafe unified cgroup: ${match[1]}`);
+  return match[1];
+}
+
+function raceScratchName(): string {
+  return `pi-subagents-race-${process.pid}-${Date.now()}`;
+}
+
+function spawnRaceFixture(
+  membership: string,
+  scratch: string,
+  id: "a" | "b",
+  barrier: string,
+  parentSessionId: string,
+  fixture = fileURLToPath(new URL("fixtures/cgroup-root-race.ts", import.meta.url)),
+): RaceFixture {
+  const child = spawn(process.execPath, [fixture, membership, scratch, id, barrier, parentSessionId], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: Buffer) => { stdout = boundedDiagnostic(stdout + chunk.toString()); });
+  child.stderr.on("data", (chunk: Buffer) => { stderr = boundedDiagnostic(stderr + chunk.toString()); });
+  const result = new Promise<RaceFixtureResult>((resolve, reject) => {
+    let exitOutcome: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    child.once("error", reject);
+    child.once("exit", (code, signal) => { exitOutcome = { code, signal }; });
+    child.once("close", () => {
+      if (exitOutcome === undefined) {
+        reject(new Error(`race fixture ${id} closed without an exit outcome; stdout=${stdout}; stderr=${stderr}`));
+        return;
+      }
+      if (exitOutcome.code !== 0 || exitOutcome.signal !== null) {
+        reject(new Error(`race fixture ${id} exited code=${exitOutcome.code} signal=${exitOutcome.signal}; stdout=${stdout}; stderr=${stderr}`));
+        return;
+      }
+      try {
+        const lines = stdout.trim().split("\n");
+        const line = lines[0];
+        if (lines.length !== 1 || line === undefined || line === "") throw new Error("expected exactly one JSON record");
+        resolve(JSON.parse(line) as RaceFixtureResult);
+      } catch (error) {
+        reject(new Error(`race fixture ${id} invalid output: ${error instanceof Error ? error.message : String(error)}; stderr=${stderr}`));
+      }
+    });
+  });
+  void result.catch(() => undefined);
+  return { child, result, diagnostic: () => `fixture ${id}: stdout=${stdout}; stderr=${stderr}` };
+}
+
+async function waitForFiles(paths: readonly string[], timeout: number): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (paths.every(existsSync)) return;
+    await Bun.sleep(10);
+  }
+  throw new Error(`race fixture arrivals timed out: ${paths.filter((path) => !existsSync(path)).join(", ")}`);
+}
+
+function trimEmptyCgroupTree(root: string): void {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) trimEmptyCgroupTree(join(root, entry.name));
+  }
+  rmdirSync(root);
+}
+
+function trimEmptyCgroupTreeBestEffort(root: string): void {
+  try { trimEmptyCgroupTree(root); } catch { /* failure cleanup must not mask the primary error */ }
+}
+
+function boundedDiagnostic(value: string): string {
+  return value.length <= 4_096 ? value : value.slice(-4_096);
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
+}
 
 function resolveSetsid(): string {
   for (const directory of (process.env.PATH ?? "").split(":")) {
