@@ -19,6 +19,7 @@ import {
 export interface TestGroupProcess {
   readonly stdout: NodeJS.ReadableStream | null;
   readonly stderr: NodeJS.ReadableStream | null;
+  once(event: "spawn", listener: () => void): this;
   once(event: "error", listener: (error: Error) => void): this;
   once(
     event: "exit",
@@ -136,6 +137,7 @@ function spawnCapturedGroup(
       },
     );
 
+    let spawned = false;
     let exitOccurred = false;
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
@@ -202,8 +204,12 @@ function spawnCapturedGroup(
     observeStream(child.stdout, stdout, () => { stdoutSettled = true; });
     observeStream(child.stderr, stderr, () => { stderrSettled = true; });
 
+    child.once("spawn", () => {
+      spawned = true;
+    });
     child.once("error", (error) => {
       if (failure === undefined) failure = error;
+      if (spawned) return;
       exitOccurred = true;
       stdoutSettled = true;
       stderrSettled = true;

@@ -24,6 +24,33 @@ import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const SETSID = resolveSetsid();
 
+describe("race fixture failure cleanup", () => {
+  test("preserves a rejected fixture reason when diagnostics are empty", () => {
+    const spawnError = new Error("fixture spawn failed");
+
+    const error = raceFixtureCleanupError([
+      { status: "rejected", reason: spawnError },
+    ], "");
+
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(error?.errors).toEqual([spawnError]);
+  });
+
+  test("includes bounded fixture diagnostics without replacing rejection reasons", () => {
+    const lifecycleError = new Error("fixture closed without exit");
+
+    const error = raceFixtureCleanupError([
+      { status: "rejected", reason: lifecycleError },
+    ], `prefix-${"x".repeat(5_000)}`);
+
+    expect(error?.errors[0]).toBe(lifecycleError);
+    expect(error?.errors[1]).toBeInstanceOf(Error);
+    expect((error?.errors[1] as Error).message).toStartWith("race fixture diagnostics:\n");
+    expect((error?.errors[1] as Error).message).not.toContain("prefix-");
+    expect((error?.errors[1] as Error).message.length).toBeLessThan(4_200);
+  });
+});
+
 describe("production cgroup-v2 process containment", () => {
   test("kills a setsid descendant outside the launcher process group", async () => {
     const stateRoot = temporaryStateRoot("pi-cgroup-process-");
@@ -111,11 +138,11 @@ describe("production cgroup-v2 process containment", () => {
       }
       for (const fixture of [first, second]) fixture?.child.kill();
       const settlements = await Promise.allSettled([first?.result, second?.result].filter(isDefined));
-      const failures = settlements.filter((result) => result.status === "rejected");
       const diagnostics = [first, second].filter(isDefined).map((fixture) => fixture.diagnostic()).join("\n");
+      const fixtureError = raceFixtureCleanupError(settlements, diagnostics);
       trimEmptyCgroupTreeBestEffort(scratch);
       barrierRoot.cleanup();
-      if (failures.length > 0 && diagnostics.length > 0) throw new Error(`race fixture failure:\n${diagnostics}`);
+      if (fixtureError !== undefined) throw fixtureError;
     }
   }, 30_000);
 
@@ -280,6 +307,18 @@ function trimEmptyCgroupTreeBestEffort(root: string): void {
 
 function boundedDiagnostic(value: string): string {
   return value.length <= 4_096 ? value : value.slice(-4_096);
+}
+
+function raceFixtureCleanupError(
+  settlements: readonly PromiseSettledResult<unknown>[],
+  diagnostics: string,
+): AggregateError | undefined {
+  const reasons = settlements.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (reasons.length === 0) return undefined;
+  const errors = diagnostics.length === 0
+    ? reasons
+    : [...reasons, new Error(`race fixture diagnostics:\n${boundedDiagnostic(diagnostics)}`)];
+  return new AggregateError(errors, "race fixture failure");
 }
 
 function isDefined<T>(value: T | undefined): value is T {

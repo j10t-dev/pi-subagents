@@ -54,6 +54,7 @@ class FakeTestGroupProcess extends EventEmitter implements TestGroupProcess {
   readonly stdout: PassThrough | null;
   readonly stderr: PassThrough | null;
   readonly killSignals: NodeJS.Signals[] = [];
+  killResult = true;
 
   constructor(captured = true) {
     super();
@@ -63,7 +64,11 @@ class FakeTestGroupProcess extends EventEmitter implements TestGroupProcess {
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
     this.killSignals.push(signal);
-    return true;
+    return this.killResult;
+  }
+
+  spawned(): void {
+    this.emit("spawn");
   }
 
   exit(code: number | null, signal: NodeJS.Signals | null = null): void {
@@ -498,6 +503,36 @@ describe("captured group settlement", () => {
     first.exit(0);
     first.stderr?.emit("close");
     expect(harness.writes.filter((write) => write.includes("===== test group: unit ====="))).toHaveLength(1);
+  });
+
+  test("a post-spawn child error after failed capture kill waits for exit and preserves the capture error", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    first.killResult = false;
+    const harness = runnerHarness([first, second]);
+    const captureError = new Error("stdout capture failed");
+    const killError = Object.assign(new Error("kill denied"), { code: "EPERM" });
+    let settled = false;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, harness.dependencies);
+    running.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    first.spawned();
+    second.stdout?.end();
+    second.stderr?.end();
+    second.exit(0);
+    first.stdout?.emit("error", captureError);
+    expect(first.killSignals).toEqual(["SIGTERM"]);
+    first.spawnError(killError);
+    first.stderr?.end();
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+    expect(settled).toBeFalse();
+    expect(harness.writes.some((write) => write.includes("===== test group: unit ====="))).toBeFalse();
+
+    first.exit(0);
+    await expect(running).rejects.toBe(captureError);
   });
 
   test("publishes the first capture diagnostic once after stderr evicts both bounded regions", async () => {
