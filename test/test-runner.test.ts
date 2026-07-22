@@ -1,10 +1,13 @@
-import { readFileSync, symlinkSync } from "node:fs";
 import { EventEmitter } from "node:events";
+import { closeSync, existsSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
+import { mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
+import { pipeline as streamPipeline } from "node:stream/promises";
 import type { SpawnOptions } from "node:child_process";
 
-import { afterAll, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 import {
   TEST_GROUP_NAMES,
@@ -12,71 +15,38 @@ import {
   discoverTestFiles,
   groupTestFiles,
   parseRequestedGroups,
-  resolveTestGroupOwner,
   selectTestGroups,
+  resolveTestGroupOwner,
   type TestGroup,
   type TestGroupName,
 } from "../scripts/test-groups.ts";
 import {
-  BoundedTestOutput,
-  formatTestGroupOutput,
-} from "../scripts/bounded-test-output.ts";
-import {
   integrationConcurrency,
   runSelectedTestGroups,
-  runTestGroups,
   testCommandArguments,
   type RunnerDependencies,
+  type RunnerFileSystem,
   type TestGroupProcess,
 } from "../scripts/run-tests.ts";
-import { temporaryTree as createTemporaryTree } from "./support/temp-state.ts";
-
 const REPOSITORY_ROOT = join(import.meta.dir, "..");
-const DISCOVERED = discoverTestFiles(REPOSITORY_ROOT);
-
-const temporaryRoots: Array<{ cleanup(): void }> = [];
-
-afterAll(() => {
-  for (const root of temporaryRoots) root.cleanup();
-});
-
-function temporaryTree(relativePaths: readonly string[]): string {
-  const tree = createTemporaryTree(relativePaths, "pi-test-groups-");
-  temporaryRoots.push(tree);
-  return tree.path;
-}
-
-function groupOf(groups: readonly TestGroup[], file: string): TestGroupName | undefined {
-  return groups.find((group) => group.files.includes(file))?.name;
-}
 
 class FakeTestGroupProcess extends EventEmitter implements TestGroupProcess {
-  readonly stdout: PassThrough | null;
-  readonly stderr: PassThrough | null;
-  readonly killSignals: NodeJS.Signals[] = [];
-  killResult = true;
-
-  constructor(captured = true) {
-    super();
-    this.stdout = captured ? new PassThrough() : null;
-    this.stderr = captured ? new PassThrough() : null;
-  }
-
-  kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
-    this.killSignals.push(signal);
-    return this.killResult;
-  }
-
-  spawned(): void {
-    this.emit("spawn");
-  }
-
+  private descriptor: number | undefined;
+  ownDescriptor(descriptor: number): void { this.descriptor = descriptor; }
+  spawned(): void { this.emit("spawn"); }
   exit(code: number | null, signal: NodeJS.Signals | null = null): void {
     this.emit("exit", code, signal);
+    this.closeDescriptor();
   }
-
   spawnError(error: Error): void {
     this.emit("error", error);
+    this.closeDescriptor();
+  }
+  private closeDescriptor(): void {
+    if (this.descriptor !== undefined) {
+      closeSync(this.descriptor);
+      this.descriptor = undefined;
+    }
   }
 }
 
@@ -85,762 +55,838 @@ interface SpawnRecord {
   readonly args: readonly string[];
   readonly options: SpawnOptions;
   readonly child: FakeTestGroupProcess;
+  readonly childDescriptor?: number;
 }
 
-function runnerHarness(children: readonly FakeTestGroupProcess[], parallelism = 6): {
+function parentTranscriptDescriptor(options: SpawnOptions): number {
+  const stdio = options.stdio;
+  if (!Array.isArray(stdio) || typeof stdio[1] !== "number" || stdio[1] !== stdio[2]) {
+    throw new Error("expected one shared transcript descriptor");
+  }
+  return stdio[1];
+}
+
+async function launched(records: readonly SpawnRecord[], count: number): Promise<void> {
+  for (let turn = 0; turn < 100 && records.length < count; turn += 1) await Bun.sleep(1);
+  if (records.length !== count) throw new Error(`expected ${count} launched children, got ${records.length}`);
+}
+
+function writeChildOutput(record: SpawnRecord, text: string): void {
+  if (record.childDescriptor === undefined) throw new Error("missing child descriptor");
+  writeSync(record.childDescriptor, text);
+}
+
+function runnerHarness(children: readonly FakeTestGroupProcess[], parallelism = 6, isTTY?: boolean): {
   readonly dependencies: RunnerDependencies;
   readonly records: SpawnRecord[];
-  readonly writes: string[];
+  readonly fileSystem: RunnerFileSystem;
+  readonly transcriptPaths: () => string[];
+  readonly stdoutText: () => string;
+  readonly stderrText: () => string;
+  readonly parentCloseCalls: () => number;
+  readonly temporaryDirectory: () => string | undefined;
 } {
   const records: SpawnRecord[] = [];
-  const writes: string[] = [];
+  const transcriptPathByParentDescriptor = new Map<number, string>();
+  const paths: string[] = [];
+  let directory: string | undefined;
+  let closeCalls = 0;
   let nextChild = 0;
+  let output = "";
+  let diagnostics = "";
+  const stdout = new PassThrough();
+  stdout.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+  if (isTTY !== undefined) Object.defineProperty(stdout, "isTTY", { value: isTTY });
+  const fileSystem: RunnerFileSystem = {
+    async mkdtemp(prefix) { directory = await mkdtemp(prefix); return directory; },
+    async open(path, flags, mode) {
+      const handle = await open(path, flags, mode);
+      const isTranscript = flags === "wx";
+      if (isTranscript) {
+        paths.push(path);
+        transcriptPathByParentDescriptor.set(handle.fd, path);
+      }
+      const close = handle.close.bind(handle);
+      handle.close = async () => { if (isTranscript) closeCalls += 1; await close(); };
+      return handle;
+    },
+    createReadStream(path) {
+      const stream = new PassThrough();
+      stream.end(readFileSync(path));
+      return stream;
+    },
+    async stat(handle) { return handle.stat(); },
+    async readLastByte(handle, position) {
+      const buffer = Buffer.alloc(1);
+      await handle.read(buffer, 0, 1, position);
+      return buffer[0] ?? -1;
+    },
+    rm: async (path) => { await rm(path, { recursive: true, force: true }); },
+  };
   return {
-    records,
-    writes,
+    records, fileSystem,
+    transcriptPaths: () => [...paths],
+    stdoutText: () => output,
+    stderrText: () => diagnostics,
+    parentCloseCalls: () => closeCalls,
+    temporaryDirectory: () => directory,
     dependencies: {
       parallelism,
+      stdout,
+      stderr: { write(chunk) { diagnostics += Buffer.from(chunk).toString("utf8"); return true; } },
+      fileSystem,
       spawn(command, args, options) {
-        const child = children[nextChild];
+        const child = children[nextChild++];
         if (child === undefined) throw new Error("missing fake child");
-        nextChild += 1;
-        records.push({ command, args, options, child });
+        if (options.stdio === "inherit") {
+          records.push({ command, args, options, child });
+          return child;
+        }
+        const parentDescriptor = parentTranscriptDescriptor(options);
+        const path = transcriptPathByParentDescriptor.get(parentDescriptor);
+        if (path === undefined) throw new Error("unknown transcript descriptor");
+        const childDescriptor = openSync(path, "a", 0o600);
+        child.ownDescriptor(childDescriptor);
+        records.push({ command, args, options, child, childDescriptor });
         return child;
-      },
-      stdout: {
-        write(chunk: Uint8Array | string): boolean {
-          writes.push(Buffer.from(chunk).toString("utf8"));
-          return true;
-        },
       },
     },
   };
 }
 
-describe("discoverTestFiles", () => {
-  test("walks nested directories and excludes support modules and the live smoke", () => {
-    const root = temporaryTree([
-      "test/domain.test.ts",
-      "test/nested/rpc-wire.test.ts",
-      "test/nested/controller.test.ts",
-      "test/support/helper.ts",
-      "test/live-model-smoke.test.ts",
-    ]);
+const unit: TestGroup = { name: "unit", files: ["test/domain.test.ts"] };
+const transport: TestGroup = { name: "transport", files: ["test/rpc-client.test.ts"] };
+const processGroup: TestGroup = { name: "process", files: ["test/watchdog.test.ts"] };
 
-    expect(discoverTestFiles(root)).toEqual([
-      "test/domain.test.ts",
-      "test/nested/controller.test.ts",
-      "test/nested/rpc-wire.test.ts",
-    ]);
-  });
-
-  test("names the expected path when the test directory is missing", () => {
-    const root = temporaryTree(["package.json"]);
-
-    expect(() => discoverTestFiles(root)).toThrow(
-      `test directory not found: ${join(root, "test")}`,
-    );
-  });
-
-  test("rejects a symlinked test root", () => {
-    const root = temporaryTree(["outside/domain.test.ts"]);
-    const link = join(root, "test");
-    symlinkSync(join(root, "outside"), link);
-
-    expect(() => discoverTestFiles(root)).toThrow(`symlinked test path: ${link}`);
-  });
-
-  test("rejects a symlinked test file", () => {
-    const root = temporaryTree(["test/target.test.ts"]);
-    const link = join(root, "test", "linked.test.ts");
-    symlinkSync(join(root, "test", "target.test.ts"), link);
-
-    expect(() => discoverTestFiles(root)).toThrow(`symlinked test path: ${link}`);
-  });
-
-  test("rejects a symlinked test directory", () => {
-    const root = temporaryTree(["outside/nested.test.ts", "test/domain.test.ts"]);
-    const link = join(root, "test", "linked");
-    symlinkSync(join(root, "outside"), link);
-
-    expect(() => discoverTestFiles(root)).toThrow(`symlinked test path: ${link}`);
-  });
-});
-
-describe("groupTestFiles", () => {
-  const groups = groupTestFiles(DISCOVERED);
-
-  test("assigns every current repository default test to exactly one group", () => {
-    const assigned = groups.flatMap((group) => group.files);
-
-    expect(new Set(assigned).size).toBe(assigned.length);
-    expect([...assigned].sort()).toEqual([...DISCOVERED].sort());
-  });
-
-  test("returns all five groups in canonical order", () => {
-    expect(groups.map((group) => group.name)).toEqual([...TEST_GROUP_NAMES]);
-  });
-
-  test.each([
-    ["test/controller-scenarios.test.ts", "controller"],
-    ["test/pi-integration.test.ts", "integration"],
-    ["test/context-safety.test.ts", "controller"],
-  ] as const)("places %s in the %s group", (file, expected) => {
-    expect(groupOf(groups, file)).toBe(expected);
-  });
-
-  test("rejects a file no rule owns", () => {
-    expect(() => groupTestFiles(["test/mystery.test.ts"])).toThrow(
-      "unassigned test file: test/mystery.test.ts",
-    );
-  });
-
-  test("assigns split settings suites to unit exactly once", () => {
-    const unit = groupTestFiles([
-      "test/async-primitives.test.ts",
-      "test/paths.test.ts",
-      "test/settings.test.ts",
-    ]).find((group) => group.name === "unit");
-    expect(unit?.files).toEqual([
-      "test/async-primitives.test.ts",
-      "test/paths.test.ts",
-      "test/settings.test.ts",
-    ]);
-  });
-});
-
-describe("resolveTestGroupOwner", () => {
-  test("resolves against the production rules by default", () => {
-    expect(resolveTestGroupOwner("test/controller-scenarios.test.ts")).toBe("controller");
-  });
-
-  test("rejects a file no rule owns", () => {
-    expect(() => resolveTestGroupOwner("test/mystery.test.ts")).toThrow(
-      "unassigned test file: test/mystery.test.ts",
-    );
-  });
-
-  test("rejects a basename claimed by two rule sets", () => {
-    const conflicting: Record<TestGroupName, ReadonlySet<string>> = {
-      unit: new Set(["contested.test.ts"]),
-      transport: new Set(["contested.test.ts"]),
-      process: new Set(),
-      controller: new Set(),
-      integration: new Set(),
-    };
-
-    expect(() => resolveTestGroupOwner("test/contested.test.ts", conflicting)).toThrow(
-      "multiply assigned test file: test/contested.test.ts",
-    );
-  });
-});
-
-describe("selectTestGroups", () => {
-  const groups = groupTestFiles(DISCOVERED);
-
-  test("returns every group when nothing is requested", () => {
-    expect(selectTestGroups(groups, []).map((group) => group.name)).toEqual([...TEST_GROUP_NAMES]);
-  });
-
-  test("returns only the requested groups in canonical order", () => {
-    expect(selectTestGroups(groups, ["transport", "unit"]).map((group) => group.name)).toEqual([
-      "unit",
-      "transport",
-    ]);
-  });
-});
-
-describe("parseRequestedGroups", () => {
-  test("accepts repeated --group arguments once each", () => {
-    expect(parseRequestedGroups(["--group", "unit", "--group", "transport", "--group", "unit"])).toEqual([
-      "unit",
-      "transport",
-    ]);
-  });
-
-  test("rejects an unknown group", () => {
-    expect(() => parseRequestedGroups(["--group", "nonsense"])).toThrow("unknown test group: nonsense");
-  });
-
-  test("rejects a malformed argument list", () => {
-    expect(() => parseRequestedGroups(["--group"])).toThrow(/--group/);
-    expect(() => parseRequestedGroups(["unit"])).toThrow(/unit/);
-  });
-});
-
-describe("runTestGroups", () => {
-  test.each([1, 16] as const)("all-host overlap at capacity %d", async (parallelism) => {
-    const attempted: string[] = [];
-    const release = Promise.withResolvers<void>();
-    const groups: TestGroup[] = TEST_GROUP_NAMES.map((name) => ({
-      name,
-      files: [`test/${name}.test.ts`],
-    }));
-
-    const running = runTestGroups(groups, async (group) => {
-      testCommandArguments(group, parallelism);
-      attempted.push(group.name);
-      await release.promise;
-      return 0;
-    });
-
-    try {
-      expect(attempted).toEqual([...TEST_GROUP_NAMES]);
-      release.resolve();
-      expect(await running).toBe(0);
-    } finally {
-      release.resolve();
-      await running;
-    }
-  });
-
-  test("waits for every group before propagating a rejection", async () => {
-    const release = Promise.withResolvers<void>();
-    let siblingSettled = false;
-    const groups: TestGroup[] = [
-      { name: "transport", files: ["test/rpc-client.test.ts"] },
-      { name: "integration", files: ["test/pi-integration.test.ts"] },
-    ];
-
-    let settlement: { error: Error | undefined; siblingSettled: boolean } | undefined;
-    const observed = runTestGroups(groups, async (group) => {
-      if (group.name === "transport") throw new Error("spawn failed");
-      await release.promise;
-      siblingSettled = true;
-      return 0;
-    }).then(
-      () => ({ error: undefined, siblingSettled }),
-      (error: Error) => ({ error, siblingSettled }),
-    ).then((result) => {
-      settlement = result;
-      return result;
-    });
-
-    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
-    const settlementBeforeSibling = settlement;
-    release.resolve();
-    const result = await observed;
-    expect(settlementBeforeSibling).toBeUndefined();
-    expect(result.error?.message).toBe("spawn failed");
-    expect(result.siblingSettled).toBeTrue();
-  });
-
-  test("a later-settling earlier canonical rejection wins over a faster later rejection", async () => {
-    const release = Promise.withResolvers<void>();
-    const firstError = new Error("canonical failure");
-    const laterError = new Error("fast later failure");
-    const running = runTestGroups([
-      { name: "unit", files: ["test/domain.test.ts"] },
-      { name: "transport", files: ["test/rpc-client.test.ts"] },
-    ], async (group) => {
-      if (group.name === "unit") {
-        await release.promise;
-        throw firstError;
-      }
-      throw laterError;
-    });
-    release.resolve();
-    await expect(running).rejects.toBe(firstError);
-  });
-
-  test("waits for every started group and returns the first non-zero exit", async () => {
-    const attempted: string[] = [];
-    const groups: TestGroup[] = [
-      { name: "unit", files: [] },
-      { name: "transport", files: ["test/rpc-client.test.ts"] },
-      { name: "process", files: ["test/watchdog.test.ts"] },
-      { name: "integration", files: ["test/pi-integration.test.ts"] },
-    ];
-
-    const exitCode = await runTestGroups(groups, async (group) => {
-      attempted.push(group.name);
-      if (group.name === "transport") return 17;
-      if (group.name === "process") return 23;
-      return 0;
-    });
-
-    expect(exitCode).toBe(17);
-    expect(attempted).toEqual(["transport", "process", "integration"]);
-  });
-
-  test("a later-settling earlier canonical non-zero exit wins over a faster later exit", async () => {
-    const release = Promise.withResolvers<void>();
-    const running = runTestGroups([
-      { name: "unit", files: ["test/domain.test.ts"] },
-      { name: "transport", files: ["test/rpc-client.test.ts"] },
-    ], async (group) => {
-      if (group.name === "unit") {
-        await release.promise;
-        return 17;
-      }
-      return 23;
-    });
-    release.resolve();
-    expect(await running).toBe(17);
-  });
-});
-
+// TDD contract for private allocation, descriptor replay, and canonical outcomes.
 describe("runSelectedTestGroups", () => {
-  const unitGroup: TestGroup = { name: "unit", files: ["test/domain.test.ts"] };
-  const transportGroup: TestGroup = { name: "transport", files: ["test/rpc-client.test.ts"] };
-
-  test("single runnable group inherits stdio and the original environment without publication", async () => {
-    const child = new FakeTestGroupProcess(false);
-    const harness = runnerHarness([child]);
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unitGroup], harness.dependencies);
-
-    expect(harness.records).toHaveLength(1);
-    expect(harness.records[0]?.options.stdio).toBe("inherit");
-    expect(harness.records[0]?.options.env).toBe(process.env);
-    expect(child.stdout).toBeNull();
-    expect(child.stderr).toBeNull();
-    expect(harness.writes).toEqual([]);
-    child.exit(7);
-
-    expect(await running).toBe(7);
-    expect(harness.writes).toEqual([]);
-  });
-
-  test("single runnable group maps a signal exit to one without a start line", async () => {
-    const child = new FakeTestGroupProcess(false);
-    const harness = runnerHarness([child]);
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unitGroup], harness.dependencies);
-    child.exit(null, "SIGKILL");
-
-    expect(await running).toBe(1);
-    expect(harness.writes).toEqual([]);
-  });
-
-  test("multi-group children start synchronously with piped colour-disabled streams", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    const harness = runnerHarness([first, second]);
-    const running = runSelectedTestGroups(
-      REPOSITORY_ROOT,
-      [unitGroup, transportGroup],
-      harness.dependencies,
-    );
-
-    expect(harness.records).toHaveLength(2);
-    expect(harness.records.map((record) => record.options.stdio)).toEqual([
-      ["inherit", "pipe", "pipe"],
-      ["inherit", "pipe", "pipe"],
-    ]);
-    for (const record of harness.records) {
-      expect(record.options.env).not.toBe(process.env);
-      expect(record.options.env?.FORCE_COLOR).toBe("0");
-      expect(record.child.stdout?.listenerCount("data")).toBeGreaterThan(0);
-      expect(record.child.stderr?.listenerCount("data")).toBeGreaterThan(0);
-    }
-    expect(harness.writes).toEqual([
-      "starting test group unit\n",
-      "starting test group transport\n",
-    ]);
-
-    second.stdout?.end("transport-out");
-    second.stderr?.end("transport-err");
-    second.exit(0);
-    first.stdout?.end("unit-out");
-    first.stderr?.end("unit-err");
-    first.exit(0);
-    expect(await running).toBe(0);
-
-    const blocks = harness.writes.slice(2);
-    expect(blocks).toHaveLength(2);
-    expect(blocks[0]).toContain("===== test group: transport =====");
-    expect(blocks[0]).toContain("transport-out");
-    expect(blocks[0]).toContain("transport-err");
-    expect(blocks[0]).toEndWith("===== end test group: transport =====\n");
-    expect(blocks[1]).toContain("===== test group: unit =====");
-    expect(blocks[1]).toContain("unit-out");
-    expect(blocks[1]).toContain("unit-err");
-    expect(blocks[1]).toEndWith("===== end test group: unit =====\n");
-    expect(blocks.every((block) => (block.match(/===== test group:/g) ?? []).length === 1)).toBeTrue();
-  });
-});
-
-describe("captured group settlement", () => {
-  const groups: readonly TestGroup[] = [
-    { name: "unit", files: ["test/domain.test.ts"] },
-    { name: "transport", files: ["test/rpc-client.test.ts"] },
-  ];
-
-  test("stream failure kills once, drains the sibling stream, and rejects after one publication", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    const harness = runnerHarness([first, second]);
-    const captureError = new Error("stdout broke");
-    let settled = false;
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, harness.dependencies);
-    running.then(
-      () => { settled = true; },
-      () => { settled = true; },
-    );
-
-    first.stdout?.write("retained-out");
-    first.stdout?.emit("error", captureError);
-    expect(first.killSignals).toEqual(["SIGTERM"]);
-    first.stderr?.write("retained-err");
-    first.stdout?.emit("end");
-    first.stdout?.emit("close");
-    first.stderr?.emit("end");
-    await Promise.resolve();
-    expect(settled).toBeFalse();
-
-    first.exit(null, "SIGTERM");
-    first.stdout?.emit("close");
-    second.stdout?.emit("end");
-    second.stderr?.emit("end");
-    second.exit(0);
-    await expect(running).rejects.toBe(captureError);
-
-    const firstBlocks = harness.writes.filter((write) => write.includes("===== test group: unit ====="));
-    expect(firstBlocks).toHaveLength(1);
-    expect(firstBlocks[0]).toContain("retained-out");
-    expect(firstBlocks[0]).toContain("retained-err");
-    expect(firstBlocks[0]).toContain("test group capture failed: stdout broke\n");
-    expect(firstBlocks[0]).toContain("test group terminated by SIGTERM");
-    first.exit(0);
-    first.stderr?.emit("close");
-    expect(harness.writes.filter((write) => write.includes("===== test group: unit ====="))).toHaveLength(1);
-  });
-
-  test("a post-spawn child error after failed capture kill waits for exit and preserves the capture error", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    first.killResult = false;
-    const harness = runnerHarness([first, second]);
-    const captureError = new Error("stdout capture failed");
-    const killError = Object.assign(new Error("kill denied"), { code: "EPERM" });
-    let settled = false;
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, harness.dependencies);
-    running.then(
-      () => { settled = true; },
-      () => { settled = true; },
-    );
-
-    first.spawned();
-    second.stdout?.end();
-    second.stderr?.end();
-    second.exit(0);
-    first.stdout?.emit("error", captureError);
-    expect(first.killSignals).toEqual(["SIGTERM"]);
-    first.spawnError(killError);
-    first.stderr?.end();
-    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
-    expect(settled).toBeFalse();
-    expect(harness.writes.some((write) => write.includes("===== test group: unit ====="))).toBeFalse();
-
-    first.exit(0);
-    await expect(running).rejects.toBe(captureError);
-  });
-
-  test("publishes the first capture diagnostic once after stderr evicts both bounded regions", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    const harness = runnerHarness([first, second]);
+  test("an empty runnable selection does no work", async () => {
+    const harness = runnerHarness([]);
+    let temporaryDirectoryCalls = 0;
+    let spawnCalls = 0;
     const dependencies: RunnerDependencies = {
       ...harness.dependencies,
-      captureLimits: { headBytes: 8, tailBytes: 12 },
+      get parallelism(): number { throw new Error("capacity must not be evaluated"); },
+      spawn() { spawnCalls += 1; throw new Error("must not spawn"); },
+      fileSystem: { ...harness.fileSystem, async mkdtemp(prefix) { temporaryDirectoryCalls += 1; return harness.fileSystem.mkdtemp(prefix); } },
     };
-    const captureError = new Error("stdout broke");
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, dependencies);
-
-    first.stderr?.write("HEADHEAD");
-    first.stdout?.emit("error", captureError);
-    first.stderr?.end(`${"x".repeat(64)}TAILTAILTAIL`);
-    first.stdout?.emit("end");
-    first.exit(null, "SIGTERM");
-    second.stdout?.end();
-    second.stderr?.end();
-    second.exit(0);
-
-    await expect(running).rejects.toBe(captureError);
-    const block = harness.writes.find((write) => write.includes("===== test group: unit ====="));
-    const diagnostic = "test group capture failed: stdout broke\n";
-    expect(block?.split(diagnostic)).toHaveLength(2);
-    expect(block).toContain("HEADHEAD\n... [truncated");
-    expect(block).toContain("TAILTAILTAIL");
+    expect(await runSelectedTestGroups(REPOSITORY_ROOT, [{ name: "unit", files: [] }], dependencies)).toBe(0);
+    expect(spawnCalls).toBe(0); expect(temporaryDirectoryCalls).toBe(0); expect(harness.stdoutText()).toBe("");
   });
 
-  test("asynchronous spawn rejection waits for every sibling", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    const harness = runnerHarness([first, second]);
-    const spawnError = new Error("async spawn failed");
-    let settled = false;
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, harness.dependencies);
-    running.catch(() => { settled = true; });
-
-    first.spawnError(spawnError);
-    await Promise.resolve();
-    expect(settled).toBeFalse();
-    second.stdout?.emit("end");
-    second.stderr?.emit("end");
-    second.exit(0);
-
-    await expect(running).rejects.toBe(spawnError);
-  });
-
-  test("synchronous spawn throw still launches later canonical groups and waits for them", async () => {
-    const sibling = new FakeTestGroupProcess();
-    const writes: string[] = [];
-    const attempted: string[] = [];
-    const spawnError = new Error("sync spawn failed");
-    let settled = false;
-    const dependencies: RunnerDependencies = {
-      parallelism: 6,
-      spawn(_command, args) {
-        const file = args[1];
-        if (file === undefined) throw new Error("missing test file argument");
-        attempted.push(file);
-        if (attempted.length === 1) throw spawnError;
-        return sibling;
-      },
-      stdout: {
-        write(chunk: Uint8Array | string): boolean {
-          writes.push(Buffer.from(chunk).toString("utf8"));
-          return true;
-        },
-      },
-    };
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, dependencies);
-    running.catch(() => { settled = true; });
-
-    expect(attempted).toEqual(["test/domain.test.ts", "test/rpc-client.test.ts"]);
-    await Promise.resolve();
-    expect(settled).toBeFalse();
-    sibling.stdout?.emit("end");
-    sibling.stderr?.emit("end");
-    sibling.exit(0);
-    await expect(running).rejects.toBe(spawnError);
-    expect(writes.filter((write) => write.startsWith("starting test group"))).toHaveLength(2);
-  });
-
-  test("captured SIGKILL publishes a labelled signal block and returns one", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    const harness = runnerHarness([first, second]);
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, harness.dependencies);
-    first.stdout?.emit("end");
-    first.stderr?.emit("end");
-    first.exit(null, "SIGKILL");
-    second.stdout?.emit("end");
-    second.stderr?.emit("end");
-    second.exit(0);
-
-    expect(await running).toBe(1);
-    expect(harness.writes.join("")).toContain(
-      "--- signal ---\ntest group terminated by SIGKILL\n",
-    );
-  });
-
-  test("same-turn completions use two non-overlapping block writes", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    const harness = runnerHarness([first, second]);
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, harness.dependencies);
-    first.stdout?.end("first");
-    first.stderr?.end();
-    second.stdout?.end("second");
-    second.stderr?.end();
-    first.exit(0);
-    second.exit(0);
-
-    expect(await running).toBe(0);
-    const blocks = harness.writes.filter((write) => write.startsWith("===== test group:"));
-    expect(blocks).toHaveLength(2);
-    expect(blocks.every((block) => (block.match(/===== test group:/g) ?? []).length === 1)).toBeTrue();
-    expect(blocks.every((block) => (block.match(/===== end test group:/g) ?? []).length === 1)).toBeTrue();
-  });
-
-  test("continuously drains at least four MiB per stream with bounded retained publication", async () => {
-    const first = new FakeTestGroupProcess();
-    const second = new FakeTestGroupProcess();
-    const harness = runnerHarness([first, second]);
-    const dependencies: RunnerDependencies = {
-      ...harness.dependencies,
-      captureLimits: { headBytes: 8, tailBytes: 12 },
-    };
-    const running = runSelectedTestGroups(REPOSITORY_ROOT, groups, dependencies);
-    const totalBytes = 4 * 1024 * 1024 + 31;
-    const chunk = Buffer.alloc(65_537, 0x78);
-    for (const stream of [first.stdout, first.stderr]) {
-      if (stream === null) throw new Error("expected captured stream");
-      let written = 0;
-      while (written < totalBytes) {
-        const length = Math.min(chunk.byteLength, totalBytes - written);
-        stream.write(chunk.subarray(0, length));
-        written += length;
-      }
-      stream.end();
-    }
-    first.exit(0);
-    second.stdout?.end();
-    second.stderr?.end();
-    second.exit(0);
-
-    expect(await running).toBe(0);
-    const block = harness.writes.find((write) => write.includes("===== test group: unit ====="));
-    expect(block).toBeDefined();
-    const notice = `... [truncated ${totalBytes - 20} bytes] ...`;
-    expect(block?.split(notice)).toHaveLength(3);
-    expect(Buffer.byteLength(block ?? "")).toBeLessThan(1024);
-  });
-});
-
-describe("integrationConcurrency", () => {
-  test.each([
-    [1, 1],
-    [4, 1],
-    [5, 1],
-    [6, 2],
-    [16, 12],
-    [64, 12],
-  ] as const)("maps %d available CPUs to %d integration workers", (available, expected) => {
-    expect(integrationConcurrency(available)).toBe(expected);
-  });
-
-  test.each([Number.NaN, Number.POSITIVE_INFINITY, 1.5, 0, -1])(
-    "rejects invalid available CPUs %p",
-    (available) => {
-      expect(() => integrationConcurrency(available)).toThrow(TypeError);
+  test.each([[0, null, 0], [7, null, 7], [null, "SIGKILL", 1], [null, null, 1]] as const)(
+    "single inherited exit %p/%p maps to %d", async (code, signal, expected) => {
+      const child = new FakeTestGroupProcess(); const harness = runnerHarness([child]);
+      const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit], harness.dependencies);
+      await launched(harness.records, 1);
+      expect(harness.records[0]?.options).toEqual({ cwd: REPOSITORY_ROOT, stdio: "inherit", env: process.env });
+      expect(harness.stdoutText()).toBe(""); child.exit(code, signal); expect(await running).toBe(expected);
     },
   );
-});
 
-describe("testCommandArguments", () => {
-  test("uses 30000 and capacity-aware concurrency only for the integration group", () => {
-    expect(testCommandArguments({
-      name: "integration",
-      files: ["test/pi-integration.test.ts"],
-    }, 6)).toEqual([
-      "test", "test/pi-integration.test.ts", "--timeout", "30000",
-      "--concurrent", "--max-concurrency", "2",
+  test("allocates private canonical transcripts, closes parents, then replays raw output canonically", async () => {
+    const first = new FakeTestGroupProcess(); const second = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second]);
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], harness.dependencies);
+    await launched(harness.records, 2);
+    expect(harness.records).toHaveLength(2);
+    const directory = harness.temporaryDirectory(); expect(directory).toBeDefined();
+    expect(basename(directory!)).toStartWith("pi-subagents-tests-");
+    expect(statSync(directory!).mode & 0o777).toBe(0o700);
+    expect(harness.transcriptPaths().map((path) => basename(path))).toEqual(["unit.log", "transport.log"]);
+    for (const path of harness.transcriptPaths()) expect(statSync(path).mode & 0o777).toBe(0o600);
+    for (const record of harness.records) {
+      expect(record.options.stdio).toEqual(["inherit", expect.any(Number), expect.any(Number)]);
+      expect(parentTranscriptDescriptor(record.options)).toBe((record.options.stdio as [unknown, unknown, number])[2]);
+    }
+    expect(harness.parentCloseCalls()).toBe(2);
+    writeChildOutput(harness.records[1]!, "transport-out\ntransport-err");
+    writeChildOutput(harness.records[0]!, "unit-out");
+    second.exit(0); first.exit(0);
+    expect(await running).toBe(0);
+    expect(harness.stdoutText()).toBe("===== unit =====\nunit-out\n===== transport =====\ntransport-out\ntransport-err\n");
+    expect(existsSync(directory!)).toBeFalse();
+  });
+
+  test("replays empty, newline-terminated, and alternating shared-descriptor transcripts exactly", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], h.dependencies);
+    await launched(h.records, 2);
+    writeChildOutput(h.records[0]!, "one"); writeChildOutput(h.records[0]!, "-two\n");
+    b.exit(0); a.exit(0); expect(await running).toBe(0);
+    expect(h.stdoutText()).toBe("===== unit =====\none-two\n===== transport =====\n");
+  });
+
+  test("inspects transcript metadata and final byte through one FileHandle", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const statArguments: unknown[] = []; const readArguments: unknown[] = [];
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...h.dependencies,
+      fileSystem: {
+        ...h.fileSystem,
+        async stat(argument) { statArguments.push(argument); return argument.stat(); },
+        async readLastByte(argument, position) {
+          readArguments.push(argument);
+          const buffer = Buffer.alloc(1);
+          await argument.read(buffer, 0, 1, position);
+          return buffer[0] ?? -1;
+        },
+      },
+    });
+    await launched(h.records, 2);
+    writeChildOutput(h.records[0]!, "no final newline");
+    a.exit(0); b.exit(0);
+    expect(await running).toBe(0);
+    expect(statArguments).toHaveLength(2);
+    expect(readArguments).toHaveLength(1);
+    expect(readArguments[0]).toBe(statArguments[0]);
+    expect(statArguments[0]).toHaveProperty("fd");
+  });
+
+  test.each([[true, "1"], [false, "0"], [undefined, "0"]] as const)("sets FORCE_COLOR for replay destination %p", async (isTTY, expected) => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b], 6, isTTY);
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], h.dependencies);
+    await launched(h.records, 2);
+    for (const record of h.records) { expect(record.options.env).not.toBe(process.env); expect(record.options.env?.FORCE_COLOR).toBe(expected); }
+    a.exit(0); b.exit(0); await running;
+  });
+
+  test("synchronous and pre-spawn failures retain canonical error after siblings settle and replay", async () => {
+    const sibling = new FakeTestGroupProcess(); const h = runnerHarness([sibling]); const error = new Error("sync failure");
+    let calls = 0;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, spawn(command, args, options) {
+      calls += 1; if (calls === 1) throw error; return h.dependencies.spawn(command, args, options);
+    } });
+    for (let turn = 0; turn < 100 && calls < 2; turn += 1) await Bun.sleep(1);
+    expect(calls).toBe(2); sibling.exit(0); await expect(running).rejects.toBe(error);
+    expect(h.stdoutText()).toContain("test group failed to start: sync failure\n");
+  });
+
+  test("normalises direct callers into canonical launch, replay, and result order", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const c = new FakeTestGroupProcess();
+    const h = runnerHarness([a, b, c]); const canonicalError = new Error("canonical unit");
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [{ name: "integration", files: ["test/pi-integration.test.ts"] }, transport, unit], h.dependencies);
+    await launched(h.records, 3);
+    expect(h.records.map((record) => record.args[1])).toEqual([unit.files[0], transport.files[0], "test/pi-integration.test.ts"]);
+    expect(h.records[2]?.args.at(-1)).toBe("4");
+    c.exit(17); b.exit(23); a.spawnError(canonicalError);
+    await expect(running).rejects.toBe(canonicalError);
+  });
+
+  test("descriptor close failure after spawn waits for every child and remains a setup failure", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const closeFailure = new Error("parent close failed"); let removals = 0;
+    const originalOpen = h.fileSystem.open;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...h.dependencies,
+      fileSystem: {
+        ...h.fileSystem,
+        async open(path, flags, mode) {
+          const handle = await originalOpen(path, flags, mode);
+          const close = handle.close.bind(handle); let failed = false;
+          handle.close = async () => { await close(); if (!failed) { failed = true; throw closeFailure; } };
+          return handle;
+        },
+        async rm(path) { removals += 1; await h.fileSystem.rm(path); },
+      },
+    });
+    await launched(h.records, 2);
+    expect(h.stdoutText()).toBe("");
+    a.exit(0); b.exit(0);
+    await expect(running).rejects.toBe(closeFailure);
+    expect(removals).toBe(1);
+    expect(h.stdoutText()).not.toContain("failed to start");
+  });
+
+  test("post-spawn error waits for exit while pre-spawn error is canonical", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]); const error = new Error("failed start");
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], h.dependencies);
+    await launched(h.records, 2);
+    a.spawned(); a.spawnError(new Error("ignored after spawn")); b.spawnError(error);
+    a.exit(17); await expect(running).rejects.toBe(error);
+  });
+
+  test("canonical spawn error and numeric failure selection ignore reverse settlement", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const c = new FakeTestGroupProcess(); const h = runnerHarness([a, b, c]); const error = new Error("first");
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport, processGroup], h.dependencies);
+    await launched(h.records, 3);
+    c.exit(23); b.exit(17); a.spawnError(error); await expect(running).rejects.toBe(error);
+  });
+
+  test("replays every available transcript once, sequentially, with end false", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const calls: Array<{ readonly name: string; readonly options: unknown }> = [];
+    const lifecycle: string[] = [];
+    const pipeline = (async (source: NodeJS.ReadableStream, destination: NodeJS.WritableStream, options: unknown) => {
+      const name = calls.length === 0 ? "unit" : "transport";
+      calls.push({ name, options }); lifecycle.push(`start ${name}`);
+      await streamPipeline(source, destination as NodeJS.WritableStream & { end(): void }, options as { end: false });
+      lifecycle.push(`end ${name}`);
+    }) as unknown as typeof import("node:stream/promises").pipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, pipeline });
+    await launched(h.records, 2);
+    writeChildOutput(h.records[0]!, "unit\n"); writeChildOutput(h.records[1]!, "transport\n");
+    b.exit(0); a.exit(0);
+    expect(await running).toBe(0);
+    expect(calls).toEqual([
+      { name: "unit", options: { end: false } },
+      { name: "transport", options: { end: false } },
     ]);
-    expect(testCommandArguments({
-      name: "unit",
-      files: ["test/domain.test.ts"],
-    }, 1)).toEqual([
-      "test", "test/domain.test.ts", "--timeout", "30000",
+    expect(lifecycle).toEqual(["start unit", "end unit", "start transport", "end transport"]);
+  });
+
+  test("passes the replay destination directly to the injected pipeline", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second]);
+    const destinations: NodeJS.WritableStream[] = [];
+    const pipeline = (async (
+      source: NodeJS.ReadableStream,
+      destination: NodeJS.WritableStream,
+    ) => {
+      destinations.push(destination);
+      source.resume();
+    }) as typeof streamPipeline;
+
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      pipeline,
+    });
+    await launched(harness.records, 2);
+    first.exit(0);
+    second.exit(0);
+
+    expect(await running).toBe(0);
+    expect(destinations).toEqual([
+      harness.dependencies.stdout,
+      harness.dependencies.stdout,
     ]);
   });
 
-  test("preserves explicit 30000 and 40000 integration test declarations", () => {
-    const source = readFileSync(join(REPOSITORY_ROOT, "test/pi-integration.test.ts"), "utf8");
-    expect(source).toContain("}, 30_000);");
-    expect(source).toContain("}, 40_000);");
-  });
-});
+  test("preserves a transcript callback error when the paired error event follows", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second]);
+    const failure = new Error("transcript output failed");
+    const output = new Writable({
+      write(chunk, _encoding, callback) {
+        callback(chunk.toString("utf8") === "transcript" ? failure : undefined);
+      },
+    });
 
-describe("BoundedTestOutput", () => {
-  const limits = { headBytes: 8, tailBytes: 12 } as const;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      stdout: output,
+      fileSystem: {
+        ...harness.fileSystem,
+        createReadStream(path) {
+          const source = new PassThrough();
+          source.write(readFileSync(path));
+          setImmediate(() => source.end());
+          return source;
+        },
+      },
+    });
+    await launched(harness.records, 2);
+    writeChildOutput(harness.records[0]!, "transcript");
+    first.exit(0);
+    second.exit(0);
 
-  test("bounded output retains exact head and tail with an exact truncated byte count", () => {
-    const output = new BoundedTestOutput(limits);
-    output.append(Buffer.from("HEADHEAD" + "x".repeat(30) + "TAILTAILTAIL"));
-
-    expect(output.discardedBytes).toBe(30);
-    expect(output.render()).toBe("HEADHEAD\n... [truncated 30 bytes] ...\nTAILTAILTAIL");
-  });
-
-  test("repeated large chunks keep only bounded retained output", () => {
-    const output = new BoundedTestOutput(limits);
-    for (let index = 0; index < 32; index += 1) output.append(Buffer.alloc(64 * 1024, 0x61));
-
-    expect(output.discardedBytes).toBe(32 * 64 * 1024 - 20);
-    expect(Buffer.byteLength(output.render())).toBeLessThan(100);
-  });
-
-  test("stdout and stderr retain independent bounded counts", () => {
-    const stdout = new BoundedTestOutput(limits);
-    const stderr = new BoundedTestOutput(limits);
-    stdout.append(Buffer.alloc(25, 0x6f));
-    stderr.append(Buffer.alloc(40, 0x65));
-
-    expect(stdout.discardedBytes).toBe(5);
-    expect(stderr.discardedBytes).toBe(20);
+    await expect(running).rejects.toBe(failure);
+    await Bun.sleep(1);
   });
 
-  test("removes a valid four-byte UTF-8 scalar split at the truncated head boundary", () => {
-    const output = new BoundedTestOutput(limits);
-    output.append(Buffer.from(`aaaaaaa😀${"m".repeat(30)}`));
+  test("preserves the exact callback-only non-EPIPE heading write error", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second]);
+    const failure = new Error("heading output failed");
+    const output = new EventEmitter() as EventEmitter & RunnerDependencies["stdout"];
+    output.write = ((_chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      callback?.(failure);
+      return false;
+    }) as typeof output.write;
 
-    expect(output.render()).toBe(`aaaaaaa\n... [truncated 22 bytes] ...\n${"m".repeat(12)}`);
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      stdout: output,
+    });
+    await launched(harness.records, 2);
+    first.exit(0);
+    second.exit(0);
+
+    await expect(running).rejects.toBe(failure);
   });
 
-  test("removes a valid four-byte UTF-8 scalar split at the truncated tail boundary", () => {
-    const output = new BoundedTestOutput(limits);
-    output.append(Buffer.from(`hhhhhhhhmmmmm😀${"p".repeat(10)}`));
+  test("preserves the exact callback-only non-EPIPE final-newline write error", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second]);
+    const failure = new Error("newline output failed");
+    const output = new EventEmitter() as EventEmitter & RunnerDependencies["stdout"];
+    let writes = 0;
+    output.write = ((_chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      writes += 1;
+      if (writes === 3) {
+        callback?.(failure);
+      } else {
+        callback?.();
+      }
+      return true;
+    }) as typeof output.write;
 
-    expect(output.render()).toBe(`hhhhhhhh\n... [truncated 9 bytes] ...\n${"p".repeat(10)}`);
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      stdout: output,
+    });
+    await launched(harness.records, 2);
+    writeChildOutput(harness.records[0]!, "without newline");
+    first.exit(0);
+    second.exit(0);
+
+    await expect(running).rejects.toBe(failure);
   });
 
-  test("keeps malformed retained UTF-8 bytes for replacement decoding", () => {
-    const output = new BoundedTestOutput(limits);
-    output.append(Buffer.concat([Buffer.from("aaaaaaa"), Buffer.from([0x80]), Buffer.alloc(20, 0x6d)]));
-
-    expect(output.render()).toStartWith("aaaaaaa�\n... [truncated");
+  test("heading EPIPE stops publication and preserves the canonical numeric status", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const output = new EventEmitter() as EventEmitter & RunnerDependencies["stdout"];
+    let writes = 0;
+    output.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      writes += 1;
+      const error = Object.assign(new Error("heading closed"), { code: "EPIPE" });
+      if (writes === 1) {
+        callback?.(error);
+        process.nextTick(() => output.emit("error", error));
+      } else callback?.();
+      return false;
+    }) as typeof output.write;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, stdout: output });
+    await launched(h.records, 2); a.exit(17); b.exit(0);
+    expect(await running).toBe(17);
+    await Bun.sleep(1);
+    expect(writes).toBe(1);
   });
 
-  test("untruncated multi-byte UTF-8 text round-trips across internal storage", () => {
-    const output = new BoundedTestOutput(limits);
-    const text = "1234567😀é";
-    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(20);
-    output.append(Buffer.from(text));
+  test("final-newline EPIPE stops publication and preserves the canonical numeric status", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const output = new EventEmitter() as EventEmitter & RunnerDependencies["stdout"];
+    let writes = 0;
+    output.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+      writes += 1;
+      const error = Object.assign(new Error("newline closed"), { code: "EPIPE" });
+      if (writes === 3) {
+        callback?.(error);
+        process.nextTick(() => output.emit("error", error));
+      } else callback?.();
+      return true;
+    }) as typeof output.write;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, stdout: output });
+    await launched(h.records, 2); writeChildOutput(h.records[0]!, "without newline"); a.exit(17); b.exit(0);
+    expect(await running).toBe(17);
+    await Bun.sleep(1);
+    expect(writes).toBe(3);
+  });
 
-    expect(output.render()).toBe(text);
-    expect(output.discardedBytes).toBe(0);
+  test("pipeline is sequential with end false and its non-EPIPE failure wins", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]); const failure = new Error("replay failed"); let calls = 0;
+    const pipeline = (async (source: NodeJS.ReadableStream) => { (source as NodeJS.ReadableStream & { destroy(): void }).destroy(); calls += 1; throw failure; }) as unknown as typeof import("node:stream/promises").pipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, pipeline });
+    await launched(h.records, 2);
+    a.exit(0); b.exit(17); await expect(running).rejects.toBe(failure); expect(calls).toBe(1);
+  });
+
+  test("replay failure retains exact identity and attaches the canonical spawn rejection as cause", async () => {
+    const sibling = new FakeTestGroupProcess();
+    const harness = runnerHarness([sibling]);
+    const spawnFailure = new Error("canonical spawn failure");
+    const replayFailure = new Error("replay failure");
+    const pipeline = (async () => { throw replayFailure; }) as typeof streamPipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      pipeline,
+      spawn(command, args, options) {
+        if (args[1] === unit.files[0]) throw spawnFailure;
+        return harness.dependencies.spawn(command, args, options);
+      },
+    });
+    await launched(harness.records, 1);
+    sibling.exit(0);
+
+    await expect(running).rejects.toBe(replayFailure);
+    expect(replayFailure.cause).toBe(spawnFailure);
+  });
+
+  test("transcript EPIPE through the writable callback and paired error event stops publication", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second]);
+    const epipe = Object.assign(new Error("transcript closed"), { code: "EPIPE" });
+    let writes = 0;
+    const output = new Writable({
+      write(chunk, _encoding, callback) {
+        writes += 1;
+        callback(chunk.toString("utf8") === "transcript" ? epipe : undefined);
+      },
+    });
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      stdout: output,
+    });
+    await launched(harness.records, 2);
+    writeChildOutput(harness.records[0]!, "transcript");
+    first.exit(17);
+    second.exit(0);
+
+    expect(await running).toBe(17);
+    await Bun.sleep(1);
+    expect(writes).toBe(2);
+  });
+
+  test("EPIPE stops publication but preserves canonical numeric result", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const epipe = Object.assign(new Error("closed"), { code: "EPIPE" });
+    const pipeline = (async (source: NodeJS.ReadableStream) => { (source as NodeJS.ReadableStream & { destroy(): void }).destroy(); throw epipe; }) as unknown as typeof import("node:stream/promises").pipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, pipeline });
+    await launched(h.records, 2);
+    a.exit(17); b.exit(0); expect(await running).toBe(17);
+  });
+
+  test("direct Node pipeline preserves caller listeners installed synchronously by pipe handlers", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second]);
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    output.setMaxListeners(100);
+    const callerListeners: Array<() => void> = [];
+    output.on("pipe", () => {
+      const listener = () => undefined;
+      callerListeners.push(listener);
+      output.on("error", listener);
+    });
+
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      stdout: output,
+    });
+    await launched(harness.records, 2);
+    first.exit(0);
+    second.exit(0);
+
+    expect(await running).toBe(0);
+    expect(output.getMaxListeners()).toBe(100);
+    expect(callerListeners).toHaveLength(2);
+    for (const listener of callerListeners) {
+      expect(output.listeners("error")).toContain(listener);
+      output.removeListener("error", listener);
+    }
+  });
+
+  test("selects the first canonical numeric failure across multiple groups", async () => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const third = new FakeTestGroupProcess();
+    const harness = runnerHarness([first, second, third]);
+    const running = runSelectedTestGroups(
+      REPOSITORY_ROOT,
+      [unit, transport, processGroup],
+      harness.dependencies,
+    );
+    await launched(harness.records, 3);
+
+    third.exit(29);
+    second.exit(23);
+    first.exit(17);
+
+    expect(await running).toBe(17);
   });
 
   test.each([
-    [{ headBytes: -1, tailBytes: 1 }, "negative"],
-    [{ headBytes: 1.5, tailBytes: 1 }, "fractional"],
-    [{ headBytes: 0, tailBytes: 0 }, "empty"],
-  ] as const)("rejects %s capture limits", (invalid) => {
-    expect(() => new BoundedTestOutput(invalid)).toThrow(TypeError);
+    [null, "SIGTERM", 1],
+    [null, null, 1],
+  ] as const)(
+    "maps multi-group exit %p/%p to status %d",
+    async (code, signal, expected) => {
+      const first = new FakeTestGroupProcess();
+      const second = new FakeTestGroupProcess();
+      const harness = runnerHarness([first, second]);
+      const running = runSelectedTestGroups(
+        REPOSITORY_ROOT,
+        [unit, transport],
+        harness.dependencies,
+      );
+      await launched(harness.records, 2);
+
+      second.exit(23);
+      first.exit(code, signal);
+
+      expect(await running).toBe(expected);
+    },
+  );
+
+  test.each([
+    "numeric",
+    "spawn",
+    "replay",
+    "epipe-success",
+    "epipe-numeric",
+  ] as const)("removes the directory after a %s outcome", async (outcome) => {
+    const first = new FakeTestGroupProcess();
+    const second = new FakeTestGroupProcess();
+    const harness = runnerHarness(outcome === "spawn" ? [second] : [first, second]);
+    const primary = new Error(`${outcome} failure`);
+    const epipe = Object.assign(new Error("closed"), { code: "EPIPE" });
+    let removals = 0;
+    const pipeline = outcome === "replay"
+      ? (async () => { throw primary; }) as typeof streamPipeline
+      : outcome.startsWith("epipe")
+        ? (async () => { throw epipe; }) as typeof streamPipeline
+        : undefined;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      ...(pipeline === undefined ? {} : { pipeline }),
+      spawn(command, args, options) {
+        if (outcome === "spawn" && args[1] === unit.files[0]) {
+          throw primary;
+        }
+        return harness.dependencies.spawn(command, args, options);
+      },
+      fileSystem: {
+        ...harness.fileSystem,
+        async rm(path) {
+          removals += 1;
+          await harness.fileSystem.rm(path);
+        },
+      },
+    });
+    await launched(harness.records, outcome === "spawn" ? 1 : 2);
+
+    if (outcome === "spawn") {
+      second.exit(0);
+      await expect(running).rejects.toBe(primary);
+    } else {
+      first.exit(outcome === "numeric" || outcome === "epipe-numeric" ? 17 : 0);
+      second.exit(0);
+      if (outcome === "replay") {
+        await expect(running).rejects.toBe(primary);
+      } else {
+        expect(await running).toBe(
+          outcome === "numeric" || outcome === "epipe-numeric" ? 17 : 0,
+        );
+      }
+    }
+
+    expect(removals).toBe(1);
+    expect(existsSync(harness.temporaryDirectory()!)).toBeFalse();
+  });
+
+  test("bounds and sanitises spawn and cleanup diagnostics as complete UTF-8 lines", async () => {
+    const child = new FakeTestGroupProcess();
+    const harness = runnerHarness([child]);
+    const message = `forged\r\n\ud800${"£".repeat(2_000)}`;
+    const spawnFailure = new Error(message);
+    const cleanupFailure = new Error(message);
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...harness.dependencies,
+      spawn(command, args, options) {
+        if (args[1] === unit.files[0]) {
+          throw spawnFailure;
+        }
+        return harness.dependencies.spawn(command, args, options);
+      },
+      fileSystem: {
+        ...harness.fileSystem,
+        async rm() {
+          throw cleanupFailure;
+        },
+      },
+    });
+    await launched(harness.records, 1);
+    child.exit(0);
+    await expect(running).rejects.toBe(spawnFailure);
+
+    const spawnLine = harness.stdoutText().split("\n").find((line) =>
+      line.startsWith("test group failed to start: "));
+    expect(spawnLine).toBeDefined();
+    assertBoundedDiagnostic(`${spawnLine}\n`);
+    assertBoundedDiagnostic(harness.stderrText());
+  });
+
+  test("allocation failure removes opened files and launches no child", async () => {
+    const h = runnerHarness([]); const failure = new Error("allocation failed"); let opens = 0; let spawns = 0;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, spawn() { spawns += 1; throw new Error("no"); }, fileSystem: {
+      ...h.fileSystem, async open(path, flags, mode) { opens += 1; if (opens === 2) throw failure; return h.fileSystem.open(path, flags, mode); },
+    } });
+    await expect(running).rejects.toBe(failure); expect(spawns).toBe(0); const directory = h.temporaryDirectory(); expect(directory === undefined || !existsSync(directory)).toBeTrue();
+  });
+
+  test("replay cleanup preserves caller error listeners added during the pipeline", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const callerListener = () => undefined;
+    const pipeline = (async (source: NodeJS.ReadableStream) => {
+      h.dependencies.stdout.once("error", callerListener);
+      source.resume();
+    }) as unknown as typeof import("node:stream/promises").pipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, pipeline });
+    await launched(h.records, 2);
+    a.exit(0); b.exit(0);
+    await running;
+    expect(h.dependencies.stdout.listeners("error")).toContain(callerListener);
+    h.dependencies.stdout.removeListener("error", callerListener);
+  });
+
+  test("asynchronous cleanup diagnostic errors preserve the primary status", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const cleanupFailure = new Error("cleanup failed"); const diagnosticFailure = new Error("closed stderr");
+    const stderr = new EventEmitter() as EventEmitter & Pick<NodeJS.WritableStream, "write">;
+    stderr.write = ((...args: unknown[]) => {
+      const done = args.find((argument): argument is () => void => typeof argument === "function");
+      process.nextTick(() => { done?.(); stderr.emit("error", diagnosticFailure); });
+      return true;
+    }) as typeof stderr.write;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...h.dependencies,
+      stderr,
+      fileSystem: { ...h.fileSystem, async rm() { throw cleanupFailure; } },
+    });
+    await launched(h.records, 2);
+    a.exit(17); b.exit(0);
+    expect(await running).toBe(17);
+    await Bun.sleep(1);
+  });
+
+  test("cleanup failure preserves a canonical spawn rejection and writes one diagnostic", async () => {
+    const child = new FakeTestGroupProcess(); const h = runnerHarness([child]); const primary = new Error("spawn failed"); const cleanup = new Error("cleanup failed");
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...h.dependencies,
+      spawn(command, args, options) { if (args[1] === unit.files[0]) throw primary; return h.dependencies.spawn(command, args, options); },
+      fileSystem: { ...h.fileSystem, async rm() { throw cleanup; } },
+    });
+    await launched(h.records, 1); child.exit(0);
+    await expect(running).rejects.toBe(primary);
+    expect(h.stderrText()).toBe("test runner cleanup failed: cleanup failed\n");
+  });
+
+  test("cleanup failure preserves a replay rejection and writes one diagnostic", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]); const primary = new Error("replay failed"); const cleanup = new Error("cleanup failed");
+    const pipeline = (async () => { throw primary; }) as unknown as typeof import("node:stream/promises").pipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, pipeline, fileSystem: { ...h.fileSystem, async rm() { throw cleanup; } } });
+    await launched(h.records, 2); a.exit(0); b.exit(0);
+    await expect(running).rejects.toBe(primary);
+    expect(h.stderrText()).toBe("test runner cleanup failed: cleanup failed\n");
+  });
+
+  test("EPIPE plus success makes cleanup failure primary", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]); const cleanup = new Error("cleanup failed");
+    const epipe = Object.assign(new Error("closed"), { code: "EPIPE" });
+    const pipeline = (async () => { throw epipe; }) as unknown as typeof import("node:stream/promises").pipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, pipeline, fileSystem: { ...h.fileSystem, async rm() { throw cleanup; } } });
+    await launched(h.records, 2); a.exit(0); b.exit(0);
+    await expect(running).rejects.toBe(cleanup);
+    expect(h.stderrText()).toBe("");
+  });
+
+  test("EPIPE plus numeric failure preserves status and writes one diagnostic", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]); const cleanup = new Error("cleanup failed");
+    const epipe = Object.assign(new Error("closed"), { code: "EPIPE" });
+    const pipeline = (async () => { throw epipe; }) as unknown as typeof import("node:stream/promises").pipeline;
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, pipeline, fileSystem: { ...h.fileSystem, async rm() { throw cleanup; } } });
+    await launched(h.records, 2); a.exit(17); b.exit(0);
+    expect(await running).toBe(17);
+    expect(h.stderrText()).toBe("test runner cleanup failed: cleanup failed\n");
+  });
+
+  test("cleanup failure is primary only after success and otherwise writes bounded diagnostic", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]); const failure = new Error("cleanup\nforged");
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], { ...h.dependencies, fileSystem: { ...h.fileSystem, async rm() { throw failure; } } });
+    await launched(h.records, 2);
+    a.exit(17); b.exit(0); expect(await running).toBe(17); expect(h.stderrText()).toBe("test runner cleanup failed: cleanup forged\n");
+  });
+
+  test("a cleanup-only failure rejects with its exact error without a diagnostic", async () => {
+    const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
+    const cleanupFailure = new Error("cleanup only");
+    const running = runSelectedTestGroups(REPOSITORY_ROOT, [unit, transport], {
+      ...h.dependencies,
+      fileSystem: { ...h.fileSystem, async rm() { throw cleanupFailure; } },
+    });
+    await launched(h.records, 2);
+    a.exit(0); b.exit(0);
+    await expect(running).rejects.toBe(cleanupFailure);
+    expect(h.stderrText()).toBe("");
   });
 });
 
-describe("formatTestGroupOutput", () => {
-  test("formats test group output with exact attributed framing", () => {
-    const stdout = new BoundedTestOutput({ headBytes: 8, tailBytes: 12 });
-    const stderr = new BoundedTestOutput({ headBytes: 8, tailBytes: 12 });
-    stdout.append(Buffer.from("out"));
-    stderr.append(Buffer.from("err\n"));
+function assertBoundedDiagnostic(line: string): void {
+  const bytes = Buffer.from(line);
+  expect(bytes.byteLength).toBeLessThanOrEqual(1_024);
+  expect(line.endsWith("\n")).toBeTrue();
+  expect(line.match(/\n/g)).toHaveLength(1);
+  expect(line).not.toContain("\r");
+  expect(() => new TextDecoder("utf-8", { fatal: true }).decode(bytes)).not.toThrow();
+}
 
-    expect(formatTestGroupOutput("unit", stdout, stderr)).toBe(
-      "===== test group: unit =====\n" +
-      "--- stdout ---\nout\n" +
-      "--- stderr ---\nerr\n" +
-      "===== end test group: unit =====\n",
+describe("test group registry and commands", () => {
+  test("rejects a missing test directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-subagents-missing-tests-"));
+    try { expect(() => discoverTestFiles(root)).toThrow(`test directory not found: ${join(root, "test")}`); }
+    finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test.each(["root", "file", "directory"] as const)("rejects a symlinked test %s", async (kind) => {
+    const root = await mkdtemp(join(tmpdir(), "pi-subagents-symlink-tests-"));
+    const target = join(root, "target"); const testRoot = join(root, "test");
+    try {
+      await mkdir(target);
+      if (kind === "root") await symlink(target, testRoot);
+      else {
+        await mkdir(testRoot);
+        if (kind === "file") { await writeFile(join(target, "case.test.ts"), ""); await symlink(join(target, "case.test.ts"), join(testRoot, "case.test.ts")); }
+        else { await mkdir(join(target, "nested")); await symlink(join(target, "nested"), join(testRoot, "nested")); }
+      }
+      expect(() => discoverTestFiles(root)).toThrow("symlinked test path:");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("rejects unassigned and multiply-owned test files", () => {
+    expect(() => resolveTestGroupOwner("test/unassigned.test.ts")).toThrow("unassigned test file: test/unassigned.test.ts");
+    const rules = { ...TEST_GROUP_RULES, unit: new Set(["shared.test.ts"]), transport: new Set(["shared.test.ts"]) };
+    expect(() => resolveTestGroupOwner("test/shared.test.ts", rules)).toThrow("multiply assigned test file: test/shared.test.ts");
+  });
+
+  test("rejects malformed and unknown group arguments", () => {
+    expect(() => parseRequestedGroups(["unit"])).toThrow("unexpected argument: unit");
+    expect(() => parseRequestedGroups(["--group"])).toThrow("--group requires a group name");
+    expect(() => parseRequestedGroups(["--group", "unknown"])).toThrow("unknown test group: unknown");
+  });
+
+  test("discovers canonical groups, selects in registry order, and inventories every test", () => {
+    const files = discoverTestFiles(REPOSITORY_ROOT);
+    const groups = groupTestFiles(files);
+    expect(groups.map((group) => group.name)).toEqual([...TEST_GROUP_NAMES]);
+    expect(selectTestGroups(groups, ["transport", "unit"]).map((group) => group.name)).toEqual(["unit", "transport"]);
+    expect(parseRequestedGroups(["--group", "unit", "--group", "unit"])).toEqual(["unit"]);
+    expect(new Set(TEST_GROUP_NAMES.flatMap((name) => [...TEST_GROUP_RULES[name]])).size).toBe(files.length);
+    expect([...TEST_GROUP_NAMES.flatMap((name) => [...TEST_GROUP_RULES[name]])].sort()).toEqual(files.map((file) => basename(file)).sort());
+  });
+  test.each([[1, 1, 1], [6, 1, 6], [6, 2, 5], [6, 5, 2], [6, 6, 1], [64, 6, 12]] as const)(
+    "maps capacity %d with %d runnable groups to %d", (available, groups, expected) => {
+      expect(integrationConcurrency(available, groups)).toBe(expected);
+    },
+  );
+  test.each([[0, 1], [1.5, 1], [1, 0], [1, 1.5]] as const)("rejects invalid capacity inputs %p/%p", (available, groups) => {
+    expect(() => integrationConcurrency(available, groups)).toThrow(TypeError);
+  });
+  test("uses the established timeout and integration capacity", () => {
+    expect(testCommandArguments({ name: "integration", files: ["test/pi-integration.test.ts"] }, 6, 5)).toEqual(["test", "test/pi-integration.test.ts", "--timeout", "30000", "--concurrent", "--max-concurrency", "2"]);
+    const integrationTests = readFileSync(
+      join(REPOSITORY_ROOT, "test/pi-integration.test.ts"),
+      "utf8",
     );
-  });
-
-  test("formats test group signal diagnostics and omits empty sections", () => {
-    const stdout = new BoundedTestOutput({ headBytes: 8, tailBytes: 12 });
-    const stderr = new BoundedTestOutput({ headBytes: 8, tailBytes: 12 });
-
-    expect(formatTestGroupOutput("process", stdout, stderr, "SIGKILL")).toBe(
-      "===== test group: process =====\n" +
-      "--- signal ---\ntest group terminated by SIGKILL\n" +
-      "===== end test group: process =====\n",
-    );
-  });
-});
-
-describe("repository inventory", () => {
-  test("every discovered basename is owned by exactly one rule", () => {
-    const groups = groupTestFiles(DISCOVERED);
-    const basenames = groups.flatMap((group) => group.files.map((file) => basename(file)));
-
-    expect(new Set(basenames).size).toBe(basenames.length);
-  });
-
-  test("every rule basename names a test file that still exists", () => {
-    const discovered = new Set(DISCOVERED.map((file) => basename(file)));
-    const named = TEST_GROUP_NAMES.flatMap((group) => [...TEST_GROUP_RULES[group]]);
-
-    expect(named.filter((name) => !discovered.has(name))).toEqual([]);
+    expect(integrationTests).toContain("}, 30_000);");
+    expect(integrationTests).toContain("}, 40_000);");
   });
 });
