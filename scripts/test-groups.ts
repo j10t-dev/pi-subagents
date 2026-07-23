@@ -13,6 +13,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
   unit: new Set([
     "assignment-identity.test.ts",
     "async-primitives.test.ts",
+    "b0-gates.test.ts",
     "child-selection.test.ts",
     "completion-service.test.ts",
     "domain.test.ts",
