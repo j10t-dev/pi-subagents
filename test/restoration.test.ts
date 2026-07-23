@@ -187,7 +187,7 @@ describe("restoration application", () => {
       "replace:stopped",
       "commit",
     ]);
-    expect(restored).toMatchObject([{ state: AgentState.Stopped, latestCompletion: { runId: testRunId("cafebabe") } }]);
+    expect(restored).toMatchObject([{ state: AgentState.Stopped, completion: { payload: { runId: testRunId("cafebabe") } } }]);
     expect(state.durableCompletions.has(agentRunKey(testAgentId(), testRunId("cafebabe")))).toBeTrue();
     expect(state.restoredRecords.size).toBe(0);
   });

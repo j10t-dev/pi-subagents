@@ -263,7 +263,7 @@ export class AgentEventAppender {
 
 // --- Pure event fold ------------------------------------------------------
 
-export interface RestoredAgentRecord {
+export interface AgentMetadata {
   agentId: AgentId;
   sessionPath: SpawnedPayload["sessionPath"];
   cwd: SpawnedPayload["cwd"];
@@ -271,20 +271,37 @@ export interface RestoredAgentRecord {
   modelId: SpawnedPayload["modelId"];
   thinkingLevel: SpawnedPayload["thinkingLevel"];
   tools: readonly string[];
-  state: AgentState;
-  currentRunId?: RunId;
-  currentReceiptPath?: ContainmentReceiptPath;
-  currentAttemptId?: RunAttemptId;
-  currentContainment?: ContainmentDescriptor;
-  currentEventVersion?: 1 | 2;
-  pendingLaunch?: RunLaunchRequestedPayloadV1 | RunLaunchRequestedPayloadV2;
-  pendingLaunchEventVersion?: 1 | 2;
-  pendingStopReason?: CancellationReason;
-  latestCompletion?: AgentCompletion;
-  latestCompletionReceiptPath?: ContainmentReceiptPath;
-  latestCompletionAttemptId?: RunAttemptId;
-  latestCompletionContainment?: ContainmentDescriptor;
-  latestCompletionEventVersion?: 1 | 2;
+}
+
+export type PendingLaunch =
+  | { payload: RunLaunchRequestedPayloadV1; eventVersion: 1 }
+  | { payload: RunLaunchRequestedPayloadV2; eventVersion: 2 };
+
+export interface ActiveRun {
+  runId: RunId;
+  receiptPath: ContainmentReceiptPath;
+  attemptId: RunAttemptId;
+  containment?: ContainmentDescriptor;
+  eventVersion: 1 | 2;
+}
+
+export interface CompletedRun {
+  payload: AgentCompletion;
+  receiptPath: ContainmentReceiptPath;
+  attemptId: RunAttemptId;
+  containment?: ContainmentDescriptor;
+  eventVersion: 1 | 2;
+}
+
+export type FoldedAgentRecord = AgentMetadata & { completion?: CompletedRun } & (
+  | { state: typeof AgentState.Stopped; pendingLaunch?: PendingLaunch }
+  | { state: typeof AgentState.Running; run: ActiveRun }
+  | { state: typeof AgentState.Stopping; run: ActiveRun; stopReason: CancellationReason }
+);
+
+export function pickMetadata(record: AgentMetadata): AgentMetadata {
+  const { agentId, sessionPath, cwd, provider, modelId, thinkingLevel, tools } = record;
+  return { agentId, sessionPath, cwd, provider, modelId, thinkingLevel, tools };
 }
 
 export type RestorationAction =
@@ -326,7 +343,7 @@ export type RestorationAction =
     };
 
 export interface RestoredRegistry {
-  agents: Map<AgentId, RestoredAgentRecord>;
+  agents: Map<AgentId, FoldedAgentRecord>;
   actions: RestorationAction[];
   invalidEvents: string[];
 }
@@ -347,7 +364,7 @@ interface FoldableEntry {
  * event and is therefore not observable here.
  */
 export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: string): RestoredRegistry {
-  const agents = new Map<AgentId, RestoredAgentRecord>();
+  const agents = new Map<AgentId, FoldedAgentRecord>();
   const actions: RestorationAction[] = [];
   const invalidEvents: string[] = [];
   const rejectedAgents = new Set<AgentId>();
@@ -383,45 +400,46 @@ export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: st
   }
 
   for (const record of agents.values()) {
-    if (record.pendingLaunch !== undefined) {
+    if (record.state === AgentState.Stopped && record.pendingLaunch !== undefined) {
+      const { payload, eventVersion } = record.pendingLaunch;
       actions.push({
         type: RestorationActionType.ReconcileLaunch,
         agentId: record.agentId,
-        attemptId: record.pendingLaunch.attemptId,
-        previousLeafId: record.pendingLaunch.previousLeafId,
-        containmentReceiptPath: record.pendingLaunch.containmentReceiptPath,
-        ...("containment" in record.pendingLaunch ? { descriptor: record.pendingLaunch.containment } : {}),
-        eventVersion: record.pendingLaunchEventVersion ?? 1,
+        attemptId: payload.attemptId,
+        previousLeafId: payload.previousLeafId,
+        containmentReceiptPath: payload.containmentReceiptPath,
+        ...("containment" in payload ? { descriptor: payload.containment } : {}),
+        eventVersion,
       });
-    } else if (record.state === AgentState.Running && record.currentRunId !== undefined) {
+    } else if (record.state === AgentState.Running) {
       actions.push({
         type: RestorationActionType.ReconcileStarted,
         agentId: record.agentId,
-        runId: record.currentRunId,
-        containmentReceiptPath: record.currentReceiptPath as ContainmentReceiptPath,
-        attemptId: record.currentAttemptId as RunAttemptId,
-        ...(record.currentContainment === undefined ? {} : { descriptor: record.currentContainment }),
-        eventVersion: record.currentEventVersion ?? 1,
+        runId: record.run.runId,
+        containmentReceiptPath: record.run.receiptPath,
+        attemptId: record.run.attemptId,
+        ...(record.run.containment === undefined ? {} : { descriptor: record.run.containment }),
+        eventVersion: record.run.eventVersion,
       });
-    } else if (record.state === AgentState.Stopping && record.currentRunId !== undefined) {
+    } else if (record.state === AgentState.Stopping) {
       actions.push({
         type: RestorationActionType.ReconcileStopping,
         agentId: record.agentId,
-        runId: record.currentRunId,
-        reason: record.pendingStopReason as CancellationReason,
-        containmentReceiptPath: record.currentReceiptPath as ContainmentReceiptPath,
-        attemptId: record.currentAttemptId as RunAttemptId,
-        ...(record.currentContainment === undefined ? {} : { descriptor: record.currentContainment }),
-        eventVersion: record.currentEventVersion ?? 1,
+        runId: record.run.runId,
+        reason: record.stopReason,
+        containmentReceiptPath: record.run.receiptPath,
+        attemptId: record.run.attemptId,
+        ...(record.run.containment === undefined ? {} : { descriptor: record.run.containment }),
+        eventVersion: record.run.eventVersion,
       });
-    } else if (record.state === AgentState.Stopped && record.latestCompletion !== undefined) {
+    } else if (record.completion !== undefined) {
       actions.push({
         type: RestorationActionType.ValidateCompletedReceipt,
         agentId: record.agentId,
-        containmentReceiptPath: record.latestCompletionReceiptPath as ContainmentReceiptPath,
-        attemptId: record.latestCompletionAttemptId as RunAttemptId,
-        ...(record.latestCompletionContainment === undefined ? {} : { descriptor: record.latestCompletionContainment }),
-        eventVersion: record.latestCompletionEventVersion ?? 1,
+        containmentReceiptPath: record.completion.receiptPath,
+        attemptId: record.completion.attemptId,
+        ...(record.completion.containment === undefined ? {} : { descriptor: record.completion.containment }),
+        eventVersion: record.completion.eventVersion,
       });
     }
   }
@@ -435,7 +453,7 @@ function persistedAgentId(value: unknown): AgentId | undefined {
 }
 
 function applyEvent(
-  agents: Map<AgentId, RestoredAgentRecord>,
+  agents: Map<AgentId, FoldedAgentRecord>,
   event: PersistedAgentEvent,
   pushInvalid: (message: string) => void,
 ): void {
@@ -471,8 +489,12 @@ function applyEvent(
         pushInvalid(`overlapping run_launch_requested for agent ${event.payload.agentId}`);
         return;
       }
-      record.pendingLaunch = event.payload;
-      record.pendingLaunchEventVersion = event.schemaVersion;
+      agents.set(event.payload.agentId, {
+        ...record,
+        pendingLaunch: event.schemaVersion === 1
+          ? { payload: event.payload, eventVersion: 1 }
+          : { payload: event.payload, eventVersion: 2 },
+      });
       return;
     }
     case AgentEventType.RunStarted: {
@@ -481,7 +503,8 @@ function applyEvent(
         pushInvalid(`run_started for unknown agent ${event.payload.agentId}`);
         return;
       }
-      if (record.pendingLaunch?.attemptId !== event.payload.attemptId) {
+      const pending = record.state === AgentState.Stopped ? record.pendingLaunch : undefined;
+      if (pending?.payload.attemptId !== event.payload.attemptId) {
         pushInvalid(`unmatched run_started for agent ${event.payload.agentId}`);
         return;
       }
@@ -489,16 +512,18 @@ function applyEvent(
         pushInvalid(`run_started while agent ${event.payload.agentId} was not stopped`);
         return;
       }
-      record.state = AgentState.Running;
-      record.currentRunId = event.payload.runId;
-      record.currentReceiptPath = record.pendingLaunch.containmentReceiptPath;
-      record.currentAttemptId = record.pendingLaunch.attemptId;
-      if (record.pendingLaunchEventVersion === undefined) delete record.currentEventVersion;
-      else record.currentEventVersion = record.pendingLaunchEventVersion;
-      if ("containment" in record.pendingLaunch) record.currentContainment = record.pendingLaunch.containment;
-      else delete record.currentContainment;
-      delete record.pendingLaunch;
-      delete record.pendingLaunchEventVersion;
+      agents.set(event.payload.agentId, {
+        ...pickMetadata(record),
+        ...(record.completion === undefined ? {} : { completion: record.completion }),
+        state: AgentState.Running,
+        run: {
+          runId: event.payload.runId,
+          receiptPath: pending.payload.containmentReceiptPath,
+          attemptId: pending.payload.attemptId,
+          ...(pending.eventVersion === 2 ? { containment: pending.payload.containment } : {}),
+          eventVersion: pending.eventVersion,
+        },
+      });
       return;
     }
     case AgentEventType.RunStopping: {
@@ -507,13 +532,17 @@ function applyEvent(
         pushInvalid(`run_stopping for unknown agent ${event.payload.agentId}`);
         return;
       }
-      if (record.state !== AgentState.Running || record.currentRunId !== event.payload.runId) {
+      if (record.state !== AgentState.Running || record.run.runId !== event.payload.runId) {
         pushInvalid(`unmatched run_stopping for agent ${event.payload.agentId}`);
         return;
       }
-      record.state = AgentState.Stopping;
-      record.currentReceiptPath = event.payload.containmentReceiptPath;
-      record.pendingStopReason = event.payload.reason;
+      agents.set(event.payload.agentId, {
+        ...pickMetadata(record),
+        ...(record.completion === undefined ? {} : { completion: record.completion }),
+        state: AgentState.Stopping,
+        run: { ...record.run, receiptPath: event.payload.containmentReceiptPath },
+        stopReason: event.payload.reason,
+      });
       return;
     }
     case AgentEventType.RunCompleted: {
@@ -522,7 +551,7 @@ function applyEvent(
         pushInvalid(`run_completed for unknown agent ${event.payload.agentId}`);
         return;
       }
-      if (record.currentRunId !== event.payload.runId || record.state === AgentState.Stopped) {
+      if (record.state === AgentState.Stopped || record.run.runId !== event.payload.runId) {
         pushInvalid(`duplicate or unmatched run_completed for agent ${event.payload.agentId}`);
         return;
       }
@@ -531,15 +560,17 @@ function applyEvent(
         pushInvalid(`run_completed transcript mismatch for agent ${event.payload.agentId}`);
         return;
       }
-      record.state = AgentState.Stopped;
-      record.latestCompletion = event.payload;
-      if (record.currentReceiptPath !== undefined) record.latestCompletionReceiptPath = record.currentReceiptPath;
-      if (record.currentAttemptId !== undefined) record.latestCompletionAttemptId = record.currentAttemptId;
-      if (record.currentContainment !== undefined) record.latestCompletionContainment = record.currentContainment;
-      else delete record.latestCompletionContainment;
-      if (record.currentEventVersion === undefined) delete record.latestCompletionEventVersion;
-      else record.latestCompletionEventVersion = record.currentEventVersion;
-      delete record.pendingStopReason;
+      agents.set(event.payload.agentId, {
+        ...pickMetadata(record),
+        state: AgentState.Stopped,
+        completion: {
+          payload: event.payload,
+          receiptPath: record.run.receiptPath,
+          attemptId: record.run.attemptId,
+          ...(record.run.containment === undefined ? {} : { containment: record.run.containment }),
+          eventVersion: record.run.eventVersion,
+        },
+      });
       return;
     }
   }
