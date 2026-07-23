@@ -26,6 +26,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "test-runner.test.ts",
   ]),
   transport: new Set([
+    "focus-spike.test.ts",
     "jsonl.test.ts",
     "output-store.test.ts",
     "rpc-client.test.ts",
