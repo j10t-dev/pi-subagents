@@ -21,7 +21,7 @@ import {
 } from "./domain.ts";
 import type { EffectiveChildSelection } from "./child-selection.ts";
 import { RunController, classifyTerminal, type RunRecord, type RunRuntime, type Settlement, type StopResult } from "./run-controller.ts";
-import { foldAgentEvents, type RestoredAgentRecord } from "./persistence.ts";
+import { foldAgentEvents } from "./persistence.ts";
 import type { RpcRunClient } from "./rpc-client.ts";
 import { classifyAssignmentEntries } from "./assignment-identity.ts";
 import { delayWithAbort, waitWithAbort } from "./async-primitives.ts";
@@ -34,6 +34,7 @@ import {
   planRestoration,
   type RestorationContainmentDecision,
   type RestorationPort,
+  type PlannedAgentRecord,
   type RestoredTerminalObligation,
   type StagedRestorePlan,
 } from "./restoration.ts";
@@ -355,7 +356,7 @@ export class SubagentController {
         this.stagedRestorePlan = plan;
       }
 
-      let restored: readonly RestoredAgentRecord[];
+      let restored: readonly PlannedAgentRecord[];
       try {
         restored = await applyRestoration(plan, admission, this.restoration, {
           durableCompletions: this.durableCompletions,
@@ -638,7 +639,7 @@ export class SubagentController {
     let obligation = this.restoredRecords.get(record.agentId);
     if (obligation === undefined || this.restoration === undefined) return undefined;
     if (obligation.kind === "restore-completion") {
-      const completion = obligation.record.latestCompletion;
+      const completion = obligation.record.completion?.payload;
       if (completion === undefined) throw new Error("invalid_state: restored completion obligation has no completion");
       this.durableCompletions.set(agentRunKey(completion.agentId, completion.runId), completion);
       await this.publish(completion);
@@ -647,14 +648,14 @@ export class SubagentController {
     }
     let nativeRunId = record.runId ?? obligation.start?.runId;
     if (nativeRunId === undefined) {
-      const pendingLaunch = obligation.record.pendingLaunch;
+      const pendingLaunch = obligation.record.state === AgentState.Stopped ? obligation.record.pendingLaunch : undefined;
       if (pendingLaunch === undefined) throw new Error("invalid_state: restored pre-native obligation has no launch cursor");
-      nativeRunId = await this.restoration.firstUserEntryAfter(obligation.record.sessionPath, pendingLaunch.previousLeafId);
+      nativeRunId = await this.restoration.firstUserEntryAfter(obligation.record.sessionPath, pendingLaunch.payload.previousLeafId);
       if (nativeRunId === undefined) {
         this.restoredRecords.delete(record.agentId);
         return undefined;
       }
-      obligation = { ...obligation, start: { runId: nativeRunId, attemptId: pendingLaunch.attemptId } };
+      obligation = { ...obligation, start: { runId: nativeRunId, attemptId: pendingLaunch.payload.attemptId } };
       this.restoredRecords.set(record.agentId, obligation);
     }
     if (obligation.start !== undefined) {
@@ -684,10 +685,12 @@ function stopOutcome(result: StopResult): PublicStopOutcome {
   return { agentId: result.agentId, runId: result.runId, state: "cancelled" };
 }
 
-function completionInventory(record: RestoredAgentRecord) {
-  return { agentId: record.agentId, state: record.state, sessionPath: record.sessionPath,
-    ...(record.currentRunId ? { currentRunId: record.currentRunId } : {}),
-    ...(record.latestCompletion ? { latestCompletion: record.latestCompletion } : {}) };
+function completionInventory(record: PlannedAgentRecord) {
+  return {
+    agentId: record.agentId, state: record.state, sessionPath: record.sessionPath,
+    ...(record.state !== AgentState.Stopped && record.runId !== undefined ? { currentRunId: record.runId } : {}),
+    ...(record.completion === undefined ? {} : { latestCompletion: record.completion.payload }),
+  };
 }
 
 function publicError(error: unknown, fallbackCode: AgentErrorCode): Error {

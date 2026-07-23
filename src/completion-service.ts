@@ -44,7 +44,7 @@ export interface PublishResult {
   queueSize: number;
 }
 
-/** Minimal restored-agent shape `restore()` needs; matches `persistence.ts`'s `RestoredAgentRecord`. */
+/** Stable DTO consumed by `restore()` and populated by the planner adapter. */
 export interface RestorableAgent {
   agentId: AgentId;
   state: AgentState;

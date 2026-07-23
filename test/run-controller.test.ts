@@ -1,9 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { Mutex, RunSemaphore } from "../src/async-primitives.ts";
 import { AgentErrorCode, AgentState, CancellationReason, CodedError, terminalFailureCause, type RunId } from "../src/domain.ts";
 import {
+  agentStateOf,
   classifyTerminal,
+  toCallbackRecord,
+  toSnapshot,
   type LaunchFailedResult,
   type LaunchResult,
+  type Phase,
+  type RunRecord,
   type RunRuntime,
   type StopResult,
 } from "../src/run-controller.ts";
@@ -14,6 +20,17 @@ import { registerStopped, restoreRuns, testRunController } from "./support/contr
 import { testRuntime } from "./support/launches.ts";
 
 type AdoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>) => void;
+
+const testReservation = new RunSemaphore(1).tryAcquire()!;
+const testIdentity = { runId: testRunId("deadbeef"), runtime: testRuntime() };
+const stopResult: StopResult = { status: "already_stopped", agentId: testAgentId() };
+const testTerminatingPhase: Extract<Phase, { kind: "terminating" }> = { kind: "terminating", reservation: testReservation, terminalState: AgentState.Stopping, contained: false };
+// @ts-expect-error a running phase requires identity
+const _badRunning: Phase = { kind: "running", reservation: testReservation };
+// @ts-expect-error completion is not representable on a running phase
+const _badCompletion: Phase = { kind: "running", reservation: testReservation, identity: testIdentity, completion: Promise.resolve(stopResult) };
+// @ts-expect-error terminating.runtime is optional and cannot satisfy a required RunRuntime
+const _rt: RunRuntime = testTerminatingPhase.runtime;
 
 /** Each row forces one post-native-identity failure seam against one waiting contender. */
 const postNativeFailureCases = [
@@ -33,6 +50,16 @@ const terminalOrderings = [
 ] as const;
 
 describe("RunController arbitration", () => {
+
+  test("register rejects non-stopped records (delta 7)", () => {
+    const c = testRunController();
+    expect(() => c.register({
+      agentId: testAgentId("active"),
+      state: AgentState.Running,
+      transcriptPath: testSessionPath("/tmp/pi-subagents-test/active"),
+      runId: testRunId("deadbeef"),
+    })).toThrow("invalid_state:");
+  });
 
   test("restore admission joins an in-flight launch and excludes later launches until commit", async () => {
     const c = testRunController({ capacity: 1 });
@@ -86,6 +113,57 @@ describe("RunController arbitration", () => {
     expect(error).toBeInstanceOf(CodedError);
     expect((error as CodedError).code).toBe(AgentErrorCode.CapacityExceeded);
     expect((error as CodedError).message).toBe("capacity_exceeded: maximum concurrent runs exceeded");
+  });
+
+  test("restore rejects active records without a native identity unless pre-native stopping containment is required", async () => {
+    const cases = [
+      { name: "running without identity or runtime", agentId: testAgentId("bad00001"), state: AgentState.Running },
+      { name: "settling without identity", agentId: testAgentId("bad00002"), state: AgentState.Settling },
+      { name: "running containment responsibility without identity", agentId: testAgentId("bad00003"), state: AgentState.Running, containmentResponsibility: "pre-native" as const, runtime: testRuntime() },
+    ];
+
+    for (const testCase of cases) {
+      const c = testRunController();
+      await expect(restoreRuns(c, [{
+        agentId: testCase.agentId,
+        state: testCase.state,
+        transcriptPath: testSessionPath("/tmp/pi-subagents-test/malformed"),
+        ...(testCase.containmentResponsibility === undefined ? {} : { containmentResponsibility: testCase.containmentResponsibility }),
+        ...(testCase.runtime === undefined ? {} : { runtime: testCase.runtime }),
+      }])).rejects.toMatchObject({ code: AgentErrorCode.InvalidState });
+    }
+  });
+
+  test("restore commit validates a mixed staged batch before installing records", async () => {
+    const c = testRunController({ capacity: 1 });
+    const restore = await c.beginRestore();
+    restore.reserve([
+      { agentId: testAgentId("valid-first"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/valid-first"), runId: testRunId("deadbeef") },
+      { agentId: testAgentId("malformed-later"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/malformed-later") },
+    ]);
+
+    expect(() => restore.commit()).toThrow("invalid_state:");
+    expect(c.snapshots()).toEqual([]);
+    expect(c.activeCount()).toBe(2);
+
+    restore.release();
+    restore.release();
+    expect(c.activeCount()).toBe(0);
+    expect(await c.spawnNew(async (register) => {
+      register({ agentId: testAgentId("reusable"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/reusable") });
+      return { status: "failed" as const, agentId: testAgentId("reusable"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/reusable") };
+    })).toEqual({ status: "failed", agentId: testAgentId("reusable") });
+    expect(c.activeCount()).toBe(0);
+  });
+
+  test("restore retains identified settling and stopping records and pre-native stopping containment", async () => {
+    const c = testRunController({ capacity: 3 });
+    await restoreRuns(c, [
+      { agentId: testAgentId("settling-identity"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/settling-identity"), runId: testRunId("deadbeef") },
+      { agentId: testAgentId("stopping-identity"), state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/stopping-identity"), runId: testRunId("cafebabe"), runtime: testRuntime() },
+      { agentId: testAgentId("pre-native-stopping"), state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/pre-native-stopping"), containmentResponsibility: "pre-native", runtime: testRuntime() },
+    ]);
+    expect(c.snapshots().map((record) => record.state)).toEqual([AgentState.Settling, AgentState.Stopping, AgentState.Stopping]);
   });
 
   test("restoreRuns inherits every prior-session obligation above capacity", async () => {
@@ -272,6 +350,53 @@ describe("RunController arbitration", () => {
     expect(publications).toBe(2);
     expect(releases).toBe(1);
   });
+  test("callback records are invocation-time snapshots, not live references", async () => {
+    let seen: Readonly<RunRecord> | undefined;
+    const c = testRunController({ onTerminal: (record) => { seen = record; } });
+    const id = registerStopped(c);
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
+    await c.stop(id, CancellationReason.StopRequested);
+    expect(seen).toMatchObject({ agentId: id, state: AgentState.Stopping, runId: testRunId("deadbeef") });
+    await c.launch(id, async () => ({ status: "accepted", runId: testRunId("cafebabe"), runtime: testRuntime() }));
+    expect(seen).toMatchObject({ state: AgentState.Stopping, runId: testRunId("deadbeef") });
+  });
+
+  test("a stop racing a launch failure resolves once the launch settles", async () => {
+    const c = testRunController();
+    const id = registerStopped(c);
+    const gate = deferred<void>();
+    const launching = c.launch(id, async (adoptIdentity) => {
+      adoptIdentity(testRunId("deadbeef"), testRuntime());
+      await gate.promise;
+      throw new Error("post-identity failure");
+    });
+    const stopping = c.stop(id, CancellationReason.StopRequested);
+    gate.resolve();
+    expect(await launching).toMatchObject({ status: "settling", agentId: id, runId: testRunId("deadbeef") });
+    expect((await stopping).status).toBe("already_stopped");
+    await c.settle(id, testRunId("deadbeef"), { kind: "completed" }).catch(() => undefined);
+  });
+
+  for (const row of [
+    { name: "throw", operation: async () => { throw new Error("pre-identity"); }, expected: "throws" },
+    { name: "failed", operation: async () => ({ status: "failed" as const }), expected: "failed" },
+    { name: "containment_failed", operation: async () => ({ status: "containment_failed" as const, runtime: testRuntime() }), expected: "containment_failed" },
+  ] as const) {
+    test(`pre-identity relaunch ${row.name} does not inherit the prior run identity`, async () => {
+      const c = testRunController();
+      const id = registerStopped(c);
+      await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
+      await c.stop(id, CancellationReason.StopRequested);
+
+      if (row.expected === "throws") await expect(c.launch(id, row.operation)).rejects.toThrow("pre-identity");
+      else expect(await c.launch(id, row.operation)).toMatchObject({ status: row.expected, agentId: id });
+
+      expect(c.snapshot(id)?.runId).toBeUndefined();
+      if (row.expected === "containment_failed") expect(c.snapshot(id)?.state).toBe(AgentState.Stopping);
+      else expect(c.snapshot(id)?.state).toBe(AgentState.Stopped);
+    });
+  }
+
   test("accepted native identity excludes overlapping send", async () => {
     const c = testRunController(); const id = registerStopped(c);
     const accepted = await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() }));
@@ -653,6 +778,33 @@ describe("RunController arbitration", () => {
     expect(publications).toEqual(["deadbeef:completed", "cafebabe:completed"]);
     expect(c.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: second });
     expect(c.activeCount()).toBe(0);
+  });
+
+  describe("phase projections", () => {
+    const res = () => new RunSemaphore(1).tryAcquire()!;
+    const identity = { runId: testRunId("deadbeef"), runtime: testRuntime() };
+
+    test.each<[string, Phase, AgentState]>([
+      ["launching without identity", { kind: "launching", reservation: res(), done: Promise.resolve(), resolveDone: () => {} }, AgentState.Stopped],
+      ["launching with identity", { kind: "launching", reservation: res(), done: Promise.resolve(), resolveDone: () => {}, identity }, AgentState.Running],
+      ["running", { kind: "running", reservation: res(), identity }, AgentState.Running],
+      ["preRunContainment", { kind: "preRunContainment", reservation: res(), runtime: testRuntime() }, AgentState.Stopping],
+      ["terminating (settling)", { kind: "terminating", reservation: res(), terminalState: AgentState.Settling, contained: false }, AgentState.Settling],
+      ["stopped", { kind: "stopped" }, AgentState.Stopped],
+    ])("%s projects to the expected AgentState", (_name, phase, expected) => {
+      expect(agentStateOf(phase)).toBe(expected);
+    });
+
+    test("toSnapshot omits runtime and obligation; stopped snapshots retain identity", () => {
+      const live: Parameters<typeof toSnapshot>[0] = {
+        agentId: testAgentId(), transcriptPath: testSessionPath(), mutex: new Mutex(),
+        phase: { kind: "running", reservation: res(), identity, provenance: { containmentResponsibility: "pre-native", restoredTerminalObligation: true } },
+      };
+      expect(toCallbackRecord(live)).toMatchObject({ runtime: identity.runtime, restoredTerminalObligation: true, containmentResponsibility: "pre-native" });
+      expect(Object.keys(toSnapshot(live)).sort()).toEqual(["agentId", "containmentResponsibility", "runId", "state", "transcriptPath"]);
+      live.phase = { kind: "stopped", runId: identity.runId, provenance: { containmentResponsibility: "pre-native" } };
+      expect(toSnapshot(live)).toMatchObject({ state: AgentState.Stopped, runId: identity.runId, containmentResponsibility: "pre-native" });
+    });
   });
 
   test("does not hold the agent mutex while stop persistence or containment waits", async () => {

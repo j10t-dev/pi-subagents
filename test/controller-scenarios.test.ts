@@ -142,7 +142,7 @@ describe("controller orchestration scenarios", () => {
   test("11 send_input rejects running, settling and stopping without mutating runs", async () => {
     for (const state of [AgentState.Running, AgentState.Settling, AgentState.Stopping]) {
       const runs = controller();
-      await restoreRuns(runs, [{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
+      await restoreRuns(runs, [{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1, runtime: runtime() }]);
       await expect(runs.launch(A, async () => ({ status: "accepted", runId: R2, runtime: runtime() }))).rejects.toThrow("invalid_state:");
       expect(runs.snapshot(A)).toMatchObject({ state, runId: R1 });
     }
@@ -200,7 +200,7 @@ describe("controller orchestration scenarios", () => {
       expect((await replacement.receive()).completions).toMatchObject([{ agentId: A, runId: R1,
         state: CompletionState.Cancelled, reason: CancellationReason.ParentShutdown }]);
       expect(foldAgentEvents(entries, "/tmp").agents.get(A)).toMatchObject({ state: AgentState.Stopped,
-        latestCompletion: { runId: R1, reason: CancellationReason.ParentShutdown } });
+        completion: { payload: { runId: R1, reason: CancellationReason.ParentShutdown } } });
       } finally {
         state.cleanup();
       }
@@ -210,7 +210,7 @@ describe("controller orchestration scenarios", () => {
   test("14 tree navigation is cancelled for running, settling and stopping ownership", async () => {
     for (const state of [AgentState.Running, AgentState.Settling, AgentState.Stopping]) {
       const host = new SubagentController({ parent: { isBusy: () => false, sendMessage: () => {} } });
-      await restoreRuns(host.runs, [{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1 }]);
+      await restoreRuns(host.runs, [{ agentId: A, state, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: R1, runtime: runtime() }]);
       expect(host.beforeTree()).toBeFalse();
     }
   });

@@ -13,7 +13,7 @@ import {
   type SpawnPreparation,
   type SurrenderContainment,
 } from "./controller.ts";
-import { AgentEventAppender, foldAgentEvents, type RestoredAgentRecord } from "./persistence.ts";
+import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord } from "./persistence.ts";
 import { buildRpcLaunchSpec, resolvePiInvocation, type BuildRpcLaunchOptions, type RpcLaunchSpec } from "./pi-launcher.ts";
 import { isLocalOutputPublicationError, RpcRunClient } from "./rpc-client.ts";
 import { OutputStore } from "./output-store.ts";
@@ -21,6 +21,7 @@ import { UIForwarder, type UIForwarderContext } from "./ui-forwarder.ts";
 import { WatchdogClient, WatchdogContainmentUnresolvedError, verifyContainmentReceipt } from "./watchdog-client.ts";
 import {
   AgentErrorCode,
+  AgentState,
   CancellationReason,
   CodedError,
   CompletionState,
@@ -228,8 +229,10 @@ export function createProductionController(
         const value = SessionManager.open(record.sessionPath).getLeafId();
         leaf = value === null ? null : sessionEntryId(value);
       } catch { /* restoration will retain unavailable sessions as non-resumable */ }
-      const attemptId = record.pendingLaunch?.attemptId ?? record.currentAttemptId ?? record.latestCompletionAttemptId ?? createRunAttemptId();
-      const receipt = record.pendingLaunch?.containmentReceiptPath ?? record.currentReceiptPath ?? record.latestCompletionReceiptPath ?? receiptFor(root, attemptId);
+      const fromRun = record.state === AgentState.Stopped ? undefined : record.run;
+      const pending = record.state === AgentState.Stopped ? record.pendingLaunch : undefined;
+      const attemptId = pending?.payload.attemptId ?? fromRun?.attemptId ?? record.completion?.attemptId ?? createRunAttemptId();
+      const receipt = pending?.payload.containmentReceiptPath ?? fromRun?.receiptPath ?? record.completion?.receiptPath ?? receiptFor(root, attemptId);
       children.set(record.agentId, {
         session: { agentId: record.agentId, transcriptPath: record.sessionPath, previousLeafId: leaf, attemptId, containmentReceiptPath: receipt },
         cwd: record.cwd,
@@ -241,7 +244,7 @@ export function createProductionController(
   }
 
   async function restoredCompletion(
-    record: RestoredAgentRecord,
+    record: FoldedAgentRecord,
     nativeRunId: AgentCompletion["runId"],
     settlement: { kind: "interrupted" } | { kind: "cancelled"; reason: CancellationReason },
   ): Promise<AgentCompletion> {

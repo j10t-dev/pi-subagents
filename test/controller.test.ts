@@ -1351,6 +1351,7 @@ describe("parent lifecycle wiring", () => {
       runId: runningRuns[index]!,
       state: AgentState.Running,
       transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${agentIdValue}`),
+      runtime: { abort: async () => {}, contain: async () => testVerifiedReceiptPath() },
     })));
     for (const index of Array.from({ length: ready }, (_, value) => value)) {
       await controller.publish(completedCompletion({
@@ -1408,7 +1409,8 @@ describe("parent lifecycle wiring", () => {
   test("tree blocks active ownership and switch/fork warn", async () => {
     const warnings: string[] = [];
     const c = new SubagentController({ parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => { warnings.push(message); } } });
-    await restoreRuns(c.runs, [{ agentId: agentId("a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: runId("deadbeef") }]);
+    await restoreRuns(c.runs, [{ agentId: agentId("a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), runId: runId("deadbeef"),
+      runtime: { abort: async () => {}, contain: async () => testVerifiedReceiptPath() } }]);
     expect(c.beforeTree()).toBeFalse();
     expect(c.beforeSwitch()).toBeTrue();
     expect(c.beforeFork()).toBeTrue();

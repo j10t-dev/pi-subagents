@@ -15,6 +15,8 @@ import {
   AgentEventAppender,
   decodeAgentEvent as decodeAgentEventAtRoot,
   foldAgentEvents as foldAgentEventsAtRoot,
+  type FoldedAgentRecord,
+  type PendingLaunch,
   type RestorationAction,
 } from "../src/persistence.ts";
 
@@ -160,6 +162,23 @@ function stoppingPayload(id = AGENT, run = RUN): RunStoppingPayload {
 function completedPayload(id = AGENT, run = RUN): RunCompletedPayload {
   return { state: "completed", agentId: testAgentId(id), runId: testRunId(run), output: { text: "done", originalBytes: utf8Bytes(4), retainedBytes: utf8Bytes(4), truncated: false }, outputPath: testCommittedOutputPath(OUTPUT_PATH), transcriptPath: sessionPath(STATE_ROOT, SESSION_PATH) };
 }
+
+const baseRecordFixture = { ...spawnedPayload(), state: AgentState.Stopped } satisfies FoldedAgentRecord;
+const runFixture = {
+  runId: testRunId(RUN), receiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH),
+  attemptId: testAttemptId(ATTEMPT), eventVersion: 1 as const,
+};
+const v1PayloadFixture = {
+  agentId: testAgentId(AGENT), previousLeafId: null, attemptId: testAttemptId(ATTEMPT),
+  containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH),
+};
+// Type-level guards: these constructions must stay illegal.
+// @ts-expect-error a running fold record requires its run bundle
+const _badRunning: FoldedAgentRecord = { ...baseRecordFixture, state: AgentState.Running };
+// @ts-expect-error a stopping fold record requires a stop reason
+const _badStopping: FoldedAgentRecord = { ...baseRecordFixture, state: AgentState.Stopping, run: runFixture };
+// @ts-expect-error a V1 launch payload cannot claim event version 2
+const _badLaunch: PendingLaunch = { payload: v1PayloadFixture, eventVersion: 2 };
 
 function cancelledPayload(id = AGENT, run = RUN): RunCompletedPayload {
   return { state: "cancelled", agentId: testAgentId(id), runId: testRunId(run), reason: "stop_requested", output: { text: "", originalBytes: utf8Bytes(0), retainedBytes: utf8Bytes(0), truncated: false }, outputPath: testCommittedOutputPath(OUTPUT_PATH), transcriptPath: sessionPath(STATE_ROOT, SESSION_PATH) };
@@ -364,7 +383,7 @@ describe("foldAgentEvents", () => {
       name: "RunStarted while the agent is non-stopped",
       entries: [spawnedEntry(), launchEntry(), startedEntry(), launchEntry(AGENT, "attempt-2"),
         startedEntry(AGENT, "c3d4e5f6", "attempt-2")],
-      prior: { state: AgentState.Running, currentRunId: RUN },
+      prior: { state: AgentState.Running, run: { runId: RUN } },
       pendingAttempt: undefined,
       action: { type: RestorationActionType.ReconcileStarted, attemptId: ATTEMPT, runId: RUN },
     },
@@ -372,7 +391,8 @@ describe("foldAgentEvents", () => {
     const restored = foldAgentEvents(entries);
     const record = restored.agents.get(testAgentId(AGENT));
     expect(record).toMatchObject(prior);
-    expect(record?.pendingLaunch?.attemptId as string | undefined).toBe(pendingAttempt);
+    expect(record?.state === AgentState.Stopped ? record.pendingLaunch?.payload.attemptId : undefined)
+      .toBe(pendingAttempt === undefined ? undefined : testAttemptId(pendingAttempt));
     expect(restored.invalidEvents.length).toBeGreaterThan(0);
     expect(restored.invalidEvents.every((message) => Buffer.byteLength(message) <= 10_000)).toBeTrue();
     expect(restored.actions).toHaveLength(1);
@@ -380,23 +400,26 @@ describe("foldAgentEvents", () => {
   });
   test("folds v2 containment ownership through launch, start, and completion without inheritance", () => {
     const first = foldAgentEvents([spawnedEntry(), launchV2Entry()]);
-    const pending = first.agents.get(agentId(AGENT))?.pendingLaunch;
+    const firstRecord = first.agents.get(agentId(AGENT));
+    const pending = firstRecord?.state === AgentState.Stopped ? firstRecord.pendingLaunch?.payload : undefined;
     expect(pending !== undefined && "containment" in pending ? pending.containment : undefined)
       .toEqual({ ...descriptor, scopePath: absolutePath(descriptor.scopePath) });
 
     const running = foldAgentEvents([spawnedEntry(), launchV2Entry(), startedEntry()]);
-    expect(running.agents.get(agentId(AGENT))?.pendingLaunch).toBeUndefined();
-    expect(running.agents.get(agentId(AGENT))?.currentContainment)
+    const runningRecord = running.agents.get(agentId(AGENT));
+    expect(runningRecord?.state === AgentState.Stopped ? runningRecord.pendingLaunch : undefined).toBeUndefined();
+    expect(runningRecord?.state === AgentState.Running ? runningRecord.run.containment : undefined)
       .toEqual({ ...descriptor, scopePath: absolutePath(descriptor.scopePath) });
 
     const completed = foldAgentEvents([spawnedEntry(), launchV2Entry(), startedEntry(), completedEntry()]);
-    expect(completed.agents.get(agentId(AGENT))?.latestCompletionContainment)
+    expect(completed.agents.get(agentId(AGENT))?.completion?.containment)
       .toEqual({ ...descriptor, scopePath: absolutePath(descriptor.scopePath) });
 
     const later = foldAgentEvents([
       spawnedEntry(), launchV2Entry(), startedEntry(), completedEntry(), launchEntry(AGENT, "attempt-2"),
     ]);
-    const laterPending = later.agents.get(agentId(AGENT))?.pendingLaunch;
+    const laterRecord = later.agents.get(agentId(AGENT));
+    const laterPending = laterRecord?.state === AgentState.Stopped ? laterRecord.pendingLaunch?.payload : undefined;
     expect(laterPending !== undefined && "containment" in laterPending ? laterPending.containment : undefined).toBeUndefined();
   });
 
@@ -417,7 +440,7 @@ describe("foldAgentEvents", () => {
     ]);
     const record = restored.agents.get(testAgentId(AGENT));
     expect(record?.state).toBe(AgentState.Stopped);
-    expect(record?.latestCompletion?.state).toBe("completed");
+    expect(record?.completion?.payload.state).toBe("completed");
     expect(restored.invalidEvents).toEqual([]);
     expect(restored.actions).toEqual([
       {
@@ -440,7 +463,7 @@ describe("foldAgentEvents", () => {
 
     expect(restored.agents.get(testAgentId(AGENT))).toMatchObject({
       state: AgentState.Stopped,
-      latestCompletion: { state: "failed", runId: RUN },
+      completion: { payload: { state: "failed", runId: RUN } },
     });
     expect(restored.invalidEvents).toEqual([]);
     expect(restored.actions).toEqual([
@@ -458,7 +481,7 @@ describe("foldAgentEvents", () => {
     ]);
     const record = restored.agents.get(testAgentId(AGENT));
     expect(record?.state).toBe(AgentState.Stopped);
-    expect(record?.latestCompletion?.state).toBe("cancelled");
+    expect(record?.completion?.payload.state).toBe("cancelled");
     expect(restored.invalidEvents).toEqual([]);
     expect(restored.actions.length).toBe(1);
     expect(restored.actions[0]?.type).toBe(RestorationActionType.ValidateCompletedReceipt);

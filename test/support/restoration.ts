@@ -1,6 +1,6 @@
 import { AGENT_EVENT_CUSTOM_TYPE } from "../../src/constants.ts";
 import { AgentEventType, AgentState, CancellationReason, type AgentCompletion, type AgentEventPayloadMap, type PersistedAgentEvent } from "../../src/domain.ts";
-import { AgentEventAppender, type RestoredAgentRecord } from "../../src/persistence.ts";
+import { AgentEventAppender, type FoldedAgentRecord } from "../../src/persistence.ts";
 import type { RestorationPort } from "../../src/controller.ts";
 import { completedCompletion } from "./messages.ts";
 import { testAbsolutePath, testAgentId, testAttemptId, testModelSpec, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./brands.ts";
@@ -12,7 +12,7 @@ export function testRestorationPort(overrides: Partial<RestorationPort> = {}): R
     getBranch: () => [],
     resolveContainment: async () => ({ kind: "contained", receipt: testVerifiedReceiptPath() }),
     firstUserEntryAfter: async () => undefined,
-    finaliseContained: async (_record: RestoredAgentRecord, runId) => completedCompletion({ runId }),
+    finaliseContained: async (_record: FoldedAgentRecord, runId) => completedCompletion({ runId }),
     appender,
     ...overrides,
   };
