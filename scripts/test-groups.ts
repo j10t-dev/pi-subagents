@@ -17,6 +17,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "completion-service.test.ts",
     "domain.test.ts",
     "durable-fs.test.ts",
+    "observation-snapshot-path.test.ts",
     "persistence.test.ts",
     "pi-integration-harness.test.ts",
     "paths.test.ts",
