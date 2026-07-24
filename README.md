@@ -69,7 +69,7 @@ Oversized or malformed records are discarded or converted to bounded diagnostics
 
 ## Lifecycle semantics
 
-Human-facing agent ordinals are scoped to one active parent branch. They are stable within that branch, are never recycled there, and are re-derived after branch replacement; they are display identities rather than native IDs.
+Human-facing agent ordinals derive from accepted unique `Spawned` positions in one active parent branch. They are stable within that branch, rejected agents retain their reserved positions, and ordinals are re-derived after branch replacement; they are display identities rather than native IDs.
 
 Parent shutdown contains every active process group before returning. There is no detached execution: quit, reload, new-session, resume, and fork shutdown paths own cancellation. Version 1 does not persist collection attempts or inspect parent tool-result entries. Restoration re-exposes each owned agent’s latest persisted completion to the next `await_agent` and may therefore return a completion that was collected before reload or resume. No automatic message is sent on restoration; `agents: … result(s) ready` in the status bar is the passive discovery surface. The stable `runId` identifies duplicate visibility of the same durable outcome. Lifecycle ownership follows persisted parent custom entries and therefore survives compaction; branch navigation is rejected while active children would make ownership ambiguous. Reload closes the old controller before restoring its replacement.
 

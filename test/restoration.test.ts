@@ -1339,18 +1339,18 @@ describe("branch restoration", () => {
     expect(c.runs.activeCount()).toBe(1);
   });
 
-  test("a reserve failure clears the staged plan before restoration retry", async () => {
+  test("a reserve failure retains the controller's folded branch snapshot on retry", async () => {
     const conflictingBranch = [spawned()];
     let reads = 0;
     const restoration = port(conflictingBranch, true, []);
-    restoration.getBranch = () => reads++ === 0 ? conflictingBranch : [];
+    restoration.getBranch = () => { reads++; return []; };
     const c = new SubagentController({ restoration });
     c.runs.register({ agentId: testAgentId(), state: AgentState.Stopped, transcriptPath: testSessionPath() });
 
     await expect(c.restore()).rejects.toThrow("invalid_agent:");
-    await expect(c.restore()).resolves.toBeUndefined();
+    await expect(c.restore()).rejects.toThrow("invalid_agent:");
 
-    expect(reads).toBe(2);
+    expect(reads).toBe(0);
     expect(c.runs.snapshots()).toHaveLength(1);
   });
 
@@ -1696,6 +1696,7 @@ function tracedDurableFileSystem(trace: string[], failOperation?: string): Durab
 }
 
 type TestRestorationPort = RestorationPort & {
+  getBranch(): readonly { readonly type: string; readonly customType?: string; readonly data?: unknown }[];
   validateReceipt(path: unknown, attemptId: unknown): Promise<boolean>;
 };
 

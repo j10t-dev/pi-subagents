@@ -24,7 +24,6 @@ import {
 } from "./domain.ts";
 import type { EffectiveChildSelection } from "./child-selection.ts";
 import { RunController, classifyTerminal, type RunRecord, type RunRuntime, type Settlement, type StopResult } from "./run-controller.ts";
-import { foldAgentEvents } from "./persistence.ts";
 import type { RpcRunClient } from "./rpc-client.ts";
 import { classifyAssignmentEntries } from "./assignment-identity.ts";
 import { delayWithAbort, waitWithAbort } from "./async-primitives.ts";
@@ -366,7 +365,7 @@ export class SubagentController {
     try {
       let plan = this.stagedRestorePlan;
       if (plan === undefined) {
-        const folded = foldAgentEvents(this.restoration.getBranch(), this.restoration.stateRoot);
+        const folded = this.restoration.folded;
         for (const diagnostic of folded.invalidEvents) this.parent?.warn?.(diagnostic);
         const evidence = await collectRestorationEvidence(
           folded,

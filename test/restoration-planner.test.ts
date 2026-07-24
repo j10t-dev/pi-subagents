@@ -178,6 +178,7 @@ function registry(record: FoldedAgentRecord, action?: RestorationAction): Restor
     agents: new Map([[record.agentId, record]]),
     actions: action === undefined ? [] : [action],
     invalidEvents: [],
+    spawnSequence: [],
   };
 }
 
@@ -262,7 +263,7 @@ function plan(record: FoldedAgentRecord, action: RestorationAction | undefined, 
 }
 
 test("plans an empty restored registry", () => {
-  expectPlan(planRestoration({ agents: new Map(), actions: [], invalidEvents: [] }, new Map()), {
+  expectPlan(planRestoration({ agents: new Map(), actions: [], invalidEvents: [], spawnSequence: [] }, new Map()), {
     restored: [], runtimeRecords: [], durableWrites: [], obligations: new Map(), warnings: [],
   });
 });
@@ -471,7 +472,7 @@ test("rejects duplicate actions fail-closed with InvalidState", () => {
 });
 
 test("rejects an action whose registry record is missing fail-closed with InvalidState", () => {
-  const input: RestoredRegistry = { agents: new Map(), actions: [launchAction()], invalidEvents: [] };
+  const input: RestoredRegistry = { agents: new Map(), actions: [launchAction()], invalidEvents: [], spawnSequence: [] };
   expect(() => planRestoration(input, new Map())).toThrow(expect.objectContaining({ code: AgentErrorCode.InvalidState }));
 });
 
@@ -489,6 +490,7 @@ test("emits restored and runtime records in registry map order rather than actio
     agents: new Map([[second.agentId, second], [first.agentId, first]]),
     actions: [completedAction(first.agentId), completedAction(second.agentId)],
     invalidEvents: [],
+    spawnSequence: [],
   };
   const evidence = new Map<AgentId, AgentRestorationEvidence>([
     [first.agentId, contained(firstRuntime)],

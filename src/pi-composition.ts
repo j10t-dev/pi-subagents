@@ -13,7 +13,7 @@ import {
   type SpawnPreparation,
   type SurrenderContainment,
 } from "./controller.ts";
-import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord } from "./persistence.ts";
+import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord, type RestoredRegistry } from "./persistence.ts";
 import { buildRpcLaunchSpec, resolvePiInvocation, type BuildRpcLaunchOptions, type RpcLaunchSpec } from "./pi-launcher.ts";
 import { isLocalOutputPublicationError, RpcRunClient } from "./rpc-client.ts";
 import { OutputStore } from "./output-store.ts";
@@ -147,7 +147,8 @@ export function createProductionController(
   });
   const children = new Map<AgentId, ChildRecord>();
   const uiForwarder = new UIForwarder(context);
-  restoreChildRegistry();
+  const folded = foldAgentEvents(context.sessionManager.getBranch(), root);
+  restoreChildRegistry(folded);
   const composition: PiControllerComposition = {
     prepareSpawn: async (input) => prepareSpawn(input),
     prepareSend: async (id) => prepareSend(id),
@@ -173,7 +174,7 @@ export function createProductionController(
     composition,
     restoration: {
       stateRoot: root,
-      getBranch: () => context.sessionManager.getBranch(),
+      folded,
       resolveContainment: async ({ attemptId, receiptPath, descriptor, eventVersion }) => {
         let receipt: ReturnType<typeof verifyContainmentReceipt> | undefined;
         try { receipt = verifyContainmentReceipt(receiptPath, attemptId); }
@@ -234,9 +235,8 @@ export function createProductionController(
     },
   });
 
-  function restoreChildRegistry(): void {
-    const folded = foldAgentEvents(context.sessionManager.getBranch(), root);
-    for (const record of folded.agents.values()) {
+  function restoreChildRegistry(registry: RestoredRegistry): void {
+    for (const record of registry.agents.values()) {
       let leaf: LaunchSession["previousLeafId"] = null;
       try {
         const value = SessionManager.open(record.sessionPath).getLeafId();

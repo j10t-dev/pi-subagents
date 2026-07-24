@@ -22,7 +22,9 @@ import { fileURLToPath } from "node:url";
 
 import { CONFIG_DIR_NAME, RpcClient, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
-import { launchAfterSurrender } from "../src/pi-composition.ts";
+import { createProductionController, launchAfterSurrender } from "../src/pi-composition.ts";
+import { agentId, delegationDepth, runCapacity, type AgentId } from "../src/domain.ts";
+import { absolutePath } from "../src/paths.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
 import {
@@ -242,6 +244,21 @@ describe("installed Pi integration prerequisites", () => {
     );
     expect(result).toBe(42);
     expect(order).toEqual(["surrender", "launch"]);
+  });
+
+  test("production restoration folds the selected parent branch once", async () => {
+    let branchReads = 0;
+    const harness = productionHarness({
+      getBranch: () => {
+        branchReads += 1;
+        return stoppedBranchWithAgents("agent-a", "agent-b");
+      },
+    });
+
+    await harness.controller.restore();
+
+    expect(branchReads).toBe(1);
+    expect(harness.restoredAgentIds()).toEqual([agentId("agent-a"), agentId("agent-b")]);
   });
 
   test("a no-process containment receipt is accepted for the matching attempt", () => {
@@ -821,6 +838,85 @@ describe("deterministic network-free real-Pi matrix", () => {
     });
   }, 40_000);
 });
+
+function productionHarness(options: {
+  readonly getBranch: () => readonly unknown[];
+}): {
+  readonly controller: ReturnType<typeof createProductionController>;
+  readonly restoredAgentIds: () => readonly AgentId[];
+} {
+  const controller = createProductionController(
+    {
+      sessionManager: {
+        getSessionId: () => "parent-task-2",
+        getBranch: options.getBranch,
+      },
+      cwd: "/tmp",
+      model: undefined,
+      modelRegistry: { getAll: () => [] },
+      hasUI: false,
+      ui: {
+        select: async () => undefined,
+        confirm: async () => false,
+        input: async () => undefined,
+        editor: async () => undefined,
+        notify: () => {},
+        setStatus: () => {},
+        setWidget: () => {},
+      },
+      isIdle: () => true,
+      isProjectTrusted: () => false,
+    } as unknown as Parameters<typeof createProductionController>[0],
+    {
+      appendEntry: () => {},
+      sendMessage: () => {},
+      getThinkingLevel: () => "off",
+      getActiveTools: () => [],
+    } as unknown as Parameters<typeof createProductionController>[1],
+    {
+      capacity: runCapacity(2),
+      currentDepth: delegationDepth(0),
+      maxDepth: delegationDepth(1),
+      stateRoot: absolutePath("/tmp/pi-subagents-task-2"),
+    },
+    {
+      createContainmentProvider: () => ({ kind: "available", backend: {
+        root: absolutePath("/tmp/pi-subagents-task-2/cgroups"),
+        parentScope: absolutePath("/tmp/pi-subagents-task-2/cgroups/parent"),
+        preflight: async () => {},
+        prepareAttempt: () => { throw new Error("unexpected launch"); },
+        restoreAttempt: () => { throw new Error("unexpected restoration"); },
+        shutdown: async () => {},
+      } }),
+      buildRpcLaunchSpec: () => { throw new Error("unexpected launch"); },
+    } as unknown as Parameters<typeof createProductionController>[3],
+  );
+  return {
+    controller,
+    restoredAgentIds: () => controller.runs.snapshots().map((record) => record.agentId),
+  };
+}
+
+function stoppedBranchWithAgents(...agentIds: readonly string[]): readonly unknown[] {
+  const root = "/tmp/pi-subagents-task-2/parent-task-2";
+  return agentIds.map((id) => ({
+    type: "custom",
+    customType: "pi-subagents:event",
+    data: {
+      schemaVersion: 2,
+      eventType: "spawned",
+      payload: {
+        agentId: id,
+        sessionPath: `${root}/sessions/${id}.jsonl`,
+        cwd: "/tmp",
+        provider: "mock-provider",
+        modelId: "mock-model",
+        thinkingLevel: "off",
+        tools: [],
+      },
+    },
+  }));
+}
 
 function transcriptToolNames(entries: readonly SessionEntry[]): string[] {
   return entries.flatMap((entry) => entry.type === "message" && entry.message.role === "assistant"

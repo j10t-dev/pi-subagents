@@ -1,16 +1,27 @@
 import { dirname } from "node:path";
 import { AGENT_EVENT_CUSTOM_TYPE } from "../../src/constants.ts";
 import { AgentEventType, AgentState, CancellationReason, type AgentCompletion, type AgentEventPayloadMap, type PersistedAgentEvent } from "../../src/domain.ts";
-import { AgentEventAppender, type FoldedAgentRecord } from "../../src/persistence.ts";
+import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord } from "../../src/persistence.ts";
 import type { RestorationPort } from "../../src/controller.ts";
 import { completedCompletion } from "./messages.ts";
 import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testContainmentAttempt, testModelId, testProviderId, testReceiptPath, testRunId, testSessionPath, testToolName, testVerifiedReceiptPath } from "./brands.ts";
 
-export function testRestorationPort(overrides: Partial<RestorationPort> = {}): RestorationPort {
+export interface TestRestorationPort extends RestorationPort {
+  getBranch(): readonly { readonly type: string; readonly customType?: string; readonly data?: unknown }[];
+}
+
+type TestRestorationPortOverrides = Partial<RestorationPort> & {
+  getBranch?: TestRestorationPort["getBranch"];
+};
+
+export function testRestorationPort(overrides: TestRestorationPortOverrides = {}): TestRestorationPort {
+  const stateRoot = overrides.stateRoot ?? testAbsolutePath("/tmp/pi-subagents-test");
+  const getBranch = overrides.getBranch ?? (() => []);
   const appender = new AgentEventAppender(() => {});
   return {
-    stateRoot: testAbsolutePath("/tmp/pi-subagents-test"),
-    getBranch: () => [],
+    stateRoot,
+    folded: overrides.folded ?? foldAgentEvents(getBranch(), stateRoot),
+    getBranch,
     resolveContainment: async () => ({ kind: "contained", receipt: testVerifiedReceiptPath() }),
     firstUserEntryAfter: async () => undefined,
     finaliseContained: async (_record: FoldedAgentRecord, runId) => completedCompletion({ runId }),

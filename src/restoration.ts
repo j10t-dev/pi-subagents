@@ -68,7 +68,8 @@ export type PlannedAgentRecord = CandidatePlannedAgentRecord;
 
 export interface RestorationPort {
   stateRoot: AbsolutePath;
-  getBranch(): readonly { readonly type: string; readonly customType?: string; readonly data?: unknown }[];
+  /** The one authoritative fold for this controller's selected parent branch. */
+  readonly folded: RestoredRegistry;
   resolveContainment(input: RestorationContainmentInput): Promise<RestorationContainmentDecision>;
   firstUserEntryAfter(sessionPath: SessionPath, cursor: SessionEntryId | null): Promise<RunId | undefined>;
   finaliseContained(record: FoldedAgentRecord, runId: RunId, settlement: RestoredSettlement): Promise<AgentCompletion>;

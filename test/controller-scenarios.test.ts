@@ -647,7 +647,7 @@ function restorationPort(
 ): RestorationPort {
   return {
     stateRoot: testAbsolutePath("/tmp"),
-    getBranch: () => entries,
+    folded: foldAgentEvents(entries, testAbsolutePath("/tmp")),
     resolveContainment: async ({ receiptPath, attemptId }) => ({
       kind: "contained",
       receipt: verifyContainmentReceipt(receiptPath, attemptId).path,

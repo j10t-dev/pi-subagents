@@ -382,6 +382,8 @@ export interface RestoredRegistry {
   agents: Map<AgentId, FoldedAgentRecord>;
   actions: RestorationAction[];
   invalidEvents: string[];
+  /** Immutable first-accepted Spawned identities; positions remain reserved after rejection. */
+  readonly spawnSequence: readonly AgentId[];
 }
 
 interface FoldableEntry {
@@ -403,6 +405,8 @@ export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: Ab
   const agents = new Map<AgentId, FoldedAgentRecord>();
   const actions: RestorationAction[] = [];
   const invalidEvents: string[] = [];
+  const spawnSequence: AgentId[] = [];
+  const acceptedSpawned = new Set<AgentId>();
   const rejectedAgents = new Set<AgentId>();
 
   const pushInvalid = (message: string): void => {
@@ -432,6 +436,11 @@ export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: Ab
       continue;
     }
 
+    if (event.eventType === AgentEventType.Spawned && !agents.has(event.payload.agentId) &&
+        !acceptedSpawned.has(event.payload.agentId)) {
+      acceptedSpawned.add(event.payload.agentId);
+      spawnSequence.push(event.payload.agentId);
+    }
     applyEvent(agents, event, pushInvalid);
   }
 
@@ -480,7 +489,7 @@ export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: Ab
     }
   }
 
-  return { agents, actions, invalidEvents };
+  return { agents, actions, invalidEvents, spawnSequence: Object.freeze(spawnSequence) };
 }
 
 function persistedAgentId(value: unknown): AgentId | undefined {

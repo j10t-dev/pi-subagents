@@ -77,6 +77,30 @@ function spawnedEntry(agentId = AGENT) {
   };
 }
 
+function spawned(agentIdValue: string) {
+  return spawnedEntry(agentIdValue);
+}
+
+function malformedSpawned(agentIdValue: string) {
+  return {
+    ...spawnedEntry(),
+    data: {
+      ...spawnedEntry().data,
+      payload: { ...spawnedEntry().data.payload, agentId: agentIdValue },
+    },
+  };
+}
+
+function malformedCompletionFor(agentIdValue: string) {
+  return {
+    ...completedEntry(agentIdValue),
+    data: {
+      ...completedEntry(agentIdValue).data,
+      payload: { ...completedEntry(agentIdValue).data.payload, transcriptPath: "/tmp/escape" },
+    },
+  };
+}
+
 function launchEntry(agentId = AGENT, attemptId = ATTEMPT) {
   return {
     type: "custom" as const,
@@ -416,6 +440,28 @@ describe("decodeAgentEvent", () => {
 });
 
 describe("foldAgentEvents", () => {
+  test("spawnSequence reserves accepted positions after later rejection and ignores duplicates", () => {
+    const folded = foldAgentEvents([
+      spawned("agent-a"),
+      malformedCompletionFor("agent-a"),
+      spawned("agent-b"),
+      spawned("agent-b"),
+    ], STATE_ROOT);
+
+    expect(folded.spawnSequence).toEqual([agentId("agent-a"), agentId("agent-b")]);
+    expect([...folded.agents.keys()]).toEqual([agentId("agent-b")]);
+    expect(Object.isFrozen(folded.spawnSequence)).toBeTrue();
+  });
+
+  test("a malformed Spawned event consumes no position", () => {
+    const folded = foldAgentEvents([
+      malformedSpawned("bad/path"),
+      spawned("agent-a"),
+    ], STATE_ROOT);
+
+    expect(folded.spawnSequence).toEqual([agentId("agent-a")]);
+  });
+
   test("a path-invalid event rejects the complete agent record and emits a bounded diagnostic", () => {
     const hostile = { ...completedEntry().data, payload: { ...completedEntry().data.payload, outputPath: "/tmp/escape" } };
     const restored = foldAgentEvents([spawnedEntry(), launchEntry(), startedEntry(),

@@ -333,7 +333,7 @@ describe("parent lifecycle wiring", () => {
     const entered = deferred<void>();
     let createSessions = 0;
     const c = new SubagentController({ restoration: {
-      stateRoot: testAbsolutePath("/tmp"), getBranch: () => [], resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
+      stateRoot: testAbsolutePath("/tmp"), folded: testRestorationPort().folded, resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
       finaliseContained: async () => { throw new Error("unused"); },
       restoreCompletion: async () => { throw new Error("unused"); },
       appender: testRestorationPort().appender,
@@ -941,7 +941,7 @@ describe("parent lifecycle wiring", () => {
       previousLeafId: null, attemptId: testAttemptId("attempt"), containmentReceiptPath: testReceiptPath("/tmp/pi-subagents-test/r"),
     };
     const c = new SubagentController({ capacity: runCapacity(1), restoration: {
-      stateRoot: testAbsolutePath("/tmp"), getBranch: () => [], resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
+      stateRoot: testAbsolutePath("/tmp"), folded: testRestorationPort().folded, resolveContainment: async () => unresolvedContainment(), firstUserEntryAfter: async () => undefined,
       finaliseContained: async () => { throw new Error("unused"); },
       restoreCompletion: async () => { throw new Error("unused"); },
       appender: testRestorationPort().appender,
