@@ -14,9 +14,10 @@ import {
   type SurrenderContainment,
 } from "./controller.ts";
 import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord, type RestoredRegistry } from "./persistence.ts";
-import { AgentObservationStore, createTotalAgentObservationAdapter } from "./agent-observation-store.ts";
+import { AgentObservationStore, createTotalAgentObservationAdapter, createTotalRpcObservationAdapter } from "./agent-observation-store.ts";
+import { createContextObservationService } from "./context-observation.ts";
 import { buildRpcLaunchSpec, resolvePiInvocation, type BuildRpcLaunchOptions, type RpcLaunchSpec } from "./pi-launcher.ts";
-import { isLocalOutputPublicationError, RpcRunClient } from "./rpc-client.ts";
+import { isLocalOutputPublicationError, RpcRunClient, type RpcLaunchTransport } from "./rpc-client.ts";
 import { OutputStore } from "./output-store.ts";
 import { UIForwarder, type UIForwarderContext } from "./ui-forwarder.ts";
 import { WatchdogClient, WatchdogContainmentUnresolvedError, verifyContainmentReceipt } from "./watchdog-client.ts";
@@ -47,7 +48,9 @@ import {
   type RunAttemptId,
   type RunId,
   type SessionEntryId,
+  type SessionPath,
   type ThinkingLevel,
+  type VerifiedContainmentReceiptPath,
   type ToolName,
 } from "./domain.ts";
 import { absolutePath, containmentReceiptPath, diagnosticsPath, sessionPath, writeOwnerOnlyFile } from "./paths.ts";
@@ -57,7 +60,7 @@ import { canDelegateFrom } from "./delegation-policy.ts";
 import { MAX_STDERR_TAIL_BYTES } from "./constants.ts";
 import { ensureDurableDirectorySync } from "./durable-fs.ts";
 import { createContainmentProvider, type ContainmentProvider } from "./cgroup-v2.ts";
-import type { ContainmentAttempt, ContainmentBackend } from "./containment.ts";
+import type { ContainmentAttempt, ContainmentBackend, ContainmentDescriptor } from "./containment.ts";
 
 interface ProductionControllerContext extends UIForwarderContext {
   readonly sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId" | "getBranch">;
@@ -93,10 +96,23 @@ interface PreparedProductionLaunch {
   readonly runtime: RunRuntime;
 }
 
+interface PreparedProductionRpcLaunch extends PreparedProductionLaunch {
+  readonly agentId: AgentId;
+  readonly sessionPath: SessionPath;
+}
+
+interface PreparedRpcTransport {
+  readonly containment: ContainmentDescriptor;
+  readonly transport: RpcLaunchTransport;
+  readonly contain: () => Promise<VerifiedContainmentReceiptPath>;
+}
+
 interface ProductionControllerDependencies {
   readonly createContainmentProvider: typeof createContainmentProvider;
   readonly buildRpcLaunchSpec: (options: BuildRpcLaunchOptions) => RpcLaunchSpec;
   readonly createPreparedLaunch?: (prepared: PreparedProductionLaunch) => Promise<LaunchTransport>;
+  /** Test harness seam retaining the production RpcRunClient and observation composition. */
+  readonly createPreparedRpcTransport?: (prepared: PreparedProductionRpcLaunch) => Promise<PreparedRpcTransport>;
 }
 
 const PRODUCTION_CONTROLLER_DEPENDENCIES: ProductionControllerDependencies = {
@@ -377,6 +393,7 @@ export function createProductionController(
     const outputStore = new OutputStore({ workDir: outputDir });
     let watchdog: WatchdogClient | undefined;
     let client: RpcRunClient | undefined;
+    let preparedRpc: Promise<PreparedRpcTransport> | undefined;
     const runtime: RunRuntime = {
       abort: async () => {
         try { await client?.abort(); } finally { watchdog?.escalate(); }
@@ -386,6 +403,7 @@ export function createProductionController(
           if (client !== undefined) await client.shutdown();
           else if (watchdog !== undefined) await watchdog.close();
           else return await attempt.terminate("no_process");
+          if (preparedRpc !== undefined) return await (await preparedRpc).contain();
           if (watchdog === undefined) throw new Error("containment_unavailable:watchdog ownership");
           return await watchdog.waitForReceipt();
         } catch (error) {
@@ -415,13 +433,30 @@ export function createProductionController(
     if (dependencies.createPreparedLaunch !== undefined) {
       return dependencies.createPreparedLaunch({ attempt, spec, runtime });
     }
-    watchdog = new WatchdogClient({
-      attemptId: child.session.attemptId,
-      receiptPath: child.session.containmentReceiptPath,
-      attempt,
-    });
+    if (dependencies.createPreparedRpcTransport !== undefined) {
+      preparedRpc = dependencies.createPreparedRpcTransport({
+        attempt, spec, runtime, agentId: child.session.agentId, sessionPath: child.session.transcriptPath,
+      });
+    } else {
+      watchdog = new WatchdogClient({
+        attemptId: child.session.attemptId,
+        receiptPath: child.session.containmentReceiptPath,
+        attempt,
+      });
+    }
+    const contextObservation = createContextObservationService(
+      { getSessionStats: () => client!.getSessionStats() },
+      (runId, value) => observationStore.updateContext(child.session.agentId, runId, value),
+    );
+    const observationSink = createTotalRpcObservationAdapter(
+      observationStore,
+      contextObservation,
+      { agentId: child.session.agentId, attemptId: child.session.attemptId },
+      (code) => context.ui.notify(code, "warning"),
+    );
     client = new RpcRunClient({
       launchTransport: async () => {
+        if (preparedRpc !== undefined) return (await preparedRpc).transport;
         const launch = await watchdog!.launch(spec);
         return { stdin: launch.stdin, stdout: launch.stdout, stderr: launch.stderr, exited: launch.exited,
           terminate: async () => {
@@ -434,13 +469,15 @@ export function createProductionController(
       outputStore,
       uiForwarder,
       agentId: child.session.agentId,
+      sessionPath: child.session.transcriptPath,
       runAttemptId: child.session.attemptId,
+      observationSink,
     });
     child.outputStore = outputStore;
     child.client = client;
     return {
       runtime,
-      ready: async () => watchdog!.ready(),
+      ready: async () => preparedRpc === undefined ? watchdog!.ready() : (await preparedRpc).containment,
       persistLaunchRequested: async () => {
         const liveContainment = child.session.containment;
         if (liveContainment === undefined) throw new Error("invalid_state: containment is not ready");

@@ -13,6 +13,7 @@ import {
   type CompletionState,
   type ModelSpec,
   type RunId,
+  type RunAttemptId,
   type ThinkingLevel,
 } from "./domain.ts";
 import {
@@ -31,12 +32,25 @@ import {
   type ObservationListener,
   type ObservationReconciliationSnapshot,
   type ObservationSensitiveValues,
+  type ObservationAttemptSinkFactory,
+  type RpcObservationEvent,
+  type RpcObservationSink,
+  type ContextObservation,
+  type ObservationHealthCode,
   type SpawnObservationInput,
   type SubagentObservationPort,
   type TranscriptSource,
+  activityText,
 } from "./agent-observation.ts";
+import type { ContextObservationService } from "./context-observation.ts";
 import type { RunRecord } from "./run-controller.ts";
-import { MAX_DIRECT_AGENT_OBSERVATIONS } from "./constants.ts";
+import {
+  MAX_DIRECT_AGENT_OBSERVATIONS,
+  MAX_PENDING_ATTEMPT_BYTES,
+  MAX_PENDING_ATTEMPT_EVENTS,
+  MAX_PENDING_OBSERVATION_BYTES,
+  MAX_PENDING_OBSERVATION_EVENTS,
+} from "./constants.ts";
 
 export interface AgentObservationMutationPort {
   registerSpawned(input: SpawnObservationInput): void;
@@ -63,6 +77,7 @@ interface RetainedAgent {
   candidate: string;
   lifecycleState: AgentState;
   latestRunId?: RunId;
+  acceptedAttemptId?: RunAttemptId;
   completionRunId?: RunId;
   completionState?: CompletionState;
   pendingDelivery: boolean;
@@ -73,9 +88,23 @@ const HEALTHY: ObservationHealth = Object.freeze({ kind: "healthy" });
 const IDLE: AgentActivity = Object.freeze({ kind: "idle" });
 const RESTORATION_UNAVAILABLE: AgentActivity = Object.freeze({ kind: "unavailable", reason: "restoration" });
 const UNAVAILABLE_CONTEXT = Object.freeze({ kind: "unavailable" } as const);
+const PROJECTION_UNAVAILABLE: AgentActivity = Object.freeze({ kind: "unavailable", reason: "projection" });
+const TRANSPORT_UNAVAILABLE: AgentActivity = Object.freeze({ kind: "unavailable", reason: "transport" });
+
+interface PendingObservationAttempt {
+  readonly agentId: AgentId;
+  readonly attemptId: RunAttemptId;
+  readonly creation: number;
+  readonly events: RpcObservationEvent[];
+  readonly onEvent: (event: RpcObservationEvent) => void;
+  readonly onBind: (runId: RunId) => void;
+  bytes: number;
+  rejected: boolean;
+  boundRunId?: RunId;
+}
 
 /** Process-local, UI-neutral projection of one controller's directly owned children. */
-export class AgentObservationStore implements SubagentObservationPort, AgentObservationMutationPort {
+export class AgentObservationStore implements SubagentObservationPort, AgentObservationMutationPort, ObservationAttemptSinkFactory {
   private readonly agents = new Map<AgentId, RetainedAgent>();
   private readonly listeners = new Set<ObservationListener>();
   private readonly knownAgentIds = new Set<AgentId>();
@@ -93,6 +122,10 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   private retryReconciliation = false;
   private generation = 0;
   private disposed = false;
+  private readonly attempts = new Map<RunAttemptId, PendingObservationAttempt>();
+  private attemptCreation = 0;
+  private pendingAttemptEvents = 0;
+  private pendingAttemptBytes = 0;
 
   constructor(options: AgentObservationStoreOptions = {}) {
     this.reconciliationSupplier = options.reconciliation;
@@ -184,6 +217,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     const sensitiveChanged = this.addSensitiveValues({ agentIds: new Set(), runIds: new Set([input.runId]), internalPaths: new Set() });
     const equivalent = agent.latestRunId === input.runId && agent.candidate === candidate;
     agent.latestRunId = input.runId;
+    agent.acceptedAttemptId = input.attemptId;
     agent.candidate = candidate;
     const changed = sensitiveChanged ? this.rederiveAll() : [];
     if (!equivalent || !sameTask(agent.observation, candidate, this.labelContext())) {
@@ -192,6 +226,46 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     }
     if (changed.length > 0) this.commit(changed, false);
     this.retryFailedReconciliation();
+  }
+
+  createAttemptSink(agentId: AgentId, attemptId: RunAttemptId): RpcObservationSink {
+    return this.createRoutedAttemptSink(agentId, attemptId, () => {}, () => {});
+  }
+
+  createRoutedAttemptSink(
+    agentId: AgentId,
+    attemptId: RunAttemptId,
+    onEvent: (event: RpcObservationEvent) => void,
+    onBind: (runId: RunId) => void,
+  ): RpcObservationSink {
+    const attempt: PendingObservationAttempt = {
+      agentId, attemptId, creation: ++this.attemptCreation, events: [], onEvent, onBind,
+      bytes: 0, rejected: this.disposed || this.attempts.has(attemptId),
+    };
+    if (!attempt.rejected) this.attempts.set(attemptId, attempt);
+    return {
+      record: (event) => this.recordAttempt(attempt, event),
+      bind: (runId) => this.bindAttempt(attempt, runId),
+      discard: () => this.releaseAttempt(attempt),
+    };
+  }
+
+  updateContext(agentId: AgentId, runId: RunId, context: ContextObservation): void {
+    if (this.disposed) return;
+    const agent = this.agents.get(agentId);
+    if (agent === undefined || agent.latestRunId !== runId) return;
+    const frozen = Object.freeze({ ...context });
+    this.replaceObservation(agent, { context: frozen });
+    this.commit([agent.ordinal], false);
+  }
+
+  failObservationProjection(agentId: AgentId): void {
+    if (this.disposed) return;
+    const agent = this.agents.get(agentId);
+    if (agent === undefined) return;
+    this.replaceObservation(agent, { activity: PROJECTION_UNAVAILABLE, context: UNAVAILABLE_CONTEXT });
+    this.commit([agent.ordinal], false);
+    this.reportProjectionFailure();
   }
 
   updateLifecycle(record: Readonly<RunRecord>): void {
@@ -347,12 +421,95 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     this.notificationScheduled = false;
     this.reconciliationScheduled = false;
     this.agents.clear();
+    this.attempts.clear();
+    this.pendingAttemptEvents = 0;
+    this.pendingAttemptBytes = 0;
     this.snapshotCache = Object.freeze({ kind: "unavailable", finalRevision: this.revision });
   }
 
   /** Explicit total-adapter test seam; not part of the widget-facing port. */
   testAdapter(): { reportProjectionFailure(): void } {
     return { reportProjectionFailure: () => this.reportProjectionFailure() };
+  }
+
+  private recordAttempt(attempt: PendingObservationAttempt, event: RpcObservationEvent): void {
+    if (this.disposed || attempt.rejected) return;
+    if (attempt.boundRunId !== undefined) {
+      this.projectActivity(attempt.agentId, attempt.boundRunId, event);
+      attempt.onEvent(event);
+      return;
+    }
+    const bytes = new TextEncoder().encode(JSON.stringify(event)).byteLength;
+    if (attempt.events.length + 1 > MAX_PENDING_ATTEMPT_EVENTS || attempt.bytes + bytes > MAX_PENDING_ATTEMPT_BYTES) {
+      this.rejectAttempt(attempt);
+      return;
+    }
+    while (this.pendingAttemptEvents + 1 > MAX_PENDING_OBSERVATION_EVENTS || this.pendingAttemptBytes + bytes > MAX_PENDING_OBSERVATION_BYTES) {
+      const oldest = [...this.attempts.values()].filter((value) => !value.rejected && value.boundRunId === undefined)
+        .sort((left, right) => left.creation - right.creation)[0];
+      if (oldest === undefined) { this.rejectAttempt(attempt); return; }
+      this.rejectAttempt(oldest);
+      if (attempt.rejected) return;
+    }
+    attempt.events.push(cloneObservationEvent(event));
+    attempt.bytes += bytes;
+    this.pendingAttemptEvents++;
+    this.pendingAttemptBytes += bytes;
+  }
+
+  private bindAttempt(attempt: PendingObservationAttempt, runId: RunId): void {
+    if (this.disposed || attempt.rejected || attempt.boundRunId !== undefined) return;
+    const agent = this.agents.get(attempt.agentId);
+    if (agent === undefined || agent.latestRunId !== runId || agent.acceptedAttemptId !== attempt.attemptId) {
+      this.rejectAttempt(attempt);
+      return;
+    }
+    attempt.boundRunId = runId;
+    const events = attempt.events.splice(0);
+    this.pendingAttemptEvents -= events.length;
+    this.pendingAttemptBytes -= attempt.bytes;
+    attempt.bytes = 0;
+    attempt.onBind(runId);
+    for (const event of events) {
+      this.projectActivity(attempt.agentId, runId, event);
+      attempt.onEvent(event);
+    }
+  }
+
+  private projectActivity(agentId: AgentId, runId: RunId, event: RpcObservationEvent): void {
+    const agent = this.agents.get(agentId);
+    if (agent === undefined || agent.latestRunId !== runId) return;
+    let activity: AgentActivity | undefined;
+    if (event.kind === "assistant-content" && event.phase === "delta") {
+      const preview = event.text === undefined ? undefined : activityText(event.text);
+      activity = Object.freeze({ kind: event.contentKind === "thinking" ? "thinking" : "responding", ...(preview === undefined ? {} : { preview }) });
+    } else if (event.kind === "tool") {
+      activity = Object.freeze({ kind: "tool", tool: event.tool, phase: event.phase, ...(event.preview === undefined ? {} : { preview: activityText(event.preview) }) });
+    } else if (event.kind === "agent-settled") activity = IDLE;
+    else if (event.kind === "transport-unavailable") activity = TRANSPORT_UNAVAILABLE;
+    if (activity === undefined || agent.observation.activity === activity) return;
+    this.replaceObservation(agent, { activity });
+    this.commit([agent.ordinal], false);
+  }
+
+  private rejectAttempt(attempt: PendingObservationAttempt): void {
+    if (attempt.rejected) return;
+    attempt.rejected = true;
+    this.pendingAttemptEvents -= attempt.events.length;
+    this.pendingAttemptBytes -= attempt.bytes;
+    attempt.events.length = 0;
+    attempt.bytes = 0;
+    this.attempts.delete(attempt.attemptId);
+  }
+
+  private releaseAttempt(attempt: PendingObservationAttempt): void {
+    if (attempt.rejected) return;
+    if (attempt.boundRunId !== undefined) {
+      attempt.rejected = true;
+      this.attempts.delete(attempt.attemptId);
+      return;
+    }
+    this.rejectAttempt(attempt);
   }
 
   private reportProjectionFailure(): void {
@@ -497,6 +654,52 @@ export function createTotalAgentObservationAdapter(store: AgentObservationStore)
     reconcile: invoke(store.reconcile.bind(store)),
     dispose: invoke(store.dispose.bind(store)),
   };
+}
+
+export function createTotalRpcObservationAdapter(
+  store: AgentObservationStore,
+  context: ContextObservationService,
+  identity: { readonly agentId: AgentId; readonly attemptId: RunAttemptId },
+  report: (code: ObservationHealthCode) => void,
+): RpcObservationSink {
+  const fail = (): void => {
+    try { store.failObservationProjection(identity.agentId); } catch { /* total boundary */ }
+    try { report("projection-failed"); } catch { /* diagnostics are optional */ }
+  };
+  let discarded = false;
+  const scoped = store.createRoutedAttemptSink(
+    identity.agentId,
+    identity.attemptId,
+    (event) => { try { context.observe(event); } catch { fail(); } },
+    (runId) => { try { context.reset(runId); } catch { fail(); } },
+  );
+  return {
+    record(event): void { if (discarded) return; try { scoped.record(event); } catch { fail(); } },
+    bind(runId): void { if (discarded) return; try { scoped.bind(runId); } catch { fail(); } },
+    discard(): void {
+      if (discarded) return;
+      discarded = true;
+      try { scoped.discard(); } catch { fail(); }
+      try { context.dispose(); } catch { fail(); }
+    },
+  };
+}
+
+function cloneObservationEvent(event: RpcObservationEvent): RpcObservationEvent {
+  switch (event.kind) {
+    case "assistant-end": return Object.freeze({ ...event,
+      finalBlocks: Object.freeze(event.finalBlocks.map((block) => Object.freeze({ ...block }))),
+      usage: Object.freeze({ ...event.usage, cost: Object.freeze({ ...event.usage.cost }) }),
+    });
+    case "assistant-content": return Object.freeze({ ...event });
+    case "tool": return Object.freeze({ ...event });
+    case "prompt-accepted": return Object.freeze({ ...event });
+    case "compaction": return Object.freeze({ ...event });
+    case "assistant-start":
+    case "turn-end":
+    case "agent-settled":
+    case "transport-unavailable": return Object.freeze({ ...event });
+  }
 }
 
 function freezeObservation(

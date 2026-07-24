@@ -22,6 +22,10 @@ import {
   type TaskLabel,
   type ThinkingLevel,
   type ToolDisplayName,
+  type RpcContentIndex,
+  type RpcStopReason,
+  type RpcToolCallId,
+  type Usage,
   type TranscriptRevision,
   type TranscriptSequence,
   type TranscriptText,
@@ -121,6 +125,33 @@ export type TranscriptItem =
 export interface TranscriptSnapshot { readonly revision: TranscriptRevision; readonly items: readonly TranscriptItem[]; readonly truncatedBefore: boolean; readonly availability: "live" | "stopped" | "unavailable" }
 export type TranscriptListener = (snapshot: TranscriptSnapshot) => void;
 export interface TranscriptSource { snapshot(): TranscriptSnapshot; subscribe(listener: TranscriptListener): () => void }
+
+export interface FinalAssistantBlock {
+  readonly contentIndex: RpcContentIndex;
+  readonly kind: "text" | "thinking";
+  readonly text: TranscriptText;
+}
+
+export type RpcObservationEvent =
+  | { readonly kind: "prompt-accepted"; readonly text: TranscriptText }
+  | { readonly kind: "assistant-start" }
+  | { readonly kind: "assistant-content"; readonly contentIndex: RpcContentIndex; readonly contentKind: "text" | "thinking"; readonly phase: "start" | "delta" | "end"; readonly text?: TranscriptText }
+  | { readonly kind: "assistant-end"; readonly finalBlocks: readonly FinalAssistantBlock[]; readonly usage: Usage; readonly stopReason: RpcStopReason }
+  | { readonly kind: "tool"; readonly toolCallId: RpcToolCallId; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
+  | { readonly kind: "turn-end" }
+  | { readonly kind: "agent-settled" }
+  | { readonly kind: "compaction"; readonly phase: "start" | "end" }
+  | { readonly kind: "transport-unavailable" };
+
+export interface RpcObservationSink {
+  record(event: RpcObservationEvent): void;
+  bind(runId: RunId): void;
+  discard(): void;
+}
+
+export interface ObservationAttemptSinkFactory {
+  createAttemptSink(agentId: AgentId, attemptId: RunAttemptId): RpcObservationSink;
+}
 
 export interface TaskLabelContext {
   readonly knownAgentIds: ReadonlySet<AgentId>;

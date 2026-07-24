@@ -50,6 +50,11 @@ export const MAX_AGGREGATE_AWAIT_BYTES = utf8Bytes(50_000);
 /** Maximum direct-child observations enumerated in one atomic snapshot/change set. */
 export const MAX_DIRECT_AGENT_OBSERVATIONS = 200;
 
+export const MAX_PENDING_ATTEMPT_EVENTS = 64;
+export const MAX_PENDING_ATTEMPT_BYTES = utf8Bytes(64 * 1024);
+export const MAX_PENDING_OBSERVATION_EVENTS = 256;
+export const MAX_PENDING_OBSERVATION_BYTES = utf8Bytes(256 * 1024);
+
 /** Maximum size of one ordinary RPC record before it is discarded through the next LF. */
 export const MAX_RPC_RECORD_BYTES = utf8Bytes(16 * 1024 * 1024);
 

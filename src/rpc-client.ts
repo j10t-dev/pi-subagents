@@ -31,12 +31,15 @@ import {
   type RunAttemptId,
   type RunId,
   type SessionEntryId,
+  type SessionPath,
   type TerminalFailureCause,
   type Usage,
 } from "./domain.ts";
 import { BoundedJsonlDecoder, serializeJsonlRecord } from "./jsonl.ts";
 import {
+  boundedObservationText,
   classifyInboundRecord,
+  extractInboundResponseCorrelation,
   type RecognizedRpcCommand,
   type RpcInboundRecord,
 } from "./rpc-wire.ts";
@@ -46,6 +49,9 @@ import { AgentUsageSchema, AssistantMessageSchema, UsageSchema, type WireAssista
 import type { RpcLaunchSpec } from "./pi-launcher.ts";
 import { launchWatchdogRpcTransport, type WatchdogClient } from "./watchdog-client.ts";
 import { MAX_RPC_RECORD_BYTES } from "./constants.ts";
+import type { RpcObservationSink } from "./agent-observation.ts";
+import type { SessionStatsResult } from "./context-observation.ts";
+import { SessionStatsDataSchema } from "./schemas.ts";
 
 const GetEntriesDataSchema = Type.Object({
   entries: Type.Array(Type.Unknown()),
@@ -60,7 +66,9 @@ export interface RpcRunClientOptions {
   outputStore: OutputStore;
   uiForwarder: UIForwarder;
   agentId: AgentId;
+  sessionPath: SessionPath;
   runAttemptId: RunAttemptId;
+  observationSink?: RpcObservationSink;
 }
 
 export interface RpcLaunchTransport {
@@ -79,6 +87,7 @@ interface PendingRequest {
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
   command: RecognizedRpcCommand;
+  onSuccess?: () => void;
 }
 type PendingMessageEvent =
   | { kind: "message_start"; message: WireAssistantMessage }
@@ -127,6 +136,7 @@ export class RpcRunClient {
   private agentStarted = false;
   private agentStartError: Error | undefined;
   private agentStartWaiters: Array<{ resolve(): void; reject(error: Error): void }> = [];
+  private observationEnded = false;
 
   constructor(options: RpcRunClientOptions) {
     this.options = options;
@@ -200,6 +210,7 @@ export class RpcRunClient {
     try {
       this.options.outputStore.adoptRun(this.options.runAttemptId, runId, () => { this.runId = runId; });
       this.options.outputStore.publishInitial(runId);
+      this.safeObservation(() => this.options.observationSink?.bind(runId));
     } catch (error) {
       if (this.runId === undefined) throw error;
       this.failLocalOutput();
@@ -225,7 +236,17 @@ export class RpcRunClient {
   }
 
   async prompt(message: string): Promise<void> {
-    await this.send("prompt", { message });
+    await this.send("prompt", { message }, () => {
+      this.safeObservation(() => this.options.observationSink?.record({ kind: "prompt-accepted", text: boundedObservationText(message) }));
+    });
+  }
+
+  async getSessionStats(): Promise<SessionStatsResult> {
+    const data = await this.send("get_session_stats", {});
+    if (!Value.Check(SessionStatsDataSchema, data)) return {};
+    const decoded = Value.Decode(SessionStatsDataSchema, data);
+    if (decoded.sessionId !== this.options.agentId || decoded.sessionFile !== this.options.sessionPath) return {};
+    return decoded.contextUsage === undefined ? {} : { contextUsage: { ...decoded.contextUsage } };
   }
 
   async abort(): Promise<void> {
@@ -273,7 +294,7 @@ export class RpcRunClient {
     await child?.terminate?.();
   }
 
-  private async send(command: RecognizedRpcCommand, fields: Record<string, unknown>): Promise<unknown> {
+  private async send(command: RecognizedRpcCommand, fields: Record<string, unknown>, onSuccess?: () => void): Promise<unknown> {
     if (this.shutDown) {
       return Promise.reject(new Error(SHUTDOWN_ERROR_MESSAGE));
     }
@@ -293,6 +314,7 @@ export class RpcRunClient {
         resolve,
         reject,
         command,
+        ...(onSuccess === undefined ? {} : { onSuccess }),
       });
       child.stdin.write(serializeJsonlRecord({ type: command, id, ...fields }), (error) => {
         if (error !== null && error !== undefined) this.terminate(processExit(null, null, AgentErrorCode.ProcessExited), error);
@@ -302,8 +324,10 @@ export class RpcRunClient {
 
   private handleRecord(value: unknown): void {
     if (this.transportFailure !== undefined) return;
+    const correlation = extractInboundResponseCorrelation(value);
     const result = classifyInboundRecord(value);
     if (!result.ok) {
+      if (correlation !== undefined && this.resolveUnavailableStats(correlation.id)) return;
       void this.failTransport(new Error(`protocol_error: ${result.reason}`));
       return;
     }
@@ -324,6 +348,7 @@ export class RpcRunClient {
       }
       const pending = this.pending.get(id);
       if (pending !== undefined) {
+        if (this.resolveUnavailableStats(id)) return;
         this.pending.delete(id);
         pending.reject(new Error(`protocol_error: oversized ${metadata.command ?? pending.command} response`));
       } else {
@@ -337,6 +362,14 @@ export class RpcRunClient {
     void this.failTransport(new Error(`protocol_error: oversized ${metadata.type ?? "unidentified"} rpc record`));
   }
 
+  private resolveUnavailableStats(id: RpcRequestId): boolean {
+    const pending = this.pending.get(id);
+    if (pending?.command !== "get_session_stats") return false;
+    this.pending.delete(id);
+    pending.resolve({});
+    return true;
+  }
+
   private dispatch(record: RpcInboundRecord): void {
     switch (record.kind) {
       case "response": {
@@ -346,31 +379,52 @@ export class RpcRunClient {
         }
         this.pending.delete(record.id);
         if (pending.command !== record.command) {
+          if (pending.command === "get_session_stats") {
+            pending.resolve({});
+            return;
+          }
           pending.reject(new Error(`protocol_error: response command mismatch for ${record.id}`));
           void this.failTransport(new Error(`protocol_error: response command mismatch for ${record.id}`));
           return;
         }
         if (record.success) {
+          try { pending.onSuccess?.(); } catch { /* observation cannot affect RPC correlation */ }
           pending.resolve(record.data);
         } else {
           pending.reject(new Error(record.error));
         }
         return;
       }
-      case "message_start":
+      case "assistant-start":
+        this.safeObservation(() => this.options.observationSink?.record({ kind: "assistant-start" }));
         this.routeOutputMutation(() => this.routeMessageEvent({ kind: "message_start", message: record.message }));
         return;
-      case "text_delta":
-        this.routeOutputMutation(() => this.routeTextDelta(record.contentIndex, record.delta));
+      case "assistant-content":
+        this.safeObservation(() => this.options.observationSink?.record({ kind: "assistant-content", contentIndex: record.contentIndex,
+          contentKind: record.contentKind, phase: record.phase, ...(record.text === undefined ? {} : { text: record.text }) }));
+        if (record.contentKind === "text" && record.phase === "delta" && record.outputText !== undefined) {
+          this.routeOutputMutation(() => this.routeTextDelta(record.contentIndex, record.outputText!));
+        }
         return;
       case "message_update_other":
         return;
-      case "message_end":
+      case "assistant-end":
+        this.safeObservation(() => this.options.observationSink?.record({ kind: "assistant-end", finalBlocks: record.finalBlocks, usage: record.usage, stopReason: record.stopReason }));
         if (!this.accumulateUsage(record.message)) return;
         if (!this.routeOutputMutation(() => this.routeMessageEvent({ kind: "message_end", message: record.message }))) return;
         this.finalAssistant = record.message;
         return;
-      case "agent_settled":
+      case "tool":
+        this.safeObservation(() => this.options.observationSink?.record(record));
+        return;
+      case "turn-end":
+        this.safeObservation(() => this.options.observationSink?.record({ kind: "turn-end" }));
+        return;
+      case "compaction":
+        this.safeObservation(() => this.options.observationSink?.record(record));
+        return;
+      case "agent-settled":
+        this.safeObservation(() => this.options.observationSink?.record({ kind: "agent-settled" }));
         this.settlementRecovery ??= this.recoverSettlementEvidence();
         return;
       case "agent_start":
@@ -388,6 +442,17 @@ export class RpcRunClient {
       case "ignored":
         return;
     }
+  }
+
+  private safeObservation(operation: () => void): void {
+    try { operation(); } catch { /* observation is never transport authority */ }
+  }
+
+  private finishObservation(abnormal: boolean): void {
+    if (this.observationEnded) return;
+    this.observationEnded = true;
+    if (abnormal && this.runId !== undefined) this.safeObservation(() => this.options.observationSink?.record({ kind: "transport-unavailable" }));
+    else this.safeObservation(() => this.options.observationSink?.discard());
   }
 
   private routeMessageEvent(event: PendingMessageEvent): void {
@@ -553,6 +618,7 @@ export class RpcRunClient {
     this.runLifetime.abort();
     if (!this.terminalCleaned) {
       this.terminalCleaned = true;
+      this.finishObservation(!this.shutDown && result.reason === "process_exited" && this.settleResult?.reason !== "agent_settled");
       if (this.settleResult?.reason !== "agent_settled" && this.settlementRecovery === undefined) this.markTransportIncomplete();
       this.options.outputStore.discardPartial(this.runId ?? this.options.runAttemptId);
       this.rejectAgentStart(error);

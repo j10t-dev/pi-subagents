@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { AgentObservationStore } from "../src/agent-observation-store.ts";
+import { AgentObservationStore, createTotalRpcObservationAdapter } from "../src/agent-observation-store.ts";
 import type { ObservationReconciliationSnapshot } from "../src/agent-observation.ts";
+import { createContextObservationService } from "../src/context-observation.ts";
+import { rpcContentIndex, rpcToolCallId } from "../src/domain.ts";
+import { toolDisplayName, transcriptText } from "../src/agent-observation.ts";
 import {
   AgentState,
   CompletionState,
@@ -43,6 +46,126 @@ function completion(id = A, run = R1) {
 }
 
 describe("AgentObservationStore", () => {
+  test("buffers scoped activity before exact bind and replays context boundaries afterwards", async () => {
+    const store = new AgentObservationStore(); register(store);
+    const attempt = runAttemptId("attempt-a"); let statsCalls = 0;
+    const context = createContextObservationService({ getSessionStats: async () => { statsCalls++; return { contextUsage: { tokens: 20, contextWindow: 100, percent: 20 } }; } }, (run, value) => store.updateContext(A, run, value));
+    const sink = createTotalRpcObservationAdapter(store, context, { agentId: A, attemptId: attempt }, () => {});
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText("plan") });
+    sink.record({ kind: "turn-end" });
+    expect(statsCalls).toBe(0);
+    store.acceptRun({ agentId: A, runId: R1, attemptId: attempt, assignment: "Review races" });
+    sink.bind(R1); await flush();
+    expect(statsCalls).toBe(1);
+    expect(store.observation(A)).toMatchObject({ activity: { kind: "thinking", preview: "plan" }, context: { kind: "known", percent: 20 } });
+  });
+
+  test("projects tool, idle, and transport activity in stream order", () => {
+    const store = new AgentObservationStore(); register(store); const attempt = runAttemptId("attempt-a");
+    store.acceptRun({ agentId: A, runId: R1, attemptId: attempt, assignment: "Review races" });
+    const sink = store.createAttemptSink(A, attempt); sink.bind(R1);
+    sink.record({ kind: "tool", toolCallId: rpcToolCallId("call-1"), tool: toolDisplayName("read"), phase: "running" });
+    expect(store.observation(A)?.activity).toMatchObject({ kind: "tool", tool: "read", phase: "running" });
+    sink.record({ kind: "agent-settled" });
+    expect(store.observation(A)?.activity).toEqual({ kind: "idle" });
+    sink.record({ kind: "transport-unavailable" });
+    expect(store.observation(A)?.activity).toEqual({ kind: "unavailable", reason: "transport" });
+  });
+
+  test("rejects one pending attempt above the 64 KiB byte cap", () => {
+    const store = new AgentObservationStore(); register(store); const attempt = runAttemptId("attempt-a");
+    const sink = store.createAttemptSink(A, attempt);
+    for (let index = 0; index < 8; index++) sink.record({ kind: "prompt-accepted", text: transcriptText("x".repeat(8_192)) });
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText("rejected") });
+    store.acceptRun({ agentId: A, runId: R1, attemptId: attempt, assignment: "Review races" });
+    sink.bind(R1);
+    expect(store.observation(A)?.activity).toEqual({ kind: "idle" });
+  });
+
+  test("the 65th small event rejects the attempt independently of the byte cap", () => {
+    const store = new AgentObservationStore(); register(store); const attempt = runAttemptId("attempt-a");
+    const sink = store.createAttemptSink(A, attempt);
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText("would-project") });
+    for (let index = 0; index < 64; index++) sink.record({ kind: "turn-end" });
+    store.acceptRun({ agentId: A, runId: R1, attemptId: attempt, assignment: "Review races" });
+    sink.bind(R1);
+    expect(store.observation(A)?.activity).toEqual({ kind: "idle" });
+  });
+
+  test("the 256-event global cap rejects the oldest pending attempt deterministically", () => {
+    const store = new AgentObservationStore();
+    const attempts = Array.from({ length: 5 }, (_, index) => {
+      const id = agentId(`agent-${index}`); const attempt = runAttemptId(`attempt-${index}`);
+      register(store, id, index + 1);
+      const sink = store.createAttemptSink(id, attempt);
+      if (index < 4) {
+        for (let event = 0; event < 63; event++) sink.record({ kind: "turn-end" });
+        sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText(`plan-${index}`) });
+      } else sink.record({ kind: "turn-end" });
+      return { id, attempt, sink, run: runId(index.toString(16).padStart(8, "0")) };
+    });
+    for (const value of attempts) { store.acceptRun({ agentId: value.id, runId: value.run, attemptId: value.attempt, assignment: "Review races" }); value.sink.bind(value.run); }
+    expect(store.observation(attempts[0]!.id)?.activity).toEqual({ kind: "idle" });
+    expect(store.observation(attempts[1]!.id)?.activity).toMatchObject({ kind: "thinking", preview: "plan-1" });
+  });
+
+  test("the 256 KiB global cap rejects the oldest pending attempt deterministically", () => {
+    const store = new AgentObservationStore();
+    const attempts = Array.from({ length: 6 }, (_, index) => {
+      const id = agentId(`byte-agent-${index}`); const attempt = runAttemptId(`byte-attempt-${index}`);
+      register(store, id, index + 1);
+      const sink = store.createAttemptSink(id, attempt);
+      sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText(`plan-${index}`) });
+      const count = index < 5 ? 7 : 3;
+      for (let event = 0; event < count; event++) sink.record({ kind: "prompt-accepted", text: transcriptText("x".repeat(7_000)) });
+      return { id, attempt, sink, run: runId((index + 16).toString(16).padStart(8, "0")) };
+    });
+    for (const value of attempts) { store.acceptRun({ agentId: value.id, runId: value.run, attemptId: value.attempt, assignment: "Review races" }); value.sink.bind(value.run); }
+    expect(store.observation(attempts[0]!.id)?.activity).toEqual({ kind: "idle" });
+    expect(store.observation(attempts[1]!.id)?.activity).toMatchObject({ kind: "thinking", preview: "plan-1" });
+  });
+
+  test.each(["wrong agent", "wrong run", "wrong attempt"] as const)("%s bind fails closed", (mismatch) => {
+    const store = new AgentObservationStore(); register(store); register(store, agentId("agent-b"), 2);
+    const accepted = runAttemptId("accepted-attempt");
+    store.acceptRun({ agentId: A, runId: R1, attemptId: accepted, assignment: "Review races" });
+    const sink = mismatch === "wrong agent"
+      ? store.createAttemptSink(agentId("agent-b"), accepted)
+      : store.createAttemptSink(A, mismatch === "wrong attempt" ? runAttemptId("other-attempt") : accepted);
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText("must-not-project") });
+    sink.bind(mismatch === "wrong run" ? runId("cafebabe") : R1);
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText("still-rejected") });
+    expect(store.observation(A)?.activity).toEqual({ kind: "idle" });
+    expect(store.observation(agentId("agent-b"))?.activity).toEqual({ kind: "idle" });
+  });
+
+  test("discard releases global event accounting before the next attempt", () => {
+    const store = new AgentObservationStore();
+    const attempts = Array.from({ length: 5 }, (_, index) => {
+      const id = agentId(`release-agent-${index}`); const attempt = runAttemptId(`release-attempt-${index}`);
+      register(store, id, index + 1); const sink = store.createAttemptSink(id, attempt);
+      if (index < 4) {
+        for (let event = 0; event < 63; event++) sink.record({ kind: "turn-end" });
+        sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", text: transcriptText(`plan-${index}`) });
+      }
+      return { id, attempt, sink, run: runId((index + 32).toString(16).padStart(8, "0")) };
+    });
+    attempts[0]!.sink.discard();
+    attempts[4]!.sink.record({ kind: "turn-end" });
+    const second = attempts[1]!;
+    store.acceptRun({ agentId: second.id, runId: second.run, attemptId: second.attempt, assignment: "Review races" });
+    second.sink.bind(second.run);
+    expect(store.observation(second.id)?.activity).toMatchObject({ kind: "thinking", preview: "plan-1" });
+  });
+
+  test("store disposal releases pending accounting and makes all attempt sinks terminal", () => {
+    const store = new AgentObservationStore(); register(store); const sink = store.createAttemptSink(A, runAttemptId("attempt-a"));
+    for (let index = 0; index < 64; index++) sink.record({ kind: "turn-end" });
+    store.dispose();
+    expect(() => { sink.discard(); sink.record({ kind: "turn-end" }); sink.bind(R1); }).not.toThrow();
+    expect(store.directSnapshot()).toMatchObject({ kind: "unavailable" });
+  });
+
   test("registers immutable observations and preserves identity on no-op lifecycle updates", () => {
     const store = new AgentObservationStore();
     register(store);

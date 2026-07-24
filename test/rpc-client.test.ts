@@ -1,11 +1,15 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync, watch, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { PassThrough } from "node:stream";
 
-import { AgentErrorCode, agentId, createRunAttemptId, runId as brandRunId, sessionEntryId, terminalFailureCause } from "../src/domain.ts";
+import { AgentErrorCode, agentId, createRunAttemptId, directAgentOrdinal, modelSpec, runId as brandRunId, sessionEntryId, terminalFailureCause, type RunAttemptId } from "../src/domain.ts";
+import type { RpcObservationSink } from "../src/agent-observation.ts";
+import { sessionPath as containedSessionPath } from "../src/paths.ts";
+import { AgentObservationStore, createTotalRpcObservationAdapter } from "../src/agent-observation-store.ts";
+import { createContextObservationService, type ContextObservationService } from "../src/context-observation.ts";
 import type { AbsolutePath, AgentId, RunId, SessionEntryId, SessionPath, Usage } from "../src/domain.ts";
 import { OutputStore } from "../src/output-store.ts";
 import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-fs.ts";
@@ -121,6 +125,8 @@ function makeClient(
   envOverrides: NodeJS.ProcessEnv = {},
   sharedForwarder?: UIForwarder,
   owner: AgentId = AGENT,
+  observationSink?: RpcObservationSink,
+  attemptId: RunAttemptId = createRunAttemptId(),
 ) {
   const outputStore = new OutputStore({ workDir });
   const forwarder = sharedForwarder ?? new UIForwarder({
@@ -145,9 +151,11 @@ function makeClient(
     outputStore,
     uiForwarder: forwarder,
     agentId: owner,
-    runAttemptId: createRunAttemptId(),
+    sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")),
+    runAttemptId: attemptId,
+    ...(observationSink === undefined ? {} : { observationSink }),
   });
-  return { client, outputStore };
+  return { client, outputStore, attemptId, sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")) };
 }
 
 describe("RpcRunClient", () => {
@@ -167,6 +175,158 @@ describe("RpcRunClient", () => {
 
   afterEach(() => {
     workState.cleanup();
+  });
+
+  test("deterministic child projects activity and context without copying tool payloads", async () => {
+    const attempt = createRunAttemptId();
+    const store = new AgentObservationStore();
+    const session = containedSessionPath(workDir, join(workDir, "session.jsonl"));
+    store.registerSpawned({ agentId: AGENT, ordinal: directAgentOrdinal(1), assignment: "Observe activity", sessionPath: session,
+      cwd: workDir, model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
+    let clientRef!: RpcRunClient;
+    const context = createContextObservationService({ getSessionStats: () => clientRef.getSessionStats() }, (run, value) => store.updateContext(AGENT, run, value));
+    const projected: string[] = [];
+    const adapter = createTotalRpcObservationAdapter(store, context, { agentId: AGENT, attemptId: attempt }, () => {});
+    const sink: RpcObservationSink = { record: (event) => { projected.push(event.kind === "assistant-content" ? event.contentKind : event.kind); adapter.record(event); }, bind: (run) => adapter.bind(run), discard: () => adapter.discard() };
+    const { client } = makeClient("activity-context", workDir, {}, process.execPath, {
+      FAKE_RPC_AGENT_ID: AGENT, FAKE_RPC_SESSION_PATH: String(session),
+    }, undefined, AGENT, sink, attempt);
+    clientRef = client;
+    await client.start(); await client.prompt("Observe activity");
+    const run = brandRunId("deadbeef");
+    store.acceptRun({ agentId: AGENT, runId: run, attemptId: attempt, assignment: "Observe activity" });
+    client.bindRun(run);
+    await client.waitSettled(); await Promise.resolve(); await Promise.resolve();
+    expect(projected).toEqual(expect.arrayContaining(["thinking", "text", "tool", "agent-settled"]));
+    expect(store.observation(AGENT)).toMatchObject({ activity: { kind: "idle" }, context: { kind: "known", percent: 37 } });
+    expect(JSON.stringify(store.observation(AGENT)?.activity)).not.toContain("not-copied");
+    await client.shutdown();
+  });
+
+  test("getSessionStats correlates identity and discards aggregate fields", async () => {
+    const session = join(workDir, "session.jsonl");
+    const { client } = makeClient("normal", workDir, {}, process.execPath, {
+      FAKE_RPC_AGENT_ID: AGENT,
+      FAKE_RPC_SESSION_PATH: session,
+    });
+    await client.start();
+    await expect(client.getSessionStats()).resolves.toEqual({ contextUsage: { tokens: 74, contextWindow: 200, percent: 37 } });
+    await client.shutdown();
+  });
+
+  test.each([
+    ["wrong child", "normal", { FAKE_RPC_AGENT_ID: "other-agent", FAKE_RPC_SESSION_PATH: "session.jsonl" }],
+    ["wrong path", "normal", { FAKE_RPC_AGENT_ID: AGENT, FAKE_RPC_SESSION_PATH: "other.jsonl" }],
+    ["absent identity", "stats-absent-identity", {}],
+    ["malformed usage", "stats-malformed-usage", { FAKE_RPC_AGENT_ID: AGENT, FAKE_RPC_SESSION_PATH: "session.jsonl" }],
+  ] as const)("%s stats evidence is unavailable without failing transport", async (_label, scenario, environment) => {
+    const env = Object.fromEntries(Object.entries(environment).map(([key, value]) => [key,
+      key === "FAKE_RPC_SESSION_PATH" ? join(workDir, value) : value]));
+    const { client } = makeClient(scenario, workDir, {}, process.execPath, env);
+    await client.start();
+    await expect(client.getSessionStats()).resolves.toEqual({});
+    await expect(client.getEntries()).resolves.toBeDefined();
+    await client.shutdown();
+  });
+
+  test.each([
+    ["known mismatched command", "stats-command-mismatch"],
+    ["unknown mismatched command", "stats-unknown-command"],
+    ["successful response missing data", "stats-missing-data"],
+    ["oversized correlated response", "stats-oversized-response"],
+  ] as const)("%s for pending stats is unavailable without failing transport", async (_label, scenario) => {
+    const { client } = makeClient(scenario, workDir);
+    await client.start();
+    await expect(client.getSessionStats()).resolves.toEqual({});
+    await expect(client.getEntries()).resolves.toEqual({ entries: [], leafId: null });
+    await client.shutdown();
+  });
+
+  test.each(["command", "data"] as const)("hostile stats %s access leaves the client usable and settlement live", async (hostileField) => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const finalMessage = { role: "assistant", content: [{ type: "text", text: "settled" }], usage: evidenceUsage, stopReason: "stop" };
+    let getterInvoked = false;
+
+    const originalParse = JSON.parse;
+    const parseSpy = spyOn(JSON, "parse").mockImplementation((text: string) => {
+      const parsed = originalParse(text) as Record<string, string>;
+      if (parsed.hostileField !== hostileField) return parsed;
+      return new Proxy(parsed, {
+        get(target, property, receiver) {
+          if (property === "type") return target.type;
+          if (property === "id") return target.id;
+          if (property === hostileField) {
+            getterInvoked = true;
+            throw new Error(`hostile ${hostileField} access`);
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+    });
+    stdin.on("data", (chunk: Buffer) => {
+      const command = originalParse(chunk.toString("utf8").trim()) as { type: string; id: string };
+      if (command.type === "get_session_stats") {
+        stdout.write(`${JSON.stringify({ type: "response", id: command.id, command: "get_session_stats", success: true,
+          data: { contextUsage: { tokens: 1, contextWindow: 10, percent: 10 } }, hostileField })}\n`);
+      } else if (command.type === "get_entries") {
+        stdout.write(`${JSON.stringify({ type: "response", id: command.id, command: "get_entries", success: true,
+          data: { entries: [{ type: "message", message: finalMessage }], leafId: null } })}\n`);
+      }
+    });
+    const client = new RpcRunClient({
+      launchTransport: async () => ({ stdin, stdout, stderr, exited: new Promise(() => {}), terminate: () => {} }),
+      outputStore: new OutputStore({ workDir }), uiForwarder: fakeUiForwarder(), agentId: AGENT,
+      sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")), runAttemptId: createRunAttemptId(),
+    });
+
+    try {
+      await client.start();
+      await expect(client.getSessionStats()).resolves.toEqual({});
+      expect(getterInvoked).toBe(true);
+      await expect(client.getEntries()).resolves.toEqual({ entries: expect.any(Array), leafId: null });
+      stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`);
+      await expect(client.waitSettled()).resolves.toMatchObject({ reason: "agent_settled" });
+    } finally {
+      parseSpy.mockRestore();
+      await client.shutdown();
+    }
+  });
+
+  test("the total RPC adapter isolates all context and health exceptions from settlement and lifecycle", async () => {
+    const attempt = createRunAttemptId();
+    const run = brandRunId("deadbeef");
+    const store = new AgentObservationStore();
+    const session = containedSessionPath(workDir, join(workDir, "session.jsonl"));
+    store.registerSpawned({ agentId: AGENT, ordinal: directAgentOrdinal(1), assignment: "Observe activity", sessionPath: session,
+      cwd: workDir, model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
+    store.acceptRun({ agentId: AGENT, runId: run, attemptId: attempt, assignment: "Observe activity" });
+    const contextCalls: string[] = [];
+    let reportCalls = 0;
+    const context: ContextObservationService = {
+      reset: () => { contextCalls.push("reset"); throw new Error("context reset fault"); },
+      observe: () => { contextCalls.push("observe"); throw new Error("context publication fault"); },
+      dispose: () => { contextCalls.push("dispose"); throw new Error("context disposal fault"); },
+    };
+    const sink = createTotalRpcObservationAdapter(store, context, { agentId: AGENT, attemptId: attempt }, () => {
+      reportCalls++;
+      throw new Error("health reporter fault");
+    });
+    const { client } = makeClient("normal", workDir, {}, process.execPath, {}, undefined, AGENT, sink, attempt);
+    await client.start();
+    client.bindRun(run);
+    await client.prompt("hello");
+    expect(await client.waitSettled()).toMatchObject({ reason: "agent_settled", stopReason: "stop" });
+    await client.shutdown();
+    expect(contextCalls).toEqual(expect.arrayContaining(["reset", "observe", "dispose"]));
+    expect(reportCalls).toBeGreaterThanOrEqual(3);
+    expect(store.observation(AGENT)).toMatchObject({
+      lifecycleState: "stopped",
+      activity: { kind: "unavailable", reason: "projection" },
+      context: { kind: "unavailable" },
+    });
+    expect(store.directSnapshot()).toMatchObject({ health: { kind: "degraded", codes: ["projection-failed"] } });
   });
 
   test("issues unique, non-empty request IDs across commands", async () => {
@@ -272,7 +432,8 @@ describe("RpcRunClient", () => {
     let launches = 0;
     const client = new RpcRunClient({
       launchTransport: async () => { launches++; return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, exited: new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal }))), terminate: () => { child.kill(); } }; },
-      outputStore, uiForwarder: forwarder, agentId: AGENT, runAttemptId: createRunAttemptId(),
+      outputStore, uiForwarder: forwarder, agentId: AGENT,
+      sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")), runAttemptId: createRunAttemptId(),
     });
     client.start();
     await client.prompt("hello");
@@ -590,6 +751,7 @@ describe("RpcRunClient", () => {
       outputStore,
       uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
+      sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")),
       runAttemptId: createRunAttemptId(),
     });
     await client.start();
@@ -626,6 +788,7 @@ describe("RpcRunClient", () => {
       outputStore,
       uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
+      sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")),
       runAttemptId: createRunAttemptId(),
     });
     await client.start();
@@ -645,6 +808,7 @@ describe("RpcRunClient", () => {
       outputStore,
       uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
+      sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")),
       runAttemptId: createRunAttemptId(),
     });
     await client.start();
@@ -671,6 +835,7 @@ describe("RpcRunClient", () => {
       outputStore,
       uiForwarder: fakeUiForwarder(),
       agentId: AGENT,
+      sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")),
       runAttemptId: createRunAttemptId(),
     });
     await client.start();
@@ -801,7 +966,8 @@ describe("RpcRunClient", () => {
     } });
     const client = new RpcRunClient({
       launchTransport: async () => ({ stdin, stdout, stderr, exited: new Promise(() => {}), terminate: () => { terminated = true; } }),
-      outputStore: new OutputStore({ workDir }), uiForwarder: forwarder, agentId: AGENT, runAttemptId: createRunAttemptId(),
+      outputStore: new OutputStore({ workDir }), uiForwarder: forwarder, agentId: AGENT,
+      sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")), runAttemptId: createRunAttemptId(),
     });
 
     await client.start();
@@ -874,7 +1040,8 @@ describe("RpcRunClient", () => {
     const clientB = new RpcRunClient({
       launchTransport: async () => ({ stdin, stdout, stderr, exited: new Promise(() => {}), terminate: () => {} }),
       outputStore: new OutputStore({ workDir }), uiForwarder: broker,
-      agentId: agentId("agent-b"), runAttemptId: createRunAttemptId(),
+      agentId: agentId("agent-b"), sessionPath: containedSessionPath(workDir, join(workDir, "session-b.jsonl")),
+      runAttemptId: createRunAttemptId(),
     });
 
     try {
@@ -929,7 +1096,8 @@ describe("RpcRunClient", () => {
     const clientB = new RpcRunClient({
       launchTransport: async () => ({ stdin, stdout, stderr, exited: new Promise(() => {}), terminate: () => {} }),
       outputStore: new OutputStore({ workDir }), uiForwarder: broker,
-      agentId: agentId("agent-b"), runAttemptId: createRunAttemptId(),
+      agentId: agentId("agent-b"), sessionPath: containedSessionPath(workDir, join(workDir, "session-b.jsonl")),
+      runAttemptId: createRunAttemptId(),
     });
 
     try {

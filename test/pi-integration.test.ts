@@ -18,12 +18,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { spawn as spawnProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { CONFIG_DIR_NAME, RpcClient, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
 import { createProductionController, launchAfterSurrender } from "../src/pi-composition.ts";
-import { agentId, delegationDepth, runCapacity, type AgentId } from "../src/domain.ts";
+import { AgentState, agentId, contextPercent, delegationDepth, runCapacity, type AgentId } from "../src/domain.ts";
 import { absolutePath } from "../src/paths.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
@@ -34,7 +35,7 @@ import {
   reportIntegrationCli,
   resolveIntegrationCli,
 } from "./support/pi-integration-harness.ts";
-import { testAttemptId, testVerifiedReceiptPath } from "./support/brands.ts";
+import { testAttemptId, testContainmentAttempt, testVerifiedReceiptPath } from "./support/brands.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
 clearManagedChildEnvironment(process.env);
@@ -245,6 +246,83 @@ describe("installed Pi integration prerequisites", () => {
     expect(result).toBe(42);
     expect(order).toEqual(["surrender", "launch"]);
   });
+
+  test("production composition publishes deterministic fake-child activity and context through its observation port", async () => {
+    const state = temporaryStateRoot("pi-production-observation-");
+    const root = String(state.path);
+    const project = join(root, "project");
+    const parentSessions = join(root, "parent-sessions");
+    mkdirSync(project); mkdirSync(parentSessions);
+    const parent = SessionManager.create(project, parentSessions);
+    const fixture = fileURLToPath(new URL("fixtures/fake-rpc-child.mjs", import.meta.url));
+    const descriptors = new Map<string, ReturnType<typeof testContainmentAttempt>["descriptor"]>();
+    const children = new Set<ReturnType<typeof spawnProcess>>();
+    const backend = {
+      root: absolutePath(join(root, "cgroup")), parentScope: absolutePath(join(root, "cgroup", "parent")),
+      preflight: async () => {},
+      prepareAttempt: (attemptId: Parameters<typeof testContainmentAttempt>[0]) => {
+        const attempt = testContainmentAttempt(attemptId, absolutePath(join(root, "cgroup")), parent.getSessionId());
+        descriptors.set(String(attemptId), attempt.descriptor); return attempt;
+      },
+      restoreAttempt: () => { throw new Error("unexpected restoration"); },
+      shutdown: async () => {},
+    };
+    const observed: string[] = [];
+    const observedPayloads: string[] = [];
+    const controller = createProductionController(
+      {
+        sessionManager: parent, cwd: project,
+        model: { provider: "mock-provider", id: "luna" }, modelRegistry: { getAll: () => [] },
+        hasUI: false,
+        ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined,
+          editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+        isIdle: () => true, isProjectTrusted: () => false,
+      } as unknown as Parameters<typeof createProductionController>[0],
+      {
+        appendEntry: (customType: string, data: unknown) => { parent.appendCustomEntry(customType, data); }, sendMessage: () => {},
+        getThinkingLevel: () => "high", getActiveTools: () => [],
+      } as unknown as Parameters<typeof createProductionController>[1],
+      { capacity: runCapacity(1), currentDepth: delegationDepth(0), maxDepth: delegationDepth(1), stateRoot: absolutePath(root) },
+      {
+        createContainmentProvider: () => ({ kind: "available", backend }),
+        buildRpcLaunchSpec: (options) => ({ command: absolutePath(process.execPath), args: [], cwd: options.cwd, env: {}, shell: false }),
+        createPreparedRpcTransport: async ({ attempt, agentId: childId, sessionPath: childSession }) => {
+          const child = spawnProcess(process.execPath, [fixture], { cwd: project, env: { ...process.env,
+            FAKE_RPC_SCENARIO: "activity-context", FAKE_RPC_AGENT_ID: childId, FAKE_RPC_SESSION_PATH: childSession }, stdio: ["pipe", "pipe", "pipe"] });
+          children.add(child);
+          await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+          const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+          return {
+            containment: descriptors.get(String(attempt.attemptId))!,
+            transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, exited, terminate: () => { child.kill(); } },
+            contain: async () => { child.kill(); return testVerifiedReceiptPath(join(root, `${attempt.attemptId}.receipt`)); },
+          };
+        },
+      },
+    );
+    try {
+      await controller.restore();
+      controller.observationPort().subscribe(() => {
+        const snapshot = controller.observationPort().directSnapshot();
+        if (snapshot.kind === "snapshot") for (const entry of snapshot.entries) {
+          observed.push(entry.observation.activity.kind);
+          observedPayloads.push(JSON.stringify(entry.observation.activity));
+        }
+      });
+      const started = await controller.spawn({ task: "Observe activity" });
+      expect(started).toMatchObject({ state: AgentState.Running });
+      const childId = started.agentId!;
+      for (let index = 0; index < 400 && (controller.observationPort().observation(childId)?.context.kind !== "known" ||
+        controller.runs.snapshot(childId)?.state !== AgentState.Stopped); index++) await Bun.sleep(5);
+      expect(observed).toEqual(expect.arrayContaining(["thinking", "responding", "tool", "idle"]));
+      expect(controller.observationPort().observation(childId)?.context).toEqual({ kind: "known", percent: contextPercent(37) });
+      expect(observedPayloads.join("\n")).not.toContain("not-copied");
+    } finally {
+      try { await controller.shutdown(); } catch { /* fake containment has no kernel cgroup authority */ }
+      for (const child of children) child.kill();
+      state.cleanup();
+    }
+  }, 15_000);
 
   test("production restoration folds the selected parent branch once", async () => {
     let branchReads = 0;

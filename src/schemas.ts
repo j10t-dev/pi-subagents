@@ -86,6 +86,35 @@ export const AssistantMessageSchema = Type.Object({
 });
 export type WireAssistantMessage = Static<typeof AssistantMessageSchema>;
 
+export const AssistantContentEventSchema = Type.Union([
+  Type.Object({ type: literalUnion(["text_start", "thinking_start"]), contentIndex: Type.Integer({ minimum: 0 }) }),
+  Type.Object({ type: literalUnion(["text_delta", "thinking_delta"]), contentIndex: Type.Integer({ minimum: 0 }), delta: Type.String() }),
+  Type.Object({ type: literalUnion(["text_end", "thinking_end"]), contentIndex: Type.Integer({ minimum: 0 }), content: Type.String() }),
+]);
+
+export const ToolObservationEventSchema = Type.Union([
+  Type.Object({ type: Type.Literal("tool_execution_start"), toolCallId: Type.String({ minLength: 1, maxLength: 256 }), toolName: Type.String({ minLength: 1, maxLength: 256 }) }),
+  Type.Object({ type: Type.Literal("tool_execution_update"), toolCallId: Type.String({ minLength: 1, maxLength: 256 }), toolName: Type.String({ minLength: 1, maxLength: 256 }) }),
+  Type.Object({ type: Type.Literal("tool_execution_end"), toolCallId: Type.String({ minLength: 1, maxLength: 256 }), toolName: Type.String({ minLength: 1, maxLength: 256 }), isError: Type.Boolean() }),
+]);
+
+export const TurnEndObservationSchema = Type.Object({ type: Type.Literal("turn_end") });
+export const CompactionObservationSchema = Type.Union([
+  Type.Object({ type: Type.Literal("compaction_start"), reason: Type.String() }),
+  Type.Object({ type: Type.Literal("compaction_end"), reason: Type.String() }),
+]);
+
+export const SessionStatsDataSchema = Type.Object({
+  sessionId: Type.String(),
+  sessionFile: Type.String(),
+  contextUsage: Type.Optional(Type.Object({
+    tokens: Type.Union([NonnegativeNumberSchema, Type.Null()]),
+    contextWindow: Type.Number({ exclusiveMinimum: 0 }),
+    percent: Type.Union([NonnegativeNumberSchema, Type.Null()]),
+  })),
+});
+export type WireSessionStatsData = Static<typeof SessionStatsDataSchema>;
+
 const CorrelationIdSchema = Type.String({ minLength: 1 });
 const MillisecondsDtoSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 

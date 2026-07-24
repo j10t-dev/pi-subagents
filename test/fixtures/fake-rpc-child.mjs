@@ -94,6 +94,42 @@ rl.on("line", (line) => {
       if (commandMarker !== undefined) appendFileSync(commandMarker, `${command.type}:${command.type === "set_model" ? `${command.provider}/${command.modelId}` : command.level}\n`);
       respond(command.type, command.id, {});
       return;
+    case "get_session_stats":
+      if (scenario === "stats-command-mismatch") {
+        respond("get_entries", command.id, { data: { entries: [], leafId: null } });
+        return;
+      }
+      if (scenario === "stats-unknown-command") {
+        respond("future_command", command.id, {});
+        return;
+      }
+      if (scenario === "stats-missing-data") {
+        write({ type: "response", command: "get_session_stats", id: command.id, success: true });
+        return;
+      }
+      if (scenario === "stats-oversized-response") {
+        write({ type: "response", command: "get_session_stats", id: command.id, success: true, data: "x".repeat(16 * 1024 * 1024 + 1) });
+        return;
+      }
+      if (scenario === "stats-malformed-usage") {
+        respond("get_session_stats", command.id, { data: {
+          sessionId: process.env.FAKE_RPC_AGENT_ID,
+          sessionFile: process.env.FAKE_RPC_SESSION_PATH,
+          contextUsage: { tokens: "invalid", contextWindow: 200, percent: 37 },
+        } });
+        return;
+      }
+      respond("get_session_stats", command.id, { data: {
+        ...(scenario === "stats-absent-identity" ? {} : {
+          sessionId: process.env.FAKE_RPC_AGENT_ID,
+          sessionFile: process.env.FAKE_RPC_SESSION_PATH,
+        }),
+        userMessages: 1,
+        assistantMessages: 1,
+        cost: 99,
+        contextUsage: { tokens: 74, contextWindow: 200, percent: 37 },
+      } });
+      return;
     case "get_entries":
       if (scenario === "pending-command") return;
       if (scenario === "exit-pending-get-entries") {
@@ -198,6 +234,27 @@ function runScenario() {
     case "incomplete-tool-use": {
       const message = { ...assistantMessage(""), content: [{ type: "toolCall", id: "call-1", name: "x", arguments: {} }], stopReason: "toolUse" };
       write({ type: "message_end", message }); write({ type: "agent_settled" }); break;
+    }
+    case "activity-context": {
+      const final = { ...assistantMessage("answer"), stopReason: "toolUse" };
+      const records = [
+        { type: "message_start", message: assistantMessage("") },
+        { type: "message_update", message: assistantMessage(""), assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "plan", partial: assistantMessage("") } },
+        { type: "message_update", message: assistantMessage(""), assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "answer", partial: assistantMessage("") } },
+        { type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: { path: "/not-copied" } },
+        { type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: { content: [{ type: "text", text: "not-copied" }], details: {} }, isError: false },
+        { type: "message_end", message: final },
+        { type: "turn_end", message: final, toolResults: [] },
+        { type: "agent_settled" },
+      ];
+      const emitNext = () => {
+        const record = records.shift();
+        if (record === undefined) return;
+        write(record);
+        setTimeout(emitNext, 100);
+      };
+      emitNext();
+      break;
     }
     case "normal":
       emitTurn("hello world", { deltas: ["hello", " world"] });

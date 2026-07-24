@@ -9,7 +9,7 @@ import type {
 
 import { assistantMessage as buildAssistantMessage } from "./support/messages.ts";
 import { testUIRequestId } from "./support/brands.ts";
-import { classifyInboundRecord } from "../src/rpc-wire.ts";
+import { classifyInboundRecord, extractInboundResponseCorrelation } from "../src/rpc-wire.ts";
 import type { WireExtensionUINotification } from "../src/schemas.ts";
 
 const validUsage: Usage = {
@@ -71,6 +71,26 @@ describe("classifyInboundRecord", () => {
     if (result.ok && result.record.kind === "response") {
       expect(requireRpcId(result.record.id)).toBe("req-1");
     }
+  });
+
+  test("extracts only bounded response correlation before strict classification", () => {
+    const correlation = extractInboundResponseCorrelation({ type: "response", id: "stats-1", command: "future_command" });
+    expect(correlation?.type).toBe("response");
+    expect(String(correlation?.id)).toBe("stats-1");
+    expect(extractInboundResponseCorrelation({ type: "response", id: "x".repeat(513) })).toBeUndefined();
+  });
+
+  test("contains hostile response correlation getters", () => {
+    const hostileType = { get type(): never { throw new Error("hostile type"); }, id: "stats-1" };
+    const hostileId = { type: "response", get id(): never { throw new Error("hostile id"); } };
+    expect(() => extractInboundResponseCorrelation(hostileType)).not.toThrow();
+    expect(() => extractInboundResponseCorrelation(hostileId)).not.toThrow();
+    expect(() => classifyInboundRecord(hostileType)).not.toThrow();
+    expect(() => classifyInboundRecord(hostileId)).not.toThrow();
+    expect(extractInboundResponseCorrelation(hostileType)).toBeUndefined();
+    expect(extractInboundResponseCorrelation(hostileId)).toBeUndefined();
+    expect(classifyInboundRecord(hostileType)).toMatchObject({ ok: false });
+    expect(classifyInboundRecord(hostileId)).toMatchObject({ ok: false });
   });
 
   test("brands validated extension UI correlation IDs", () => {
@@ -150,13 +170,23 @@ describe("classifyInboundRecord", () => {
   test("classifies message_start", () => {
     const result = classifyInboundRecord({ type: "message_start", message: assistantMessage() });
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.record.kind).toBe("message_start");
+    if (result.ok) expect(result.record.kind).toBe("assistant-start");
   });
 
   test("ignores Pi user message boundaries while retaining strict assistant validation", () => {
     for (const type of ["message_start", "message_end"] as const) {
       const result = classifyInboundRecord({ type, message: { role: "user", content: [{ type: "text", text: "assignment" }], timestamp: Date.now() } });
       expect(result).toEqual({ ok: true, record: { kind: "ignored" } });
+    }
+  });
+
+  test("bounds a large observation delta without truncating authoritative output text", () => {
+    const delta = "x".repeat(9_000);
+    const result = classifyInboundRecord({ type: "message_update", message: assistantMessage(), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
+    expect(result.ok).toBeTrue();
+    if (result.ok && result.record.kind === "assistant-content") {
+      expect(new TextEncoder().encode(result.record.text).byteLength).toBeLessThanOrEqual(8_192);
+      expect(result.record.outputText).toBe(delta);
     }
   });
 
@@ -167,25 +197,25 @@ describe("classifyInboundRecord", () => {
       assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi", partial: assistantMessage() },
     });
     expect(result.ok).toBe(true);
-    if (result.ok && result.record.kind === "text_delta") {
-      expect(result.record.delta).toBe("hi");
-      expect(result.record.contentIndex).toBe(0);
+    if (result.ok && result.record.kind === "assistant-content") {
+      expect(String(result.record.text)).toBe("hi");
+      expect(Number(result.record.contentIndex)).toBe(0);
     } else {
-      throw new Error("expected text_delta");
+      throw new Error("expected assistant-content");
     }
   });
 
-  test("classifies a non-text_delta message_update as message_update_other", () => {
+  test("classifies a thinking_delta as assistant content", () => {
     const result = classifyInboundRecord({
       type: "message_update",
       message: assistantMessage(),
       assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "hmm", partial: assistantMessage() },
     });
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.record.kind).toBe("message_update_other");
+    if (result.ok) expect(result.record.kind).toBe("assistant-content");
   });
 
-  test("treats a text_end carrying its own content as an unremarkable other update", () => {
+  test("validates text_end carrying its final content", () => {
     const poisonedTextEnd = classifyInboundRecord({
       type: "message_update",
       message: assistantMessage("trusted delta"),
@@ -196,7 +226,7 @@ describe("classifyInboundRecord", () => {
         partial: { type: "text", text: "POISONED_PARTIAL" },
       },
     });
-    expect(poisonedTextEnd).toEqual({ ok: true, record: { kind: "message_update_other" } });
+    expect(poisonedTextEnd).toMatchObject({ ok: true, record: { kind: "assistant-content", phase: "end", text: "POISONED_TEXT_END_CONTENT" } });
   });
 
   test("rejects malformed required text_delta events instead of treating them as other updates", () => {
@@ -217,13 +247,13 @@ describe("classifyInboundRecord", () => {
   test("classifies message_end", () => {
     const result = classifyInboundRecord({ type: "message_end", message: assistantMessage() });
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.record.kind).toBe("message_end");
+    if (result.ok) expect(result.record.kind).toBe("assistant-end");
   });
 
   test("classifies agent_settled", () => {
     const result = classifyInboundRecord({ type: "agent_settled" });
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.record.kind).toBe("agent_settled");
+    if (result.ok) expect(result.record.kind).toBe("agent-settled");
   });
 
   test("classifies the initial agent_start barrier", () => {
@@ -320,6 +350,60 @@ describe("classifyInboundRecord", () => {
     expect(classifyInboundRecord(null).ok).toBe(false);
     expect(classifyInboundRecord("string").ok).toBe(false);
     expect(classifyInboundRecord(42).ok).toBe(false);
+  });
+
+  test.each([
+    [{ type: "message_update", message: assistantMessage(), assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "plan" } }, "assistant-content"],
+    [{ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} }, "tool"],
+    [{ type: "tool_execution_update", toolCallId: "call-1", toolName: "read", args: {}, partialResult: {} }, "tool"],
+    [{ type: "tool_execution_end", toolCallId: "call-1", toolName: "read", isError: false, result: {} }, "tool"],
+    [{ type: "turn_end", message: assistantMessage(), toolResults: [] }, "turn-end"],
+    [{ type: "compaction_start", reason: "threshold" }, "compaction"],
+    [{ type: "compaction_end", reason: "threshold", result: null, aborted: false, willRetry: false }, "compaction"],
+  ] as const)("validates observation event %j", (wire, kind) => {
+    const result = classifyInboundRecord(wire);
+    expect(result.ok && result.record.kind).toBe(kind);
+  });
+
+  test.each([
+    { type: "message_update", message: assistantMessage(), assistantMessageEvent: { type: "text_delta", contentIndex: -1, delta: "x" } },
+    { type: "tool_execution_start", toolCallId: "", toolName: "read", args: {} },
+    { type: "tool_execution_end", toolCallId: "call-1", toolName: "read", isError: "false", result: {} },
+    { type: "compaction_start", reason: 3 },
+  ] as const)("rejects malformed required observation record %j", (wire) => {
+    expect(classifyInboundRecord(wire)).toMatchObject({ ok: false });
+  });
+
+  test("keeps future stop reasons wire-valid and projects complete final blocks", () => {
+    const result = classifyInboundRecord({
+      type: "message_end",
+      message: assistantMessage("", {
+        stopReason: "future_reason",
+        content: [{ type: "thinking", thinking: "plan" }, { type: "text", text: "answer" }],
+      }),
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      record: { kind: "assistant-end", stopReason: "future_reason", finalBlocks: [
+        { contentIndex: 0, kind: "thinking", text: "plan" },
+        { contentIndex: 1, kind: "text", text: "answer" },
+      ] },
+    });
+  });
+
+  test("rejects malformed final blocks and required end content", () => {
+    expect(classifyInboundRecord({ type: "message_end", message: assistantMessage("", { content: [{ type: "text", text: 3 }] }) })).toMatchObject({ ok: false });
+    expect(classifyInboundRecord({ type: "message_update", message: assistantMessage(), assistantMessageEvent: { type: "thinking_end", contentIndex: 0 } })).toMatchObject({ ok: false });
+  });
+
+  test("validates correlated get_session_stats success and failure", () => {
+    expect(classifyInboundRecord({ type: "response", id: "stats-1", command: "get_session_stats", success: true,
+      data: { sessionId: "agent-a", sessionFile: "/tmp/a.jsonl", contextUsage: { tokens: null, contextWindow: 200_000, percent: null } },
+    })).toMatchObject({ ok: true, record: { kind: "response", command: "get_session_stats", success: true } });
+    expect(classifyInboundRecord({ type: "response", id: "stats-2", command: "get_session_stats", success: false, error: "unavailable" }))
+      .toMatchObject({ ok: true, record: { kind: "response", command: "get_session_stats", success: false } });
+    expect(classifyInboundRecord({ type: "response", id: "stats-3", command: "get_session_stats", success: true, data: {} }))
+      .toMatchObject({ ok: true, record: { kind: "response", command: "get_session_stats", success: true } });
   });
 });
 

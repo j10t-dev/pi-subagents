@@ -350,6 +350,7 @@ function hostileLaunch(
     outputStore: store,
     uiForwarder: fakeUiForwarder(),
     agentId: session.agentId,
+    sessionPath: session.transcriptPath,
     runAttemptId: session.attemptId,
   });
   clients.add(client);
@@ -387,7 +388,8 @@ function fakeClient(scenario: string): { client: RpcRunClient; store: OutputStor
       terminate: () => { child.kill(); } }),
     outputStore: store,
     uiForwarder: fakeUiForwarder(),
-    agentId: testAgentId(`context-${scenario}`), runAttemptId: testAttemptId(`attempt-${scenario}`),
+    agentId: testAgentId(`context-${scenario}`), sessionPath: sessionPath(dir, join(dir, "session.jsonl")),
+    runAttemptId: testAttemptId(`attempt-${scenario}`),
   });
   return { client, store, close: async () => { await client.shutdown(); state.cleanup(); } };
 }
