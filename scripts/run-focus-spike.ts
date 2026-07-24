@@ -10,7 +10,6 @@ import { assertOrdered, encodeKey, type FocusMechanism } from "./focus-spike-pro
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "..", "test", "fixtures", "focus-transfer-spike-extension.ts");
-const LOCAL_CLI = join(HERE, "..", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 
 function argValue(flag: string, fallback: string): string {
   const index = process.argv.indexOf(flag);
@@ -106,11 +105,9 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, resultFile: 
 }
 
 async function main(): Promise<void> {
-  const version = argValue("--pi", "global");
   const mode = (argValue("--mode", "primary") === "fallback" ? "fallback" : "primary") as FocusMechanism;
-  const piBase = version === "0.80.6" ? ["node", LOCAL_CLI] : ["pi"];
   const piCommand = [
-    ...piBase, "-e", FIXTURE, "--no-extensions",
+    "pi", "-e", FIXTURE, "--no-extensions",
     "--no-session", "--offline", "--no-context-files", "--no-skills",
     "--no-prompt-templates", "--no-themes", "--approve",
   ];
@@ -128,7 +125,7 @@ async function main(): Promise<void> {
       console.log(`${label}_UNSUPPORTED: ${(error as Error).message.slice(0, 300)}`);
       return;
     }
-    process.stderr.write(`ordered focus events (${version}/${mode}): ${JSON.stringify(events)}\n`);
+    process.stderr.write(`ordered focus events (${mode}): ${JSON.stringify(events)}\n`);
     const expected = mode === "primary"
       ? ["fixture_ready mode=primary", "spike_selector_down", "base_editor_delegated", "editor_down_nonempty_native", "editor_down_empty_focuses_board", "board_focused", "board_up_from_first_unfocuses", "editor_down_empty_focuses_board", "board_focused"]
       : ["fixture_ready mode=fallback", "shortcut_triggered", "board_opened", "board_up_from_first_unfocuses", "board_closed"];

@@ -11,6 +11,8 @@ import {
   type AgentCompletion,
   type AgentError,
   type AgentId,
+  type Milliseconds,
+  type RunCapacity,
   type RunId,
   type SessionEntryId,
   type SessionPath,
@@ -25,7 +27,7 @@ import { foldAgentEvents } from "./persistence.ts";
 import type { RpcRunClient } from "./rpc-client.ts";
 import { classifyAssignmentEntries } from "./assignment-identity.ts";
 import { delayWithAbort, waitWithAbort } from "./async-primitives.ts";
-import { ASSIGNMENT_IDENTITY_POLL_MS, ASSIGNMENT_IDENTITY_TIMEOUT_MS } from "./constants.ts";
+import { ASSIGNMENT_IDENTITY_POLL_MS, ASSIGNMENT_IDENTITY_TIMEOUT_MS, DEFAULT_MAX_CONCURRENT_RUNS } from "./constants.ts";
 import type { ContainmentDescriptor } from "./containment.ts";
 import {
   RestorationApplicationError,
@@ -33,8 +35,8 @@ import {
   collectRestorationEvidence,
   planRestoration,
   type RestorationContainmentDecision,
+  type AppliedAgentRecord,
   type RestorationPort,
-  type PlannedAgentRecord,
   type RestoredTerminalObligation,
   type StagedRestorePlan,
 } from "./restoration.ts";
@@ -52,8 +54,7 @@ export interface LaunchSession {
 }
 
 export interface LaunchTransport extends Pick<RpcRunClient, "start" | "getEntries" | "prompt" | "bindRun" | "waitForAgentStart" | "waitSettled"> {
-  readonly containment: ContainmentDescriptor;
-  ready(): Promise<void>;
+  ready(): Promise<ContainmentDescriptor>;
   persistLaunchRequested(): Promise<void>;
   persistRunStarted(runId: RunId): Promise<void>;
   runtime: RunRuntime;
@@ -131,7 +132,7 @@ export interface ParentLifecyclePort {
 }
 
 export interface SubagentControllerOptions {
-  capacity?: number;
+  capacity?: RunCapacity;
   completions?: CompletionService;
   composition?: PiControllerComposition;
   parent?: ParentLifecyclePort;
@@ -139,7 +140,7 @@ export interface SubagentControllerOptions {
   trace?: (event: string) => void;
   onStatusChange?: () => void;
   identityDeadline?: () => AbortSignal;
-  identityDelay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  identityDelay?: (milliseconds: Milliseconds, signal: AbortSignal) => Promise<void>;
 }
 
 interface ControllerOperation {
@@ -170,7 +171,7 @@ export class SubagentController {
   private readonly durableCompletions = new Map<ReturnType<typeof agentRunKey>, AgentCompletion>();
   private readonly pendingNotifications = new Set<ReturnType<typeof agentRunKey>>();
   private readonly identityDeadline: () => AbortSignal;
-  private readonly identityDelay: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  private readonly identityDelay: (milliseconds: Milliseconds, signal: AbortSignal) => Promise<void>;
 
   constructor(options: SubagentControllerOptions = {}) {
     this.completions = options.completions ?? new CompletionService();
@@ -178,10 +179,10 @@ export class SubagentController {
     this.parent = options.parent;
     this.restoration = options.restoration;
     this.trace = options.trace;
-    this.identityDeadline = options.identityDeadline ?? (() => AbortSignal.timeout(ASSIGNMENT_IDENTITY_TIMEOUT_MS));
+    this.identityDeadline = options.identityDeadline ?? (() => AbortSignal.timeout(Number(ASSIGNMENT_IDENTITY_TIMEOUT_MS)));
     this.identityDelay = options.identityDelay ?? delayWithAbort;
     this.runs = new RunController({
-      capacity: options.capacity ?? 4,
+      capacity: options.capacity ?? DEFAULT_MAX_CONCURRENT_RUNS,
       onReserve: () => this.trace?.("reserve"),
       onStopping: (record, reason) => this.composition?.persistStopping?.(record, reason),
       onTerminal: async (record, settlement) => {
@@ -330,6 +331,7 @@ export class SubagentController {
 
   private async restoreOwned(): Promise<void> {
     if (this.restorationApplied) {
+      await this.retryRestoredCompletionObligations();
       this.restored = true;
       return;
     }
@@ -356,7 +358,7 @@ export class SubagentController {
         this.stagedRestorePlan = plan;
       }
 
-      let restored: readonly PlannedAgentRecord[];
+      let restored: readonly AppliedAgentRecord[];
       try {
         restored = await applyRestoration(plan, admission, this.restoration, {
           durableCompletions: this.durableCompletions,
@@ -381,6 +383,24 @@ export class SubagentController {
       this.restored = true;
     } finally {
       admission.release();
+    }
+  }
+
+  private async retryRestoredCompletionObligations(): Promise<void> {
+    if (this.restoration === undefined) return;
+    for (const [agentIdValue, obligation] of this.restoredRecords) {
+      if (obligation.kind !== "restore-completion") continue;
+      const candidate = obligation.record.completion;
+      if (candidate === undefined) {
+        throw new Error("invalid_state: restored completion obligation has no completion");
+      }
+      const completion = await this.restoration.restoreCompletion({
+        ...obligation.record,
+        completion: candidate,
+      });
+      this.durableCompletions.set(agentRunKey(completion.agentId, completion.runId), completion);
+      await this.completions.publish(completion);
+      this.restoredRecords.delete(agentIdValue);
     }
   }
 
@@ -555,8 +575,7 @@ export class SubagentController {
     };
     try {
       runtime = transport.runtime;
-      await transport.ready();
-      session.containment = transport.containment;
+      session.containment = await transport.ready();
       await transport.persistLaunchRequested();
       await transport.start();
       const deadline = this.identityDeadline();
@@ -639,8 +658,14 @@ export class SubagentController {
     let obligation = this.restoredRecords.get(record.agentId);
     if (obligation === undefined || this.restoration === undefined) return undefined;
     if (obligation.kind === "restore-completion") {
-      const completion = obligation.record.completion?.payload;
-      if (completion === undefined) throw new Error("invalid_state: restored completion obligation has no completion");
+      const candidate = obligation.record.completion;
+      if (candidate === undefined) {
+        throw new Error("invalid_state: restored completion obligation has no completion");
+      }
+      const completion = await this.restoration.restoreCompletion({
+        ...obligation.record,
+        completion: candidate,
+      });
       this.durableCompletions.set(agentRunKey(completion.agentId, completion.runId), completion);
       await this.publish(completion);
       this.restoredRecords.delete(record.agentId);
@@ -685,7 +710,7 @@ function stopOutcome(result: StopResult): PublicStopOutcome {
   return { agentId: result.agentId, runId: result.runId, state: "cancelled" };
 }
 
-function completionInventory(record: PlannedAgentRecord) {
+function completionInventory(record: AppliedAgentRecord) {
   return {
     agentId: record.agentId, state: record.state, sessionPath: record.sessionPath,
     ...(record.state !== AgentState.Stopped && record.runId !== undefined ? { currentRunId: record.runId } : {}),

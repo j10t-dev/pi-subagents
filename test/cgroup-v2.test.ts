@@ -6,27 +6,40 @@ import {
   createContainmentProvider,
   resolveCgroupV2Backend,
   type CgroupFileSystem,
+  type CgroupV2Options,
   type ProbeProcess,
 } from "../src/cgroup-v2.ts";
-import { PublicPreflightError, runAttemptId, verifiedContainmentReceiptPath } from "../src/domain.ts";
-import type { ContainmentDescriptor } from "../src/containment.ts";
+import { agentId, processId, PublicPreflightError, runAttemptId, verifiedContainmentReceiptPath } from "../src/domain.ts";
+import type { AbsolutePath, CgroupScopePath } from "../src/domain.ts";
+import type { ContainmentDescriptor, RestorationContainmentDescriptor } from "../src/containment.ts";
 import { absolutePath, containmentReceiptPath } from "../src/paths.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const MOUNT = "/sys/fs/cgroup";
 const CURRENT = `${MOUNT}/user.slice/pi.scope`;
 const ROOT = `${CURRENT}/pi-subagents`;
-const PARENT = `${ROOT}/${cgroupScopeName("parent-session")}`;
-const ATTEMPT = `${PARENT}/${cgroupScopeName("attempt-1")}`;
-const PREFLIGHT = `${PARENT}/preflight-00112233445566778899aabbccddeeff`;
+const PARENT_ID = agentId("parent-session");
+const PARENT = `${ROOT}/${cgroupScopeName(PARENT_ID)}`;
 const ATTEMPT_ID = runAttemptId("attempt-1");
+const ATTEMPT = `${PARENT}/${cgroupScopeName(ATTEMPT_ID)}`;
+const PREFLIGHT = `${PARENT}/preflight-00112233445566778899aabbccddeeff`;
+const RAW_PARENT_ID: string = PARENT_ID;
+// @ts-expect-error raw strings must be validated before cgroup parent identity construction.
+const _scopeFromRawParent = cgroupScopeName(RAW_PARENT_ID);
+const _optionsWithRawParent: CgroupV2Options = {
+  // @ts-expect-error cgroup options retain the validated parent identity internally.
+  parentSessionId: RAW_PARENT_ID,
+  receiptPathFor: () => containmentReceiptPath("/state", "type-flow.json"),
+};
+void _scopeFromRawParent;
+void _optionsWithRawParent;
 
 describe("cgroup-v2", () => {
   test("uses complete SHA-256 scope names", () => {
-    expect(cgroupScopeName("parent-session")).toBe(
+    expect(cgroupScopeName(PARENT_ID)).toBe(
       "a1bdc27ac7582a7459555e91884123666722003a729ba3fbfc29676fc4f724c7",
     );
-    expect(cgroupScopeName("attempt-1")).toBe(
+    expect(cgroupScopeName(ATTEMPT_ID)).toBe(
       "3dafcfaa6218343276ff42263fe100bab5e2b0475a8d98b96abc88c57bfd9992",
     );
   });
@@ -179,41 +192,64 @@ describe("cgroup-v2", () => {
     expect(() => backend(current)).toThrow(/^containment_unavailable:parent cgroup/);
   });
 
-  test("prepare is non-I/O, deterministic and reuses attempt identity", () => {
+  test("prepare retains only a candidate until the created scope receives canonical proof", () => {
     const fs = baseFs();
     const resolved = backend(fs);
     fs.trace.length = 0;
     const first = resolved.prepareAttempt(ATTEMPT_ID);
     const second = resolved.prepareAttempt(ATTEMPT_ID);
+    const candidateScope: AbsolutePath = first.candidate.scopePath;
+    // @ts-expect-error lexical preparation cannot produce a live canonical cgroup proof.
+    const _candidateAsProven: CgroupScopePath = first.candidate.scopePath;
+    void _candidateAsProven;
     expect(first).toBe(second);
-    expect(first.descriptor).toEqual({ backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    expect(JSON.parse(JSON.stringify(first.candidate))).toEqual({ backend: "cgroup-v2", scopePath: ATTEMPT });
     expect(fs.trace).toEqual([]);
     expect(fs.directories.has(ATTEMPT)).toBeFalse();
+    expect(() => first.proveRuntimeDescriptor(first.candidate)).toThrow(/^containment_unavailable:attempt scope/);
+
+    fs.addDirectory(candidateScope);
+    const proven: ContainmentDescriptor = first.proveRuntimeDescriptor(first.candidate);
+    expect(proven.backend).toBe("cgroup-v2");
+    expect(String(proven.scopePath)).toBe(candidateScope);
   });
 
-  test("prepare performs no filesystem I/O after resolution", () => {
+  test.each([
+    ["changed identity", `${PARENT}/different-attempt`],
+    ["root escape", "/outside/attempt"],
+  ])("runtime proof rejects a %s realpath", (_name, canonicalScope) => {
     const fs = baseFs();
     const resolved = backend(fs);
-    fs.reals.set(PARENT, "/outside/parent");
-    expect(resolved.prepareAttempt(ATTEMPT_ID).descriptor.scopePath).toBe(absolutePath(ATTEMPT));
+    const attempt = resolved.prepareAttempt(ATTEMPT_ID);
+    fs.addDirectory(ATTEMPT);
+    fs.reals.set(ATTEMPT, canonicalScope);
+
+    expect(() => attempt.proveRuntimeDescriptor(attempt.candidate))
+      .toThrow(/^containment_unavailable:attempt scope/);
   });
 
-  test("restore validates backend, exact identity and extant canonical containment", () => {
+  test("restore validates backend, exact identity and extant canonical containment without minting live proof", () => {
     const fs = baseFs();
     const resolved = backend(fs);
-    const descriptor = resolved.prepareAttempt(ATTEMPT_ID).descriptor;
-    expect(resolved.restoreAttempt(ATTEMPT_ID, descriptor).descriptor).toEqual(descriptor);
-    expect(() => resolved.restoreAttempt(ATTEMPT_ID, { ...descriptor, scopePath: absolutePath(`${ATTEMPT}-wrong`) }))
+    const stored: RestorationContainmentDescriptor = resolved.prepareAttempt(ATTEMPT_ID).candidate;
+    const restored = resolved.restoreAttempt(ATTEMPT_ID, stored);
+    const candidateScope: AbsolutePath = restored.candidate.scopePath;
+    // @ts-expect-error restoration validation alone does not prove a live cgroup scope.
+    const _restoredAsLive: CgroupScopePath = restored.candidate.scopePath;
+    void _restoredAsLive;
+    expect(candidateScope).toBe(stored.scopePath);
+    expect(restored.candidate).toEqual(stored);
+    expect(() => resolved.restoreAttempt(ATTEMPT_ID, { ...stored, scopePath: absolutePath(`${ATTEMPT}-wrong`) }))
       .toThrow(/^containment_unavailable:attempt descriptor/);
-    const malformedDescriptor: ContainmentDescriptor = { ...descriptor };
+    const malformedDescriptor: RestorationContainmentDescriptor = { ...stored };
     Reflect.set(malformedDescriptor, "backend", "other");
     expect(() => resolved.restoreAttempt(ATTEMPT_ID, malformedDescriptor))
       .toThrow(/^containment_unavailable:attempt descriptor/);
     fs.addDirectory(ATTEMPT);
     fs.reals.set(ATTEMPT, `${PARENT}/different-attempt`);
-    expect(() => resolved.restoreAttempt(ATTEMPT_ID, descriptor)).toThrow(/^containment_unavailable:attempt scope/);
+    expect(() => resolved.restoreAttempt(ATTEMPT_ID, stored)).toThrow(/^containment_unavailable:attempt scope/);
     fs.reals.set(ATTEMPT, "/outside/attempt");
-    expect(() => resolved.restoreAttempt(ATTEMPT_ID, descriptor)).toThrow(/^containment_unavailable:attempt scope/);
+    expect(() => resolved.restoreAttempt(ATTEMPT_ID, stored)).toThrow(/^containment_unavailable:attempt scope/);
   });
 
   test("preflight proves the exact authoritative operation trace", async () => {
@@ -339,8 +375,8 @@ describe("cgroup-v2", () => {
     const resolved = backend(fs, { receiptPathFor: () => receipt, diagnostic: (message) => fs.diagnostics.push(message) });
     const attempt = resolved.restoreAttempt(ATTEMPT_ID, { backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
     const childRoot = `${ATTEMPT}/pi-subagents`;
-    const childParent = `${childRoot}/${cgroupScopeName("child-session")}`;
-    const childAttempt = `${childParent}/${cgroupScopeName("child-attempt")}`;
+    const childParent = `${childRoot}/${cgroupScopeName(agentId("child-session"))}`;
+    const childAttempt = `${childParent}/${cgroupScopeName(runAttemptId("child-attempt"))}`;
     for (const path of [ATTEMPT, childRoot, childParent, childAttempt]) fs.addDirectory(path);
 
     await attempt.cleanup(verifiedContainmentReceiptPath(receipt));
@@ -493,7 +529,7 @@ interface BackendOverrides {
 
 function options(fs: MemoryCgroupFileSystem, overrides: BackendOverrides = {}) {
   return {
-    parentSessionId: "parent-session",
+    parentSessionId: PARENT_ID,
     mountPath: MOUNT,
     selfCgroupText: "0::/user.slice/pi.scope\n",
     fs,
@@ -618,7 +654,7 @@ function controlledProbe(fs: MemoryCgroupFileSystem, rejectExit = false): ProbeP
   let fail!: (error: Error) => void;
   const exited = new Promise<void>((resolve, reject) => { settle = resolve; fail = reject; });
   const probe = {
-    pid: 4242,
+    pid: processId(4242),
     killed: false,
     released: false,
     release(): void {

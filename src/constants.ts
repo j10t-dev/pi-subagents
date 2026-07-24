@@ -1,3 +1,13 @@
+import {
+  delegationDepth,
+  milliseconds,
+  processCount,
+  runCapacity,
+  utf8Bytes,
+} from "./domain.ts";
+
+export { MAX_ERROR_MESSAGE_BYTES } from "./domain.ts";
+
 /** Schema version stamped on newly persisted lifecycle event envelopes. */
 export const CURRENT_EVENT_SCHEMA_VERSION = 2;
 
@@ -14,37 +24,34 @@ export const CHILD_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 export const CHILD_CAPACITY_ENV = "PI_SUBAGENT_MAX_CONCURRENT_RUNS";
 
 /** Default maximum number of concurrently running agents. */
-export const DEFAULT_MAX_CONCURRENT_RUNS = 4;
-export const DEFAULT_MAX_DEPTH = 1;
-export const MAX_MAX_DEPTH = 8;
-export const MAX_TREE_CHILD_PROCESSES = 100;
+export const DEFAULT_MAX_CONCURRENT_RUNS = runCapacity(4);
+export const DEFAULT_MAX_DEPTH = delegationDepth(1);
+export const MAX_MAX_DEPTH = delegationDepth(8);
+export const MAX_TREE_CHILD_PROCESSES = processCount(100);
 
 /** Maximum time for strict live assignment identity resolution. */
-export const ASSIGNMENT_IDENTITY_TIMEOUT_MS = 5_000;
+export const ASSIGNMENT_IDENTITY_TIMEOUT_MS = milliseconds(5_000);
 
 /** Interval between post-barrier assignment identity snapshots. */
-export const ASSIGNMENT_IDENTITY_POLL_MS = 25;
+export const ASSIGNMENT_IDENTITY_POLL_MS = milliseconds(25);
 
 /** Maximum UTF-8 bytes retained in a single persisted completion output. */
-export const MAX_COMPLETION_OUTPUT_BYTES = 50_000;
-
-/** Maximum UTF-8 bytes retained per persisted or model-visible error message. */
-export const MAX_ERROR_MESSAGE_BYTES = 10_000;
+export const MAX_COMPLETION_OUTPUT_BYTES = utf8Bytes(50_000);
 
 /** Maximum time to prove a cgroup has become empty. */
-export const CONTAINMENT_TIMEOUT_MS = 10_000;
+export const CONTAINMENT_TIMEOUT_MS = milliseconds(10_000);
 
 /** Maximum UTF-8 bytes retained in a stderr tail. */
-export const MAX_STDERR_TAIL_BYTES = 50_000;
+export const MAX_STDERR_TAIL_BYTES = utf8Bytes(50_000);
 
 /** Maximum final provider-visible serialised JSON bytes from one `receive_agent` call. */
-export const MAX_AGGREGATE_RECEIVE_BYTES = 50_000;
+export const MAX_AGGREGATE_RECEIVE_BYTES = utf8Bytes(50_000);
 
 /** Maximum size of one ordinary RPC record before it is discarded through the next LF. */
-export const MAX_RPC_RECORD_BYTES = 16 * 1024 * 1024;
+export const MAX_RPC_RECORD_BYTES = utf8Bytes(16 * 1024 * 1024);
 
 /** Maximum span of the authoritative child session JSONL inspected during bounded recovery. */
-export const MAX_SESSION_RECOVERY_BYTES = 32 * 1024 * 1024;
+export const MAX_SESSION_RECOVERY_BYTES = utf8Bytes(32 * 1024 * 1024);
 
 /** Directory name (beneath the extension's state directory) holding per-parent child sessions. */
 export const STATE_DIR_NAME = "pi-subagents";

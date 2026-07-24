@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveCgroupV2Backend } from "../src/cgroup-v2.ts";
-import { createRunAttemptId } from "../src/domain.ts";
+import { agentId, createRunAttemptId, type AgentId } from "../src/domain.ts";
 import { testAbsolutePath } from "./support/brands.ts";
 import { isContainedPath } from "../src/paths.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
@@ -57,7 +57,7 @@ describe("production cgroup-v2 process containment", () => {
     const state: string = stateRoot.path;
     const pidPath = join(state, "pids.json");
     const backend = resolveCgroupV2Backend({
-      parentSessionId: `setsid-process-${process.pid}-${Date.now()}`,
+      parentSessionId: agentId(`setsid-process-${process.pid}-${Date.now()}`),
       ...(process.env.PI_SUBAGENTS_CGROUP_ROOT === undefined ? {} : { configuredRoot: process.env.PI_SUBAGENTS_CGROUP_ROOT }),
       receiptPathFor: (attemptId) => containmentReceiptPath(state, `${attemptId}.json`),
     });
@@ -67,8 +67,8 @@ describe("production cgroup-v2 process containment", () => {
       await backend.preflight();
       const attempt = backend.prepareAttempt(attemptId);
       client = new WatchdogClient({ attemptId, receiptPath: containmentReceiptPath(state, `${attemptId}.json`), attempt });
-      await client.ready();
-      const nestedRoot = join(attempt.descriptor.scopePath, "pi-subagents");
+      const descriptor = await client.ready();
+      const nestedRoot = join(descriptor.scopePath, "pi-subagents");
       const nestedParent = join(nestedRoot, "nested-parent");
       mkdirSync(nestedRoot, { mode: 0o700 });
       mkdirSync(nestedParent, { mode: 0o700 });
@@ -81,11 +81,11 @@ describe("production cgroup-v2 process containment", () => {
       });
       const pids = await waitForPids(pidPath);
       expect(processGroup(pids.detached)).not.toBe(processGroup(pids.launcher));
-      expect(pids.cgroups.detached).toContain(cgroupMembershipPath(attempt.descriptor.scopePath));
+      expect(pids.cgroups.detached).toContain(cgroupMembershipPath(descriptor.scopePath));
 
       await client.close();
       const receiptPath = containmentReceiptPath(state, `${attemptId}.json`);
-      verifyContainmentReceipt(receiptPath, attemptId, undefined, attempt.descriptor);
+      verifyContainmentReceipt(receiptPath, attemptId, undefined, descriptor);
       const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
       expect(processAbsent(pids.detached)).toBeTrue();
       expect(Object.keys(receipt).sort()).toEqual([
@@ -94,12 +94,12 @@ describe("production cgroup-v2 process containment", () => {
       expect(receipt).toMatchObject({
         version: 2,
         backend: "cgroup-v2",
-        scopePath: attempt.descriptor.scopePath,
+        scopePath: descriptor.scopePath,
         populated: false,
       });
       expect(existsSync(nestedParent)).toBeFalse();
       expect(existsSync(nestedRoot)).toBeFalse();
-      expect(existsSync(attempt.descriptor.scopePath)).toBeFalse();
+      expect(existsSync(descriptor.scopePath)).toBeFalse();
     } finally {
       await client?.close().catch(() => undefined);
       await backend.shutdown().catch(() => undefined);
@@ -120,8 +120,8 @@ describe("production cgroup-v2 process containment", () => {
     let second: RaceFixture | undefined;
     try {
       mkdirSync(scratch, { mode: 0o700 });
-      first = spawnRaceFixture(membership, scratch, "a", barrier, `race-parent-a-${process.pid}-${Date.now()}`);
-      second = spawnRaceFixture(membership, scratch, "b", barrier, `race-parent-b-${process.pid}-${Date.now()}`);
+      first = spawnRaceFixture(membership, scratch, "a", barrier, agentId(`race-parent-a-${process.pid}-${Date.now()}`));
+      second = spawnRaceFixture(membership, scratch, "b", barrier, agentId(`race-parent-b-${process.pid}-${Date.now()}`));
       await waitForFiles([arrivalA, arrivalB], 10_000);
       writeFileSync(releasePath, "release", { flag: "wx" });
 
@@ -154,7 +154,7 @@ describe("production cgroup-v2 process containment", () => {
       'spawn(process.execPath, ["-e", `setTimeout(() => process.stdout.write(JSON.stringify({ id: "a", root: "/root", parentScope: "/scope", mkdirOutcome: "created" }) + "\\\\n"), 50)`], { stdio: ["ignore", "inherit", "inherit"] }).unref();',
     ].join("\n"));
     try {
-      const race = spawnRaceFixture("/", "/unused", "a", stateRoot.path, "delayed-stdout", fixture);
+      const race = spawnRaceFixture("/", "/unused", "a", stateRoot.path, agentId("delayed-stdout"), fixture);
       const result = await race.result.catch((error: unknown) => {
         throw new Error(`delayed stdout fixture failed: ${error instanceof Error ? error.message : String(error)}; ${race.diagnostic()}`);
       });
@@ -171,7 +171,7 @@ describe("production cgroup-v2 process containment", () => {
     const state: string = stateRoot.path;
     const readyPath = join(state, "nested-ready.json");
     const bootstrap = resolveCgroupV2Backend({
-      parentSessionId: `nested-bootstrap-${process.pid}-${Date.now()}`,
+      parentSessionId: agentId(`nested-bootstrap-${process.pid}-${Date.now()}`),
       receiptPathFor: (attemptId) => containmentReceiptPath(state, `bootstrap-${attemptId}.json`),
     });
     let ancestor: ReturnType<typeof resolveCgroupV2Backend> | undefined;
@@ -179,7 +179,7 @@ describe("production cgroup-v2 process containment", () => {
     try {
       await bootstrap.preflight();
       ancestor = resolveCgroupV2Backend({
-        parentSessionId: `nested-ancestor-${process.pid}-${Date.now()}`,
+        parentSessionId: agentId(`nested-ancestor-${process.pid}-${Date.now()}`),
         configuredRoot: bootstrap.root,
         receiptPathFor: (attemptId) => containmentReceiptPath(state, `ancestor-${attemptId}.json`),
       });
@@ -191,7 +191,7 @@ describe("production cgroup-v2 process containment", () => {
         receiptPath: containmentReceiptPath(state, `ancestor-${attemptId}.json`),
         attempt: ancestorAttempt,
       });
-      await ancestorClient.ready();
+      const ancestorDescriptor = await ancestorClient.ready();
       await ancestorClient.launch({
         command: testAbsolutePath(process.execPath),
         args: [fileURLToPath(new URL("fixtures/nested-cgroup-controller.ts", import.meta.url)), state, readyPath],
@@ -200,13 +200,13 @@ describe("production cgroup-v2 process containment", () => {
         shell: false,
       });
       const ready = await waitForNestedReady(readyPath);
-      expect(isContainedPath(ancestorAttempt.descriptor.scopePath, ready.nestedRoot)).toBeTrue();
-      expect(isContainedPath(ancestorAttempt.descriptor.scopePath, ready.nestedScope)).toBeTrue();
+      expect(isContainedPath(ancestorDescriptor.scopePath, ready.nestedRoot)).toBeTrue();
+      expect(isContainedPath(ancestorDescriptor.scopePath, ready.nestedScope)).toBeTrue();
       expect(ready.grandchildPids).not.toHaveLength(0);
 
       await ancestorClient.close();
       await waitForProcessesAbsent([ready.controllerPid, ...ready.grandchildPids]);
-      expect(cgroupReportsRunning(ancestorAttempt.descriptor.scopePath)).toBeFalse();
+      expect(cgroupReportsRunning(ancestorDescriptor.scopePath)).toBeFalse();
       expect(cgroupReportsRunning(ready.nestedScope)).toBeFalse();
       expect(cgroupReportsRunning(ready.nestedRoot)).toBeFalse();
     } finally {
@@ -248,10 +248,11 @@ function spawnRaceFixture(
   scratch: string,
   id: "a" | "b",
   barrier: string,
-  parentSessionId: string,
+  parentSessionId: AgentId,
   fixture = fileURLToPath(new URL("fixtures/cgroup-root-race.ts", import.meta.url)),
 ): RaceFixture {
-  const child = spawn(process.execPath, [fixture, membership, scratch, id, barrier, parentSessionId], {
+  const primitiveParentSessionId: string = parentSessionId;
+  const child = spawn(process.execPath, [fixture, membership, scratch, id, barrier, primitiveParentSessionId], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";

@@ -14,27 +14,43 @@
  * abnormal boundary reported the same way (via `waitSettled()`), so the caller can fall back to
  * `OutputStore.recover()` reading the child's own session file.
  */
-import { randomUUID } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { Type } from "typebox";
-import type { Static } from "typebox";
 import { Value } from "typebox/value";
 
-import { AgentErrorCode, terminalFailureCause, type AgentId, type AgentUsage, type RunAttemptId, type RunId, type TerminalFailureCause, type Usage } from "./domain.ts";
+import {
+  AgentErrorCode,
+  createRpcRequestId,
+  rpcRequestId,
+  sessionEntryId,
+  terminalFailureCause,
+  type AgentId,
+  type AgentUsage,
+  type RpcRequestId,
+  type RunAttemptId,
+  type RunId,
+  type SessionEntryId,
+  type TerminalFailureCause,
+  type Usage,
+} from "./domain.ts";
 import { BoundedJsonlDecoder, serializeJsonlRecord } from "./jsonl.ts";
-import { classifyInboundRecord, type RpcInboundRecord } from "./rpc-wire.ts";
+import {
+  classifyInboundRecord,
+  type RecognizedRpcCommand,
+  type RpcInboundRecord,
+} from "./rpc-wire.ts";
 import { OutputStore } from "./output-store.ts";
 import { UIForwarder, type UIForwardOutcome } from "./ui-forwarder.ts";
 import { AgentUsageSchema, AssistantMessageSchema, UsageSchema, type WireAssistantMessage, type WireExtensionUIDialog } from "./schemas.ts";
 import type { RpcLaunchSpec } from "./pi-launcher.ts";
 import { launchWatchdogRpcTransport, type WatchdogClient } from "./watchdog-client.ts";
+import { MAX_RPC_RECORD_BYTES } from "./constants.ts";
 
 const GetEntriesDataSchema = Type.Object({
   entries: Type.Array(Type.Unknown()),
-  leafId: Type.Union([Type.String(), Type.Null()]),
+  leafId: Type.Union([Type.String({ pattern: "^[0-9a-f]{8}$" }), Type.Null()]),
 });
-type GetEntriesData = Static<typeof GetEntriesDataSchema>;
 
 export interface RpcRunClientOptions {
   /** Test seam. Production callers omit this and provide watchdogClient plus launchSpec. */
@@ -62,7 +78,7 @@ export type SettleResult =
 interface PendingRequest {
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
-  command: string;
+  command: RecognizedRpcCommand;
 }
 type PendingMessageEvent =
   | { kind: "message_start"; message: WireAssistantMessage }
@@ -94,7 +110,7 @@ export class RpcRunClient {
   private launchTransport: (() => Promise<RpcLaunchTransport>) | undefined;
   private child: RpcLaunchTransport | undefined;
   private launchPromise: Promise<void> | undefined;
-  private readonly pending = new Map<string, PendingRequest>();
+  private readonly pending = new Map<RpcRequestId, PendingRequest>();
   private readonly decoder: BoundedJsonlDecoder;
   private readonly runLifetime = new AbortController();
   private runId: RunId | undefined;
@@ -128,7 +144,7 @@ export class RpcRunClient {
       onDecodeError: (reason) => {
         void this.failTransport(new Error(`protocol_error: rpc decode error: ${reason}`));
       },
-      maxRecordBytes: 16 * 1024 * 1024,
+      maxRecordBytes: MAX_RPC_RECORD_BYTES,
     });
   }
 
@@ -191,12 +207,21 @@ export class RpcRunClient {
     }
   }
 
-  async getEntries(since?: string | null): Promise<{ entries: readonly unknown[]; leafId: string | null }> {
-    const data = await this.send("get_entries", since === undefined || since === null ? {} : { since });
+  async getEntries(
+    since?: SessionEntryId | null,
+  ): Promise<{ entries: readonly unknown[]; leafId: SessionEntryId | null }> {
+    const data = await this.send(
+      "get_entries",
+      since === undefined || since === null ? {} : { since },
+    );
     if (!Value.Check(GetEntriesDataSchema, data)) {
       throw new Error("protocol_error: malformed get_entries response data");
     }
-    return Value.Decode(GetEntriesDataSchema, data);
+    const decoded = Value.Decode(GetEntriesDataSchema, data);
+    return {
+      entries: decoded.entries,
+      leafId: decoded.leafId === null ? null : sessionEntryId(decoded.leafId),
+    };
   }
 
   async prompt(message: string): Promise<void> {
@@ -248,7 +273,7 @@ export class RpcRunClient {
     await child?.terminate?.();
   }
 
-  private async send(command: string, fields: Record<string, unknown>): Promise<unknown> {
+  private async send(command: RecognizedRpcCommand, fields: Record<string, unknown>): Promise<unknown> {
     if (this.shutDown) {
       return Promise.reject(new Error(SHUTDOWN_ERROR_MESSAGE));
     }
@@ -262,7 +287,7 @@ export class RpcRunClient {
     if (child === undefined) {
       return Promise.reject(new Error("invalid_state: rpc client has not been started"));
     }
-    const id = randomUUID();
+    const id = createRpcRequestId();
     return new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, {
         resolve,
@@ -287,18 +312,22 @@ export class RpcRunClient {
 
   private handleOversizedRecord(metadata: { type?: string; id?: string; command?: string }): void {
     if (metadata.type === "response") {
-      if (metadata.id !== undefined) {
-        const pending = this.pending.get(metadata.id);
-        if (pending !== undefined) {
-          this.pending.delete(metadata.id);
-          pending.reject(new Error(`protocol_error: oversized ${metadata.command ?? pending.command} response`));
-        } else {
-          void this.failTransport(new Error("protocol_error: oversized response with unknown correlation id"));
-        }
-      } else {
+      let id: RpcRequestId;
+      try {
+        if (metadata.id === undefined) throw new Error("missing correlation id");
+        id = rpcRequestId(metadata.id);
+      } catch {
         for (const request of this.pending.values()) request.reject(new Error("protocol_error: oversized uncorrelated response"));
         this.pending.clear();
         void this.failTransport(new Error("protocol_error: oversized response with unidentifiable correlation id"));
+        return;
+      }
+      const pending = this.pending.get(id);
+      if (pending !== undefined) {
+        this.pending.delete(id);
+        pending.reject(new Error(`protocol_error: oversized ${metadata.command ?? pending.command} response`));
+      } else {
+        void this.failTransport(new Error("protocol_error: oversized response with unknown correlation id"));
       }
       return;
     }
@@ -311,11 +340,11 @@ export class RpcRunClient {
   private dispatch(record: RpcInboundRecord): void {
     switch (record.kind) {
       case "response": {
-        const pending = record.id === undefined ? undefined : this.pending.get(record.id);
+        const pending = this.pending.get(record.id);
         if (pending === undefined) {
           return;
         }
-        if (record.id !== undefined) this.pending.delete(record.id);
+        this.pending.delete(record.id);
         if (pending.command !== record.command) {
           pending.reject(new Error(`protocol_error: response command mismatch for ${record.id}`));
           void this.failTransport(new Error(`protocol_error: response command mismatch for ${record.id}`));

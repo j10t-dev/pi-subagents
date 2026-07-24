@@ -3,9 +3,16 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rea
 import { join } from "node:path";
 
 import { MAX_SESSION_RECOVERY_BYTES } from "../src/constants.ts";
-import { createRunAttemptId, runId as brandRunId } from "../src/domain.ts";
+import { createRunAttemptId, runId as brandRunId, utf8Bytes } from "../src/domain.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
-import type { RunAttemptId, RunId, SessionPath } from "../src/domain.ts";
+import type {
+  AbsolutePath,
+  CommittedOutputPath,
+  OutputPath,
+  RunAttemptId,
+  RunId,
+  SessionPath,
+} from "../src/domain.ts";
 import { OutputStore, type TranscriptFileSystem } from "../src/output-store.ts";
 import { sessionPath as toSessionPath } from "../src/paths.ts";
 import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-fs.ts";
@@ -95,7 +102,7 @@ function assistantEntry(id: string, text: string) {
 }
 
 describe("OutputStore", () => {
-  let workDir: string;
+  let workDir: AbsolutePath;
   let workState: ReturnType<typeof temporaryStateRoot>;
   let store: OutputStore;
 
@@ -332,7 +339,7 @@ describe("OutputStore", () => {
     const assistantLine = sessionLine(assistantEntry("aaaaaaaa", "boundary crossing text"));
     writeFileSync(sessionPath, userLine + paddingLine + assistantLine);
 
-    const smallStore = new OutputStore({ workDir, maxRecoveryBytes: Buffer.byteLength(userLine + paddingLine + assistantLine) });
+    const smallStore = new OutputStore({ workDir, maxRecoveryBytes: utf8Bytes(Buffer.byteLength(userLine + paddingLine + assistantLine)) });
     const attempt2 = createRunAttemptId();
     smallStore.beginAttempt(attempt2);
     smallStore.bindRun(attempt2, RUN);
@@ -398,6 +405,60 @@ describe("OutputStore", () => {
     const durable = failedStore.ensureDurable(RUN, sessionPath);
     expect(durable.output).toEqual(expect.objectContaining({ text: "authoritative" }));
     expect(typeof durable.committedPath).toBe("string");
+  });
+
+  test("adoption exposes only an uncommitted destination until publication succeeds", () => {
+    const attemptId = createRunAttemptId();
+    store.beginAttempt(attemptId);
+    const destination: OutputPath = store.adoptRun(attemptId, RUN);
+    // @ts-expect-error adoption does not prove publication.
+    const _committed: CommittedOutputPath = destination;
+    expect(destination).toEndWith(`${RUN}.committed`);
+    void _committed;
+  });
+
+  test("publishInitial returns a committed path only after file and directory sync", () => {
+    const trace: string[] = [];
+    const tracedStore = new OutputStore({ workDir, durableFileSystem: tracingFileSystem(trace) });
+    const attemptId = createRunAttemptId();
+    tracedStore.beginAttempt(attemptId);
+    tracedStore.adoptRun(attemptId, RUN);
+    trace.length = 0;
+
+    const committed: CommittedOutputPath = tracedStore.publishInitial(RUN);
+
+    expect(committed).toEndWith(`${RUN}.committed`);
+    expect(trace.filter((operation) => ["file:sync", "rename", "directory:sync"].includes(operation)).slice(-3))
+      .toEqual(["file:sync", "rename", "directory:sync"]);
+  });
+
+  test("pending recovery compares bytes before synchronising and promoting", () => {
+    const trace: string[] = [];
+    const failedStore = new OutputStore({
+      workDir,
+      durableFileSystem: tracingFileSystem(trace, "directory:sync", 5),
+    });
+    const attemptId = createRunAttemptId();
+    failedStore.beginAttempt(attemptId);
+    const destination = failedStore.bindRun(attemptId, RUN);
+    expect(() => failedStore.onMessageEnd(RUN, assistantMessage("renamed but unsynced")))
+      .toThrow(/directory:sync/);
+    const tampered = "changed but unsynced";
+    expect(Buffer.byteLength(tampered)).toBe(Buffer.byteLength("renamed but unsynced"));
+    writeFileSync(destination, tampered);
+    const sessionPath = toSessionPath(workDir, "pending-mismatch.jsonl");
+    writeFileSync(
+      sessionPath,
+      sessionLine(userEntry(RUN)) + sessionLine(assistantEntry("a", "authoritative transcript bytes")),
+    );
+    trace.length = 0;
+
+    const durable = failedStore.ensureDurable(RUN, sessionPath);
+
+    expect(durable.output.text).toBe("authoritative transcript bytes");
+    expect(readFileSync(destination, "utf8")).toBe("authoritative transcript bytes");
+    expect(trace).toContain("write");
+    expect(trace).toContain("rename");
   });
 
   test("adopts run identity before a failed initial publication and remains durably addressable", () => {
@@ -478,6 +539,30 @@ describe("OutputStore", () => {
     },
   );
 
+  test("every durability check reproves a previously published destination", () => {
+    const trace: string[] = [];
+    const tracedStore = new OutputStore({ workDir, durableFileSystem: tracingFileSystem(trace) });
+    const attemptId = createRunAttemptId();
+    tracedStore.beginAttempt(attemptId);
+    const destination = tracedStore.bindRun(attemptId, RUN);
+    tracedStore.onMessageEnd(RUN, assistantMessage("authoritative"));
+    const sessionPath = toSessionPath(workDir, "fresh-proof.jsonl");
+    writeFileSync(
+      sessionPath,
+      sessionLine(userEntry(RUN)) + sessionLine(assistantEntry("a", "authoritative")),
+    );
+    tracedStore.ensureDurable(RUN, sessionPath);
+    writeFileSync(destination, "same-length-bad");
+    trace.length = 0;
+
+    const durable = tracedStore.ensureDurable(RUN, sessionPath);
+
+    expect(durable.output.text).toBe("authoritative");
+    expect(readFileSync(destination, "utf8")).toBe("authoritative");
+    expect(trace).toContain("write");
+    expect(trace).toContain("rename");
+  });
+
   test("transport-incomplete retry never blesses pending bytes and republishes transcript projection", () => {
     const tracedStore = new OutputStore({ workDir, durableFileSystem: tracingFileSystem([], "directory:sync", 5) });
     const attemptId = createRunAttemptId();
@@ -524,10 +609,9 @@ describe("OutputStore", () => {
     writeFileSync(committed, "stale destination");
     const sessionPath = join(workDir, "recover.jsonl") as SessionPath;
     writeFileSync(sessionPath, sessionLine(userEntry(RUN)) + sessionLine(assistantEntry("a", "authoritative")));
-    expect(store.ensureDurable(RUN, sessionPath)).toEqual({
-      output: expect.objectContaining({ text: "authoritative" }),
-      committedPath: committed,
-    });
+    const durable = store.ensureDurable(RUN, sessionPath);
+    expect(durable.output).toEqual(expect.objectContaining({ text: "authoritative" }));
+    expect(String(durable.committedPath)).toBe(String(committed));
     expect(readFileSync(committed, "utf8")).toBe("authoritative");
   });
 
@@ -557,7 +641,7 @@ describe("OutputStore", () => {
     const missingPath = join(workDir, "missing.jsonl") as SessionPath;
     expect(() => store.ensureDurable(RUN, missingPath)).toThrow(/unreadable/);
 
-    const boundedStore = new OutputStore({ workDir, maxRecoveryBytes: 100 });
+    const boundedStore = new OutputStore({ workDir, maxRecoveryBytes: utf8Bytes(100) });
     boundedStore.restoreRun(OTHER_RUN);
     const sessionPath = join(workDir, "bounded-miss.jsonl") as SessionPath;
     writeFileSync(sessionPath, sessionLine(userEntry(OTHER_RUN)) + sessionLine({ type: "metadata", padding: "x".repeat(200) }));
@@ -695,7 +779,7 @@ describe("OutputStore", () => {
   });
 
   test("stderr and diagnostics retain only their configured tails", () => {
-    const boundedStore = new OutputStore({ workDir, maxTailBytes: 16 });
+    const boundedStore = new OutputStore({ workDir, maxTailBytes: utf8Bytes(16) });
     boundedStore.appendStderr("0123456789");
     boundedStore.appendStderr("0123456789");
     expect(new TextEncoder().encode(boundedStore.getStderrTail()).byteLength).toBeLessThanOrEqual(16);

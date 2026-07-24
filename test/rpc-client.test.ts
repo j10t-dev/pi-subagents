@@ -5,8 +5,8 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { PassThrough } from "node:stream";
 
-import { AgentErrorCode, agentId, createRunAttemptId, runId as brandRunId, terminalFailureCause } from "../src/domain.ts";
-import type { AgentId, RunId, SessionPath, Usage } from "../src/domain.ts";
+import { AgentErrorCode, agentId, createRunAttemptId, runId as brandRunId, sessionEntryId, terminalFailureCause } from "../src/domain.ts";
+import type { AbsolutePath, AgentId, RunId, SessionEntryId, SessionPath, Usage } from "../src/domain.ts";
 import { OutputStore } from "../src/output-store.ts";
 import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-fs.ts";
 import { authoritativeSettlement, RpcRunClient } from "../src/rpc-client.ts";
@@ -23,6 +23,8 @@ const validUsage: Usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, ca
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const evidenceUsage = validUsage;
 const messageEndEvent = (text: string) => `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], usage: evidenceUsage, stopReason: "stop" } })}\n`;
+function requireEntryId(value: SessionEntryId | null): SessionEntryId | null { return value; }
+
 const invalidUsageCases = [
   ["negative token", (usage: Usage) => ({ ...usage, input: -1 })],
   ["NaN token", (usage: Usage) => ({ ...usage, output: Number.NaN })],
@@ -113,7 +115,7 @@ class ReentrantDiscardOutputStore extends OutputStore {
 
 function makeClient(
   scenario: string,
-  workDir: string,
+  workDir: AbsolutePath,
   uiOverrides: Partial<ExtensionUIContextLike> = {},
   command = process.execPath,
   envOverrides: NodeJS.ProcessEnv = {},
@@ -149,7 +151,13 @@ function makeClient(
 }
 
 describe("RpcRunClient", () => {
-  let workDir: string;
+  test("configures the decoder from the shared RPC record byte constant", () => {
+    const source = readFileSync(join(import.meta.dir, "../src/rpc-client.ts"), "utf8");
+    expect(source).toContain("maxRecordBytes: MAX_RPC_RECORD_BYTES");
+    expect(source).not.toContain("maxRecordBytes: 16 * 1024 * 1024");
+  });
+
+  let workDir: AbsolutePath;
   let workState: ReturnType<typeof temporaryStateRoot>;
 
   beforeEach(() => {
@@ -223,7 +231,7 @@ describe("RpcRunClient", () => {
   test("rejects the caller's promise on command failure", async () => {
     const { client } = makeClient("normal", workDir);
     client.start();
-    await expect(client.getEntries("force-fail")).rejects.toThrow(/Entry not found/);
+    await expect(client.getEntries(sessionEntryId("ffffffff"))).rejects.toThrow(/Entry not found/);
     await client.shutdown();
   });
 
@@ -278,6 +286,23 @@ describe("RpcRunClient", () => {
     client.start();
     const result = await client.getEntries();
     expect(result).toEqual({ entries: [], leafId: null });
+    await client.shutdown();
+  });
+
+  test("brands get_entries cursors after response validation", async () => {
+    const { client } = makeClient("entries-with-leaf", workDir);
+    await client.start();
+    const result = await client.getEntries(sessionEntryId("aaaaaaaa"));
+    expect(requireEntryId(result.leafId)).toBe(sessionEntryId("bbbbbbbb"));
+    await client.shutdown();
+  });
+
+  test("rejects malformed get_entries leaf cursors", async () => {
+    const { client } = makeClient("entries-malformed-leaf", workDir);
+    await client.start();
+    await expect(client.getEntries()).rejects.toThrow(
+      "protocol_error: malformed get_entries response data",
+    );
     await client.shutdown();
   });
 

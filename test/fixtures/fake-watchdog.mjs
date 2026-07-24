@@ -27,6 +27,11 @@ const FAKE = true;
 const testConfig = existsSync(`${receiptPath}.fake-config.json`)
   ? JSON.parse(readFileSync(`${receiptPath}.fake-config.json`, "utf8"))
   : {};
+// Test configuration models an independently received primitive wire value; it never alters the
+// production-proven descriptor passed by the parent process.
+const parentScopeWire = Object.hasOwn(testConfig, "parentScopeWire")
+  ? testConfig.parentScopeWire
+  : parentScopePath;
 let state = "await_launch";
 let controlBuffer = Buffer.alloc(0);
 let launcher;
@@ -52,15 +57,15 @@ process.on("SIGTERM", () => void finish(outcomeForPhase()));
 process.on("SIGINT", () => void finish(outcomeForPhase()));
 
 function validatePaths() {
-  for (const [label, path] of [["receipt", receiptPath], ["scope", scopePath], ["parent scope", parentScopePath], ["launcher", launcherPath]]) {
+  for (const [label, path] of [["receipt", receiptPath], ["scope", scopePath], ["parent scope", parentScopeWire], ["launcher", launcherPath]]) {
     if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0")) throw new Error(`invalid ${label} path`);
   }
   if (typeof attemptId !== "string" || attemptId.length === 0) throw new Error("invalid attempt id");
-  if (realpathSync(parentScopePath) !== parentScopePath || !/^[0-9a-f]{64}$/.test(parentScopePath.slice(parentScopePath.lastIndexOf("/") + 1)) || dirname(scopePath) !== parentScopePath) {
+  if (realpathSync(parentScopeWire) !== parentScopeWire || !/^[0-9a-f]{64}$/.test(parentScopeWire.slice(parentScopeWire.lastIndexOf("/") + 1)) || dirname(scopePath) !== parentScopeWire) {
     throw new Error("attempt scope is not rooted in the backend canonical parent scope");
   }
   const expectedScope = createHash("sha256").update(attemptId).digest("hex");
-  if (scopePath !== join(parentScopePath, expectedScope)) throw new Error("invalid attempt scope identity");
+  if (scopePath !== join(parentScopeWire, expectedScope)) throw new Error("invalid attempt scope identity");
   if (realpathSync(launcherPath) !== launcherPath || !statSync(launcherPath).isFile()) throw new Error("invalid canonical launcher path");
 }
 

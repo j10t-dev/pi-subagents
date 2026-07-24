@@ -1,3 +1,5 @@
+import type { Milliseconds, RunCapacity } from "./domain.ts";
+
 /** A FIFO mutex: callers acquire the lock in the order they requested it. */
 export class Mutex {
   private locked = false;
@@ -41,11 +43,7 @@ export interface RunReservation {
 export class RunSemaphore {
   private active = 0;
 
-  constructor(private readonly capacity: number) {
-    if (!Number.isInteger(capacity) || capacity < 1) {
-      throw new Error(`invalid_input: semaphore capacity must be a positive integer: ${capacity}`);
-    }
-  }
+  constructor(private readonly capacity: RunCapacity) {}
 
   acquireInherited(): RunReservation {
     this.active += 1;
@@ -108,9 +106,10 @@ export class AbortError extends Error {
 }
 
 /** Resolves after `milliseconds`, or rejects with `AbortError` if `signal` aborts first. */
-export function delayWithAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
+export function delayWithAbort(milliseconds: Milliseconds, signal?: AbortSignal): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const delay = new Promise<void>((resolve) => { timer = setTimeout(resolve, milliseconds); });
+  const primitiveMilliseconds: number = milliseconds;
+  const delay = new Promise<void>((resolve) => { timer = setTimeout(resolve, primitiveMilliseconds); });
   return waitWithAbort(delay, signal).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
   });

@@ -6,7 +6,9 @@ import { Text } from "@earendil-works/pi-tui";
 
 import { canDelegateFrom, parseExtensionLaunchContext, type DelegationLimits } from "./src/delegation-policy.ts";
 import { SubagentController } from "./src/controller.ts";
+import { delegationDepth, type AbsolutePath, type DelegationDepth } from "./src/domain.ts";
 import { createProductionController } from "./src/pi-composition.ts";
+import { absolutePath } from "./src/paths.ts";
 import { loadSubagentSettings, readGlobalMaxDepth, readSubagentSettingsFiles, type SubagentSettingsResolved } from "./src/settings.ts";
 import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
 
@@ -186,7 +188,8 @@ function compactResult(value: object | undefined): string {
 }
 
 const launchContext = parseExtensionLaunchContext(process.env);
-const defaultRootMaxDepth = readGlobalMaxDepth(readOptional(join(getAgentDir(), "settings.json")));
+const defaultAgentDir = absolutePath(getAgentDir());
+const defaultRootMaxDepth = readGlobalMaxDepth(readOptional(join(defaultAgentDir, "settings.json")));
 const defaultRegistration = registrationForLaunchContext(launchContext, defaultRootMaxDepth);
 
 const extension = createPiSubagentsExtension({
@@ -194,14 +197,15 @@ const extension = createPiSubagentsExtension({
   nodeVersion: process.versions.node,
   registration: defaultRegistration,
   createController: (context, pi, refreshStatus) => {
-    const agentDir = getAgentDir();
-    const currentDepth = launchContext.kind === "descendant" ? launchContext.currentDepth : 0;
+    const agentDir = absolutePath(getAgentDir());
+    const cwd = absolutePath(context.cwd);
+    const currentDepth = launchContext.kind === "descendant" ? launchContext.currentDepth : delegationDepth(0);
     const inheritedLimits: DelegationLimits | undefined =
       launchContext.kind === "descendant" ? launchContext.limits : undefined;
     const projectTrusted = context.isProjectTrusted();
     const texts = readSubagentSettingsFiles({
       agentDir,
-      cwd: context.cwd,
+      cwd,
       projectTrusted,
       configDirName: CONFIG_DIR_NAME,
       readOptional,
@@ -227,16 +231,16 @@ const extension = createPiSubagentsExtension({
 export default extension;
 
 export function buildProductionControllerOptions(
-  agentDir: string,
+  agentDir: AbsolutePath,
   settings: SubagentSettingsResolved,
-  currentDepth: number,
+  currentDepth: DelegationDepth,
   onStatusChange: () => void,
 ): Parameters<typeof createProductionController>[2] {
   return {
     capacity: settings.maxConcurrentRuns,
     currentDepth,
     maxDepth: settings.maxDepth,
-    stateRoot: join(agentDir, "pi-subagents"),
+    stateRoot: absolutePath(join(agentDir, "pi-subagents")),
     ...(currentDepth === 0 && settings.cgroupRoot !== undefined
       ? { cgroupRoot: settings.cgroupRoot }
       : {}),
@@ -246,7 +250,7 @@ export function buildProductionControllerOptions(
 
 export function registrationForLaunchContext(
   context: ReturnType<typeof parseExtensionLaunchContext>,
-  rootMaxDepth: number,
+  rootMaxDepth: DelegationDepth,
 ): ExtensionRegistration {
   if (context.kind === "invalid") return { enabled: false, diagnostic: context.diagnostic };
   if (context.kind === "legacy-child") return { enabled: false };

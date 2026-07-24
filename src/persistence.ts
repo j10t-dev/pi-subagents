@@ -5,17 +5,16 @@ import {
   AgentErrorCode,
   AgentEventType,
   AgentState,
+  type AbsolutePath,
   type AgentCompletion,
   type AgentEventPayloadMap,
   type AgentId,
   type AgentUsage,
-  type AbsolutePath,
   type CancellationReason,
   type ContainmentReceiptPath,
-  type DiagnosticsPath,
   type PersistedAgentEvent,
+  type RestorableAgentCompletion,
   type RunAttemptId,
-  type RunCompletedPayload,
   type RunId,
   type RunLaunchRequestedPayloadV1,
   type RunLaunchRequestedPayloadV2,
@@ -27,36 +26,81 @@ import {
   runAttemptId,
   runId as brandRunId,
   sessionEntryId,
-  modelSpec,
+  modelId,
+  providerId,
+  toolName,
   utf8Bytes,
   truncateUtf8,
 } from "./domain.ts";
-import { absolutePath, restoredStatePath } from "./paths.ts";
+import {
+  absolutePath,
+  restoredContainmentReceiptPath,
+  restoredDiagnosticsPath,
+  restoredOutputPath,
+  restoredSessionPath,
+} from "./paths.ts";
 import { PersistenceSequencer } from "./async-primitives.ts";
 import { Value } from "typebox/value";
 import { AgentUsageSchema, decodePersistedAgentEvent, type AgentCompletionDto } from "./schemas.ts";
-import type { ContainmentDescriptor } from "./containment.ts";
+import type { RestorationContainmentDescriptor } from "./containment.ts";
+
+interface DecodedAgentEventPayloadMapV1 {
+  [AgentEventType.Spawned]: SpawnedPayload;
+  [AgentEventType.RunLaunchRequested]: RunLaunchRequestedPayloadV1;
+  [AgentEventType.RunStarted]: RunStartedPayload;
+  [AgentEventType.RunStopping]: RunStoppingPayload;
+  [AgentEventType.RunCompleted]: RestorableAgentCompletion;
+}
+
+export interface RestorationRunLaunchRequestedPayloadV2
+  extends RunLaunchRequestedPayloadV1 {
+  readonly containment: RestorationContainmentDescriptor;
+}
+
+export interface DecodedAgentEventPayloadMap extends DecodedAgentEventPayloadMapV1 {
+  [AgentEventType.RunLaunchRequested]: RestorationRunLaunchRequestedPayloadV2;
+}
+
+type DecodedPersistedAgentEventV1 = {
+  [K in AgentEventType]: {
+    schemaVersion: 1;
+    eventType: K;
+    payload: DecodedAgentEventPayloadMapV1[K];
+  };
+}[AgentEventType];
+
+type DecodedPersistedAgentEventV2 = {
+  [K in AgentEventType]: {
+    schemaVersion: 2;
+    eventType: K;
+    payload: DecodedAgentEventPayloadMap[K];
+  };
+}[AgentEventType];
+
+export type DecodedPersistedAgentEvent =
+  | DecodedPersistedAgentEventV1
+  | DecodedPersistedAgentEventV2;
 
 /** Matches Pi's `ExtensionAPI.appendEntry<T>(customType, data)` shape so it can be injected in tests. */
 export type AppendEntryFn = (customType: string, data: unknown) => void;
 
 /**
- * Decodes an `unknown` custom-entry payload into a fully-branded `PersistedAgentEvent`.
+ * Decodes an `unknown` custom-entry payload into a fully-branded `DecodedPersistedAgentEvent`.
  * Throws `invalid_input: ...` when the envelope fails schema validation or a field fails
  * to brand; callers convert that failure into a bounded diagnostic rather than propagating it.
  */
-export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAgentEvent {
+export function decodeAgentEvent(value: unknown, stateRoot: AbsolutePath): DecodedPersistedAgentEvent {
   const dto = decodePersistedAgentEvent(value);
   switch (dto.eventType) {
     case AgentEventType.Spawned: {
       const payload: SpawnedPayload = {
         agentId: agentId(dto.payload.agentId),
-        sessionPath: restoredSessionPath(dto.payload.sessionPath, stateRoot),
+        sessionPath: restoredSessionPath(stateRoot, dto.payload.sessionPath),
         cwd: absolutePath(dto.payload.cwd),
-        provider: dto.payload.provider,
-        modelId: modelSpec(dto.payload.modelId),
+        provider: providerId(dto.payload.provider),
+        modelId: modelId(dto.payload.modelId),
         thinkingLevel: dto.payload.thinkingLevel,
-        tools: dto.payload.tools,
+        tools: dto.payload.tools.map(toolName),
       };
       return { schemaVersion: dto.schemaVersion, eventType: dto.eventType, payload };
     }
@@ -66,12 +110,12 @@ export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAg
         previousLeafId:
           dto.payload.previousLeafId === null ? null : sessionEntryId(dto.payload.previousLeafId),
         attemptId: runAttemptId(dto.payload.attemptId),
-        containmentReceiptPath: restoredReceiptPath(dto.payload.containmentReceiptPath, stateRoot),
+        containmentReceiptPath: restoredContainmentReceiptPath(stateRoot, dto.payload.containmentReceiptPath),
       };
       if (dto.schemaVersion === 1) {
         return { schemaVersion: 1, eventType: dto.eventType, payload: common };
       }
-      const payload: RunLaunchRequestedPayloadV2 = {
+      const payload: RestorationRunLaunchRequestedPayloadV2 = {
         ...common,
         containment: {
           backend: dto.payload.containment.backend,
@@ -93,7 +137,7 @@ export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAg
         agentId: agentId(dto.payload.agentId),
         runId: brandRunId(dto.payload.runId),
         reason: dto.payload.reason as CancellationReason,
-        containmentReceiptPath: restoredReceiptPath(dto.payload.containmentReceiptPath, stateRoot),
+        containmentReceiptPath: restoredContainmentReceiptPath(stateRoot, dto.payload.containmentReceiptPath),
       };
       return { schemaVersion: dto.schemaVersion, eventType: dto.eventType, payload };
     }
@@ -104,7 +148,7 @@ export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAg
   }
 }
 
-function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): RunCompletedPayload {
+function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: AbsolutePath): RestorableAgentCompletion {
   const textBytes = new TextEncoder().encode(dto.output.text).byteLength;
   if (textBytes !== dto.output.retainedBytes || dto.output.retainedBytes > MAX_COMPLETION_OUTPUT_BYTES ||
       dto.output.originalBytes < dto.output.retainedBytes ||
@@ -114,7 +158,7 @@ function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): Ru
   if (dto.state === "failed" && new TextEncoder().encode(dto.error.message).byteLength > MAX_ERROR_MESSAGE_BYTES) {
     throw new Error("invalid_input: persisted completion error exceeds byte limit");
   }
-  const base: Omit<AgentCompletion, "state" | "error" | "reason"> = {
+  const base: Omit<RestorableAgentCompletion, "state" | "error" | "reason"> = {
     agentId: agentId(dto.agentId),
     runId: brandRunId(dto.runId),
     output: {
@@ -123,15 +167,15 @@ function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): Ru
       retainedBytes: utf8Bytes(dto.output.retainedBytes),
       truncated: dto.output.truncated,
     },
-    outputPath: restoredOutputPath(dto.outputPath, stateRoot) as AgentCompletion["outputPath"],
-    transcriptPath: restoredSessionPath(dto.transcriptPath, stateRoot),
+    outputPath: restoredOutputPath(stateRoot, dto.outputPath),
+    transcriptPath: restoredSessionPath(stateRoot, dto.transcriptPath),
     ...(dto.usage !== undefined ? { usage: validateUsage(dto.usage) } : {}),
   };
   if (dto.state === "failed" && dto.error !== undefined) {
     const diagnosticsPath =
       dto.error.diagnosticsPath === undefined
         ? undefined
-        : (restoredDiagnosticsPath(dto.error.diagnosticsPath, stateRoot) as DiagnosticsPath);
+        : restoredDiagnosticsPath(stateRoot, dto.error.diagnosticsPath);
     return {
       ...base,
       state: "failed",
@@ -145,22 +189,6 @@ function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): Ru
     return { ...base, state: "cancelled", reason: dto.reason as CancellationReason };
   }
   return { ...base, state: "completed" };
-}
-
-function restoredSessionPath(value: string, root: string): SpawnedPayload["sessionPath"] {
-  return restoredStatePath(root, value) as SpawnedPayload["sessionPath"];
-}
-
-function restoredReceiptPath(value: string, root: string): ContainmentReceiptPath {
-  return restoredStatePath(root, value) as ContainmentReceiptPath;
-}
-
-function restoredOutputPath(value: string, root: string): AbsolutePath {
-  return restoredStatePath(root, value);
-}
-
-function restoredDiagnosticsPath(value: string, root: string): AbsolutePath {
-  return restoredStatePath(root, value);
 }
 
 function validateUsage(value: NonNullable<AgentCompletionDto["usage"]>): AgentUsage {
@@ -267,33 +295,40 @@ export interface AgentMetadata {
   agentId: AgentId;
   sessionPath: SpawnedPayload["sessionPath"];
   cwd: SpawnedPayload["cwd"];
-  provider: string;
+  provider: SpawnedPayload["provider"];
   modelId: SpawnedPayload["modelId"];
   thinkingLevel: SpawnedPayload["thinkingLevel"];
-  tools: readonly string[];
+  tools: SpawnedPayload["tools"];
 }
 
 export type PendingLaunch =
   | { payload: RunLaunchRequestedPayloadV1; eventVersion: 1 }
-  | { payload: RunLaunchRequestedPayloadV2; eventVersion: 2 };
+  | { payload: RestorationRunLaunchRequestedPayloadV2; eventVersion: 2 };
 
 export interface ActiveRun {
   runId: RunId;
   receiptPath: ContainmentReceiptPath;
   attemptId: RunAttemptId;
-  containment?: ContainmentDescriptor;
+  containment?: RestorationContainmentDescriptor;
   eventVersion: 1 | 2;
 }
 
-export interface CompletedRun {
-  payload: AgentCompletion;
-  receiptPath: ContainmentReceiptPath;
-  attemptId: RunAttemptId;
-  containment?: ContainmentDescriptor;
-  eventVersion: 1 | 2;
+export interface CompletedRunMetadata {
+  readonly receiptPath: ContainmentReceiptPath;
+  readonly attemptId: RunAttemptId;
+  readonly containment?: RestorationContainmentDescriptor;
+  readonly eventVersion: 1 | 2;
 }
 
-export type FoldedAgentRecord = AgentMetadata & { completion?: CompletedRun } & (
+export interface CompletedRunCandidate extends CompletedRunMetadata {
+  readonly payload: RestorableAgentCompletion;
+}
+
+export interface DurableCompletedRun extends CompletedRunMetadata {
+  readonly payload: AgentCompletion;
+}
+
+export type FoldedAgentRecord = AgentMetadata & { completion?: CompletedRunCandidate } & (
   | { state: typeof AgentState.Stopped; pendingLaunch?: PendingLaunch }
   | { state: typeof AgentState.Running; run: ActiveRun }
   | { state: typeof AgentState.Stopping; run: ActiveRun; stopReason: CancellationReason }
@@ -310,7 +345,7 @@ export type RestorationAction =
       agentId: AgentId;
       containmentReceiptPath: ContainmentReceiptPath;
       attemptId: RunAttemptId;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     }
   | {
@@ -319,7 +354,7 @@ export type RestorationAction =
       attemptId: RunAttemptId;
       previousLeafId: SessionEntryId | null;
       containmentReceiptPath: ContainmentReceiptPath;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     }
   | {
@@ -328,7 +363,7 @@ export type RestorationAction =
       runId: RunId;
       containmentReceiptPath: ContainmentReceiptPath;
       attemptId: RunAttemptId;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     }
   | {
@@ -338,7 +373,7 @@ export type RestorationAction =
       reason: CancellationReason;
       containmentReceiptPath: ContainmentReceiptPath;
       attemptId: RunAttemptId;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     };
 
@@ -363,7 +398,7 @@ interface FoldableEntry {
  * only what the persisted log proves; the transient runtime `Settling` state has no persisted
  * event and is therefore not observable here.
  */
-export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: string): RestoredRegistry {
+export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: AbsolutePath): RestoredRegistry {
   const agents = new Map<AgentId, FoldedAgentRecord>();
   const actions: RestorationAction[] = [];
   const invalidEvents: string[] = [];
@@ -378,7 +413,7 @@ export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: st
       continue;
     }
 
-    let event: PersistedAgentEvent;
+    let event: DecodedPersistedAgentEvent;
     try {
       event = decodeAgentEvent(entry.data, stateRoot);
     } catch (error) {
@@ -454,7 +489,7 @@ function persistedAgentId(value: unknown): AgentId | undefined {
 
 function applyEvent(
   agents: Map<AgentId, FoldedAgentRecord>,
-  event: PersistedAgentEvent,
+  event: DecodedPersistedAgentEvent,
   pushInvalid: (message: string) => void,
 ): void {
   switch (event.eventType) {

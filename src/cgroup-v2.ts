@@ -15,20 +15,28 @@ import { CONTAINMENT_TIMEOUT_MS } from "./constants.ts";
 import type {
   ContainmentAttempt,
   ContainmentBackend,
+  ContainmentCandidateDescriptor,
   ContainmentDescriptor,
   ContainmentOutcome,
+  RestorationContainmentDescriptor,
 } from "./containment.ts";
 import { publishCommittedSync } from "./durable-fs.ts";
 import {
   AgentErrorCode,
   PublicPreflightError,
+  milliseconds,
+  processId,
   verifiedContainmentReceiptPath,
   type AbsolutePath,
+  type AgentId,
+  type CgroupScopePath,
   type ContainmentReceiptPath,
+  type Milliseconds,
+  type ProcessId,
   type RunAttemptId,
   type VerifiedContainmentReceiptPath,
 } from "./domain.ts";
-import { isContainedPath } from "./paths.ts";
+import { absolutePath, isContainedPath } from "./paths.ts";
 
 const UNAVAILABLE_PREFIX = "containment_unavailable:";
 
@@ -49,28 +57,29 @@ export interface CgroupFileSystem {
 }
 
 export interface ProbeProcess {
-  readonly pid: number;
+  readonly pid: ProcessId;
   release(): void;
   readonly exited: Promise<void>;
   kill(): void;
 }
 
 export interface CgroupV2Options {
-  readonly parentSessionId: string;
+  readonly parentSessionId: AgentId;
   readonly configuredRoot?: string;
   readonly mountPath?: string;
   readonly selfCgroupText?: string;
   readonly fs?: CgroupFileSystem;
   readonly spawnProbe?: () => ProbeProcess;
   readonly receiptPathFor: (attemptId: RunAttemptId) => ContainmentReceiptPath;
-  readonly pollDelay?: (milliseconds: number) => Promise<void>;
+  readonly pollDelay?: (milliseconds: Milliseconds) => Promise<void>;
   readonly now?: () => number;
   readonly randomBytes?: (bytes: number) => Buffer;
   readonly diagnostic?: (message: string) => void;
 }
 
-export function cgroupScopeName(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
+export function cgroupScopeName(value: AgentId | RunAttemptId): string {
+  const primitiveIdentity: string = value;
+  return createHash("sha256").update(primitiveIdentity).digest("hex");
 }
 
 export function resolveCgroupV2Backend(options: CgroupV2Options): ContainmentBackend {
@@ -130,13 +139,14 @@ class CgroupV2Backend implements ContainmentBackend {
     parentScope: string,
     private readonly options: CgroupV2Options,
   ) {
-    this.root = root as AbsolutePath;
-    this.parentScope = parentScope as AbsolutePath;
+    this.root = absolutePath(root);
+    this.parentScope = absolutePath(parentScope);
   }
 
   async preflight(): Promise<void> {
     const name = `preflight-${(this.options.randomBytes ?? nodeRandomBytes)(16).toString("hex")}`;
-    const scope = join(this.parentScope, name);
+    const primitiveParentScope: string = this.parentScope;
+    const scope = join(primitiveParentScope, name);
     let scopeCreated = false;
     let probe: ProbeProcess | undefined;
     try {
@@ -144,7 +154,8 @@ class CgroupV2Backend implements ContainmentBackend {
       scopeCreated = true;
       probe = (this.options.spawnProbe ?? defaultProbe)();
       filesystemOperation("probe process move", () => {
-        this.fs.writeFile(join(scope, "cgroup.procs"), `${probe!.pid}\n`);
+        const primitivePid: number = probe!.pid;
+        this.fs.writeFile(join(scope, "cgroup.procs"), `${primitivePid}\n`);
       });
       const members = filesystemOperation(
         "probe membership",
@@ -175,15 +186,20 @@ class CgroupV2Backend implements ContainmentBackend {
     assertContained(this.root, this.parentScope, "parent scope");
     const existing = this.attempts.get(attemptId);
     if (existing !== undefined) return existing;
-    const scope = join(this.parentScope, cgroupScopeName(attemptId));
+    const primitiveParentScope: string = this.parentScope;
+    const scope = absolutePath(join(primitiveParentScope, cgroupScopeName(attemptId)));
     assertContained(this.parentScope, scope, "attempt path");
-    const attempt = new CgroupAttempt(this, attemptId, scope as AbsolutePath, scope);
+    const attempt = new CgroupAttempt(this, attemptId, scope);
     this.attempts.set(attemptId, attempt);
     return attempt;
   }
 
-  restoreAttempt(attemptId: RunAttemptId, descriptor: ContainmentDescriptor): ContainmentAttempt {
-    const expected = join(this.parentScope, cgroupScopeName(attemptId));
+  restoreAttempt(
+    attemptId: RunAttemptId,
+    descriptor: RestorationContainmentDescriptor,
+  ): ContainmentAttempt {
+    const primitiveParentScope: string = this.parentScope;
+    const expected = absolutePath(join(primitiveParentScope, cgroupScopeName(attemptId)));
     if (descriptor.backend !== "cgroup-v2" || descriptor.scopePath !== expected) {
       unavailable("attempt descriptor");
     }
@@ -193,12 +209,7 @@ class CgroupV2Backend implements ContainmentBackend {
     if (operationScope !== expected) unavailable("attempt scope");
     const existing = this.attempts.get(attemptId);
     if (existing !== undefined) return existing;
-    const attempt = new CgroupAttempt(
-      this,
-      attemptId,
-      descriptor.scopePath,
-      operationScope,
-    );
+    const attempt = new CgroupAttempt(this, attemptId, absolutePath(operationScope));
     this.attempts.set(attemptId, attempt);
     return attempt;
   }
@@ -208,6 +219,27 @@ class CgroupV2Backend implements ContainmentBackend {
       await attempt.retryCleanup();
     }
     this.removeIntermediate(this.parentScope, "parent scope");
+  }
+
+  proveRuntimeDescriptor(
+    attempt: CgroupAttempt,
+    evidence: RestorationContainmentDescriptor,
+  ): ContainmentDescriptor {
+    if (evidence.backend !== attempt.candidate.backend ||
+        evidence.scopePath !== attempt.candidate.scopePath) {
+      unavailable("attempt descriptor");
+    }
+    const canonicalScope = canonicalContainedDirectory(
+      this.fs,
+      this.parentScope,
+      attempt.operationScope,
+      "attempt scope",
+    );
+    if (canonicalScope !== attempt.operationScope) unavailable("attempt scope");
+    return {
+      backend: "cgroup-v2",
+      scopePath: provenCgroupScopePath(attempt.candidate.scopePath),
+    };
   }
 
   ensureNoProcessScope(scope: string): void {
@@ -235,13 +267,15 @@ class CgroupV2Backend implements ContainmentBackend {
 
   publishReceipt(attempt: CgroupAttempt, outcome: ContainmentOutcome): VerifiedContainmentReceiptPath {
     const receiptPath = this.options.receiptPathFor(attempt.attemptId);
+    const primitiveAttemptId: string = attempt.attemptId;
+    const primitiveScopePath: string = attempt.candidate.scopePath;
     publishCommittedSync({
       destination: receiptPath,
       data: JSON.stringify({
         version: 2,
-        attemptId: attempt.attemptId,
+        attemptId: primitiveAttemptId,
         backend: "cgroup-v2",
-        scopePath: attempt.descriptor.scopePath,
+        scopePath: primitiveScopePath,
         outcome,
         timestamp: new Date((this.options.now ?? Date.now)()).toISOString(),
         populated: false,
@@ -313,7 +347,7 @@ class CgroupV2Backend implements ContainmentBackend {
     while (true) {
       if (this.readPopulated(scope) === 0) return;
       if (now() >= deadline) unavailable("empty timeout");
-      await (this.options.pollDelay ?? delay)(20);
+      await (this.options.pollDelay ?? delay)(milliseconds(20));
     }
   }
 
@@ -345,18 +379,21 @@ class CgroupV2Backend implements ContainmentBackend {
 }
 
 class CgroupAttempt implements ContainmentAttempt {
-  readonly descriptor: ContainmentDescriptor;
+  readonly candidate: ContainmentCandidateDescriptor;
   readonly parentScope: AbsolutePath;
   acceptedReceipt: VerifiedContainmentReceiptPath | undefined;
 
   constructor(
     private readonly backend: CgroupV2Backend,
     readonly attemptId: RunAttemptId,
-    scope: AbsolutePath,
-    readonly operationScope: string,
+    readonly operationScope: AbsolutePath,
   ) {
     this.parentScope = backend.parentScope;
-    this.descriptor = { backend: "cgroup-v2", scopePath: scope };
+    this.candidate = { backend: "cgroup-v2", scopePath: operationScope };
+  }
+
+  proveRuntimeDescriptor(evidence: RestorationContainmentDescriptor): ContainmentDescriptor {
+    return this.backend.proveRuntimeDescriptor(this, evidence);
   }
 
   async terminate(outcome: ContainmentOutcome): Promise<VerifiedContainmentReceiptPath> {
@@ -450,12 +487,12 @@ function parsePopulated(text: string): 0 | 1 {
   return populated[0]![2] === "0" ? 0 : 1;
 }
 
-function parsePids(text: string): number[] {
+function parsePids(text: string): ProcessId[] {
   const lines = text.split("\n").filter((line) => line.length > 0);
   if (lines.some((line) => !/^[1-9]\d*$/.test(line))) unavailable("cgroup membership");
-  const pids = lines.map(Number);
-  if (pids.some((pid) => !Number.isSafeInteger(pid))) unavailable("cgroup membership");
-  return pids;
+  const primitivePids = lines.map(Number);
+  if (primitivePids.some((pid) => !Number.isSafeInteger(pid))) unavailable("cgroup membership");
+  return primitivePids.map(processId);
 }
 
 function canonicalDirectory(fs: CgroupFileSystem, path: string, label: string): string {
@@ -511,6 +548,14 @@ function assertContained(parent: string, child: string, label: string): void {
   if (!isContainedPath(parent, child)) unavailable(label);
 }
 
+/**
+ * Promotes an absolute path only after this module has proved the exact attempt identity and
+ * containment beneath the backend's canonical parent scope.
+ */
+function provenCgroupScopePath(path: AbsolutePath): CgroupScopePath {
+  return path as CgroupScopePath;
+}
+
 function filesystemOperation<T>(category: string, operation: () => T): T {
   try {
     return operation();
@@ -551,8 +596,9 @@ function bestEffort(operation: () => void): void {
   try { operation(); } catch { /* retain the primary capability failure */ }
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((done) => setTimeout(done, milliseconds));
+function delay(milliseconds: Milliseconds): Promise<void> {
+  const primitiveMilliseconds: number = milliseconds;
+  return new Promise((done) => setTimeout(done, primitiveMilliseconds));
 }
 
 function defaultProbe(): ProbeProcess {
@@ -563,7 +609,7 @@ function defaultProbe(): ProbeProcess {
   });
   if (child.pid === undefined) throw new Error("probe pid unavailable");
   return {
-    pid: child.pid,
+    pid: processId(child.pid),
     release: () => child.stdin.end(),
     exited: new Promise((done, reject) => {
       child.once("exit", () => done());

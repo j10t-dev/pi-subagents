@@ -1,8 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
 
 import { AgentState, truncateUtf8, utf8Bytes } from "../src/domain.ts";
-import { CompletionService, type AgentSummary } from "../src/completion-service.ts";
-import type { AgentCompletion } from "../src/domain.ts";
+import { CompletionService, completionKey, type AgentSummary } from "../src/completion-service.ts";
+import type { AgentCompletion, AgentRunKey } from "../src/domain.ts";
 import {
   testAgentId,
   testCommittedOutputPath,
@@ -16,6 +16,11 @@ const OTHER_AGENT = testAgentId("agent-2");
 const RUN = testRunId("deadbeef");
 const SESSION_PATH = testSessionPath();
 const OUTPUT_PATH = testCommittedOutputPath();
+const COMPLETION_KEY: AgentRunKey = completionKey({ agentId: AGENT, runId: RUN });
+// @ts-expect-error arbitrary strings cannot enter the completion publication key set.
+const _arbitraryCompletionKey: AgentRunKey = "agent-1\0deadbeef";
+void COMPLETION_KEY;
+void _arbitraryCompletionKey;
 
 function completion(
   overrides: Partial<Extract<AgentCompletion, { state: "completed" }>> = {},
@@ -201,7 +206,7 @@ describe("CompletionService.receive", () => {
 
   test("drains an immutable clone without aggregate truncation", async () => {
     const service = new CompletionService();
-    const original = completion({ output: truncateUtf8("x".repeat(60_000), 50_000) });
+    const original = completion({ output: truncateUtf8("x".repeat(60_000), utf8Bytes(50_000)) });
     await service.publish(original);
     const [drained] = (await service.receive()).completions;
     expect(drained).not.toBe(original);
@@ -216,7 +221,7 @@ describe("CompletionService.receive", () => {
       cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } } };
     const original = {
       ...completion({
-        output: truncateUtf8("failed", 50_000),
+        output: truncateUtf8("failed", utf8Bytes(50_000)),
         usage,
       }),
       state: "failed" as const,

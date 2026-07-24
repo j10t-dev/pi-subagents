@@ -6,6 +6,7 @@ import {
   CompletionState,
   type AgentCompletion,
   type AgentId,
+  type AgentRunKey,
   type CommittedOutputPath,
   type Milliseconds,
   type RunId,
@@ -66,7 +67,7 @@ interface CompletionWaiter {
 export class CompletionService {
   private readonly mutex = new Mutex();
   private readonly queue: AgentCompletion[] = [];
-  private readonly publishedRuns = new Set<string>();
+  private readonly publishedRuns = new Set<AgentRunKey>();
   private readonly agents = new Map<AgentId, AgentSummary>();
   private waitingReceiver: CompletionWaiter | undefined;
   private notifiedSinceEmpty = false;
@@ -193,11 +194,12 @@ export class CompletionService {
       } else {
         options.signal?.addEventListener("abort", onAbort, { once: true });
         if (options.timeoutMs !== undefined) {
+          const primitiveTimeout: number = options.timeoutMs;
           timer = setTimeout(() => {
             void this.finishWaitLocked(waiter, () => {
               finish({ completions: [], agents: this.snapshotAgentsLocked(), timedOut: true });
             });
-          }, options.timeoutMs);
+          }, primitiveTimeout);
         }
       }
     }
@@ -299,6 +301,8 @@ export class CompletionService {
   }
 }
 
-function completionKey(completion: Pick<AgentCompletion, "agentId" | "runId">): string {
+export function completionKey(
+  completion: Pick<AgentCompletion, "agentId" | "runId">,
+): AgentRunKey {
   return agentRunKey(completion.agentId, completion.runId);
 }

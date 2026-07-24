@@ -26,10 +26,12 @@ import {
   testAgentId,
   testAttemptId,
   testEntryId,
-  testModelSpec,
+  testModelId,
+  testProviderId,
   testReceiptPath,
   testRunId,
   testSessionPath,
+  testToolName,
   testVerifiedReceiptPath,
 } from "./support/brands.ts";
 import { completedCompletion } from "./support/messages.ts";
@@ -63,10 +65,10 @@ function baseStopped(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { sta
     agentId,
     sessionPath: testSessionPath(`/tmp/pi-subagents-test/sessions/${agentId}.jsonl`),
     cwd: testAbsolutePath("/tmp/pi-subagents-test"),
-    provider: "mock-provider",
-    modelId: testModelSpec(),
+    provider: testProviderId(),
+    modelId: testModelId(),
     thinkingLevel: "high",
-    tools: ["read"],
+    tools: [testToolName()],
     state: AgentState.Stopped,
   };
 }
@@ -283,7 +285,7 @@ test("a crashed relaunch of a completed agent with a failed lookup restores pre-
     startedEntry(),
     completedEntry(),
     launchEntry({ attemptId: testAttemptId("attempt-2") }),
-  ], "/tmp/pi-subagents-test");
+  ], testAbsolutePath("/tmp/pi-subagents-test"));
   const evidence: AgentRestorationEvidence = {
     containment: { kind: "contained", runtime: runtime() },
     launchIdentity: { kind: "lookup-failed" },
@@ -431,11 +433,12 @@ test("row 12: ReconcileStopping + historical-unresolved adds historical responsi
   });
 });
 
-test("row 13: ValidateCompletedReceipt + contained preserves stopped completion", () => {
+test("row 13: ValidateCompletedReceipt + contained preserves stopped completion and its proof obligation", () => {
   const record = completionRecord();
   const runRuntime = runtime();
   expectPlan(plan(record, completedAction(), contained(runRuntime)), {
-    restored: [record], runtimeRecords: [runRecord(record)], durableWrites: [], obligations: new Map(), warnings: [],
+    restored: [record], runtimeRecords: [runRecord(record)], durableWrites: [],
+    obligations: new Map([[AGENT, { kind: "restore-completion", record }]]), warnings: [],
   });
 });
 
@@ -492,7 +495,12 @@ test("emits restored and runtime records in registry map order rather than actio
   ]);
   expectPlan(planRestoration(input, evidence), {
     restored: [second, first], runtimeRecords: [runRecord(second), runRecord(first)],
-    durableWrites: [], obligations: new Map(), warnings: [],
+    durableWrites: [],
+    obligations: new Map([
+      [second.agentId, { kind: "restore-completion", record: second }],
+      [first.agentId, { kind: "restore-completion", record: first }],
+    ]),
+    warnings: [],
   });
 });
 

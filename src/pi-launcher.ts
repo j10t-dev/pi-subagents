@@ -1,27 +1,34 @@
 import { realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
 
-import type { AbsolutePath, ModelSpec, ThinkingLevel } from "./domain.ts";
+import type {
+  AbsolutePath,
+  DelegationDepth,
+  ModelSpec,
+  RunCapacity,
+  ThinkingLevel,
+  ToolName,
+} from "./domain.ts";
 import {
   CHILD_CAPACITY_ENV,
   CHILD_DEPTH_ENV,
   CHILD_MARKER_ENV,
   CHILD_MAX_DEPTH_ENV,
 } from "./constants.ts";
-import { isContainedPath } from "./paths.ts";
+import { absolutePath, isContainedPath } from "./paths.ts";
 
 export interface PiInvocation { readonly command: AbsolutePath; readonly argsPrefix: readonly string[] }
 export interface InvocationProcess { readonly execPath: string; readonly argv: readonly string[] }
 
 export function resolvePiInvocation(source: InvocationProcess = process): PiInvocation {
-  const command = resolve(source.execPath) as AbsolutePath;
+  const command = absolutePath(source.execPath);
   const executable = basename(command).toLowerCase();
   if (executable === "node" || executable === "node.exe" || executable === "bun" || executable === "bun.exe") {
     const script = source.argv[1];
     if (script === undefined || script.length === 0 || !script.startsWith("/")) {
       throw new Error("launch_error: cannot resolve the same Pi entry point from the Node process");
     }
-    return Object.freeze({ command, argsPrefix: Object.freeze([resolve(script)]) });
+    return Object.freeze({ command, argsPrefix: Object.freeze([absolutePath(script)]) });
   }
   if ((executable === "pi" || executable === "pi.exe") && source.argv[0] !== undefined && resolve(source.argv[0]) === command) {
     return Object.freeze({ command, argsPrefix: Object.freeze([]) });
@@ -42,12 +49,12 @@ export interface BuildRpcLaunchOptions {
   readonly cwd: AbsolutePath;
   readonly childSessionDir: AbsolutePath;
   readonly existingSession?: AbsolutePath;
-  readonly effectiveTools: readonly string[];
+  readonly effectiveTools: readonly ToolName[];
   readonly effectiveModel: ModelSpec;
   readonly effectiveThinking: ThinkingLevel;
-  readonly childDepth: number;
-  readonly maxDepth: number;
-  readonly maxConcurrentRuns: number;
+  readonly childDepth: DelegationDepth;
+  readonly maxDepth: DelegationDepth;
+  readonly maxConcurrentRuns: RunCapacity;
   readonly trustedRoot?: AbsolutePath;
   readonly env?: NodeJS.ProcessEnv;
 }

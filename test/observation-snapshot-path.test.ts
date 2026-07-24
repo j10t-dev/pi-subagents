@@ -4,7 +4,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { agentId, type AgentId } from "../src/domain.ts";
+import {
+  agentId,
+  observationRevision,
+  type AbsolutePath,
+  type AgentId,
+  type ObservationRevision,
+  type ObservationSnapshotPath,
+} from "../src/domain.ts";
+import { absolutePath } from "../src/paths.ts";
 import {
   MAX_SNAPSHOT_BYTES,
   observationSnapshotPath,
@@ -22,8 +30,8 @@ function smuggled(value: string): AgentId {
 
 const CHILD_1 = agentId("child-1");
 
-let agentDir: string;
-beforeEach(() => { agentDir = mkdtempSync(join(tmpdir(), "obs-path-")); });
+let agentDir: AbsolutePath;
+beforeEach(() => { agentDir = absolutePath(mkdtempSync(join(tmpdir(), "obs-path-"))); });
 afterEach(() => { rmSync(agentDir, { recursive: true, force: true }); });
 
 function writeSnapshot(sessionId: AgentId, snapshot: unknown): void {
@@ -34,27 +42,30 @@ function writeSnapshot(sessionId: AgentId, snapshot: unknown): void {
 
 const valid: ObservationSnapshotV1 = {
   version: 1,
-  sessionId: "child-1",
-  revision: 3,
+  sessionId: CHILD_1,
+  revision: observationRevision(3),
   agents: [{ ordinal: "A1", state: "running", taskLabel: "Research terminal UX" }],
 };
 
 describe("observationSnapshotPath", () => {
-  test("builds a path beneath the managed pi-subagents root", () => {
-    expect(observationSnapshotPath("/agent", agentId("abc123"))).toBe(
-      "/agent/pi-subagents/abc123/ui/observation-v1.json",
+  test("builds a proven path beneath the managed pi-subagents root", () => {
+    const path: ObservationSnapshotPath = observationSnapshotPath(
+      absolutePath("/agent"),
+      agentId("abc123"),
     );
+    const absolute: AbsolutePath = path;
+    expect(String(absolute)).toBe("/agent/pi-subagents/abc123/ui/observation-v1.json");
   });
 
   test("rejects a smuggled session id containing a path separator", () => {
-    expect(() => observationSnapshotPath("/agent", smuggled("../escape"))).toThrow(/session id/i);
-    expect(() => observationSnapshotPath("/agent", smuggled("a/b"))).toThrow(/session id/i);
+    expect(() => observationSnapshotPath(absolutePath("/agent"), smuggled("../escape"))).toThrow(/session id/i);
+    expect(() => observationSnapshotPath(absolutePath("/agent"), smuggled("a/b"))).toThrow(/session id/i);
   });
 
   test("rejects a smuggled empty or relative session id", () => {
-    expect(() => observationSnapshotPath("/agent", smuggled(""))).toThrow(/session id/i);
-    expect(() => observationSnapshotPath("/agent", smuggled("."))).toThrow(/session id/i);
-    expect(() => observationSnapshotPath("/agent", smuggled(".."))).toThrow(/session id/i);
+    expect(() => observationSnapshotPath(absolutePath("/agent"), smuggled(""))).toThrow(/session id/i);
+    expect(() => observationSnapshotPath(absolutePath("/agent"), smuggled("."))).toThrow(/session id/i);
+    expect(() => observationSnapshotPath(absolutePath("/agent"), smuggled(".."))).toThrow(/session id/i);
   });
 });
 
@@ -64,7 +75,11 @@ describe("readKnownChildSnapshots", () => {
     writeSnapshot(agentId("intruder"), { ...valid, sessionId: "intruder" });
     const result = readKnownChildSnapshots(agentDir, [CHILD_1]);
     expect([...result.snapshots.keys()]).toEqual([CHILD_1]);
-    expect(result.snapshots.get(CHILD_1)?.revision).toBe(3);
+    const snapshot = result.snapshots.get(CHILD_1);
+    const session: AgentId | undefined = snapshot?.sessionId;
+    const revision: ObservationRevision | undefined = snapshot?.revision;
+    expect(session).toBe(CHILD_1);
+    expect(revision).toBe(observationRevision(3));
     expect(result.skipped.size).toBe(0);
   });
 
@@ -89,6 +104,16 @@ describe("readKnownChildSnapshots", () => {
     expect(result.snapshots.size).toBe(0);
     expect(result.skipped.get(CHILD_1)).toBe("oversized");
   });
+
+  test.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "reports malformed observation revision %p",
+    (revision) => {
+      writeSnapshot(CHILD_1, { ...valid, revision });
+      const result = readKnownChildSnapshots(agentDir, [CHILD_1]);
+      expect(result.snapshots.size).toBe(0);
+      expect(result.skipped.get(CHILD_1)).toBe("malformed");
+    },
+  );
 
   test("reports a snapshot whose declared sessionId does not match its slot", () => {
     writeSnapshot(CHILD_1, { ...valid, sessionId: "someone-else" });

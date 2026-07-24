@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { agentId } from "../src/domain.ts";
-import type { AgentId } from "../src/domain.ts";
+import { agentId, milliseconds, uiRequestId } from "../src/domain.ts";
+import type { AgentId, UIRequestId } from "../src/domain.ts";
 import { createHash } from "node:crypto";
 import type {
   WireExtensionUIDialog as WireExtensionUIRequest,
@@ -9,14 +9,17 @@ import type {
 } from "../src/schemas.ts";
 import { UIForwarder, type ExtensionUIContextLike } from "../src/ui-forwarder.ts";
 import { deferred } from "./support/async.ts";
+import { testUIRequestId } from "./support/brands.ts";
 import { fakeUiForwarder } from "./support/ui-forwarders.ts";
 
 const AGENT_A = agentId("agent-a");
 const AGENT_B = agentId("agent-b");
 
 function confirm(id: string, title = id.toUpperCase()): WireExtensionUIRequest {
-  return { type: "extension_ui_request", method: "confirm", id, title, message: `Confirm ${id}?` };
+  return { type: "extension_ui_request", method: "confirm", id: uiRequestId(id), title, message: `Confirm ${id}?` };
 }
+
+function requireOutcomeId(value: UIRequestId): string { return value; }
 
 function missingSignalTypeFixture(): void {
   const broker = new UIForwarder({ hasUI: true, ui: {
@@ -55,6 +58,16 @@ function forward(
 }
 
 describe("UIForwarder broker", () => {
+  test("preserves the child UI request identity in its outcome", async () => {
+    const broker = new UIForwarder({ hasUI: true, ui: controlledUI() });
+    const result = await broker.forward(
+      AGENT_A,
+      { type: "extension_ui_request", method: "confirm", id: uiRequestId("confirm-1"), title: "Confirm", message: "Proceed?" },
+      new AbortController().signal,
+    );
+    expect(requireOutcomeId(result.id)).toBe("confirm-1");
+  });
+
   test("serialises dialogs in FIFO order across agents", async () => {
     const firstEntered = deferred<void>();
     const releaseFirst = deferred<void>();
@@ -116,14 +129,14 @@ describe("UIForwarder broker", () => {
     const first = forward(broker, AGENT_A, confirm("failed", "Failed"));
     const second = forward(broker, AGENT_B, confirm("next", "Next"));
 
-    await expect(first).resolves.toEqual({ type: "extension_ui_response", id: "failed", cancelled: true });
-    await expect(second).resolves.toEqual({ type: "extension_ui_response", id: "next", confirmed: true });
+    await expect(first).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId("failed"), cancelled: true });
+    await expect(second).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId("next"), confirmed: true });
     expect(order).toEqual(["[agent-a] Failed", "[agent-b] Next"]);
   });
 
   test("fake disabled UI forwarder cancels confirmations", async () => {
     await expect(forward(fakeUiForwarder(), AGENT_A, confirm("fake-disabled"))).resolves.toEqual({
-      type: "extension_ui_response", id: "fake-disabled", cancelled: true,
+      type: "extension_ui_response", id: testUIRequestId("fake-disabled"), cancelled: true,
     });
   });
 
@@ -132,7 +145,7 @@ describe("UIForwarder broker", () => {
     const broker = new UIForwarder({ hasUI: false, ui: controlledUI({ confirm: async () => { invoked = true; return true; } }) });
 
     await expect(forward(broker, AGENT_A, confirm("no-ui"))).resolves.toEqual({
-      type: "extension_ui_response", id: "no-ui", cancelled: true,
+      type: "extension_ui_response", id: testUIRequestId("no-ui"), cancelled: true,
     });
     expect(invoked).toBeFalse();
   });
@@ -152,7 +165,7 @@ describe("UIForwarder broker", () => {
     const queued = broker.forward(AGENT_B, confirm("queued", "Queued"), queuedController.signal);
 
     queuedController.abort();
-    await expect(queued).resolves.toEqual({ type: "extension_ui_response", id: "queued", cancelled: true });
+    await expect(queued).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId("queued"), cancelled: true });
     expect(shown).toEqual(["[agent-a] Active"]);
     release.resolve();
     await active;
@@ -162,10 +175,10 @@ describe("UIForwarder broker", () => {
     test(`aborting an active ${method} is observable on the options signal`, async () => {
       const entered = deferred<AbortSignal>();
       const request: WireExtensionUIRequest = method === "select"
-        ? { type: "extension_ui_request", method, id: method, title: "Choose", options: ["one"], timeout: 50 }
+        ? { type: "extension_ui_request", method, id: testUIRequestId(method), title: "Choose", options: ["one"], timeout: milliseconds(50) }
         : method === "confirm"
-          ? { type: "extension_ui_request", method, id: method, title: "Confirm", message: "Proceed?", timeout: 50 }
-          : { type: "extension_ui_request", method, id: method, title: "Input", placeholder: "Value", timeout: 50 };
+          ? { type: "extension_ui_request", method, id: testUIRequestId(method), title: "Confirm", message: "Proceed?", timeout: milliseconds(50) }
+          : { type: "extension_ui_request", method, id: testUIRequestId(method), title: "Input", placeholder: "Value", timeout: milliseconds(50) };
       const waitForAbort = async (_title: string, _value: string[] | string | undefined, opts?: { signal?: AbortSignal }): Promise<never> => {
         if (opts?.signal === undefined) throw new Error("missing signal");
         entered.resolve(opts.signal);
@@ -185,7 +198,7 @@ describe("UIForwarder broker", () => {
       controller.abort();
 
       expect(signal.aborted).toBeTrue();
-      await expect(outcome).resolves.toEqual({ type: "extension_ui_response", id: method, cancelled: true });
+      await expect(outcome).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId(method), cancelled: true });
     });
   }
 
@@ -200,10 +213,10 @@ describe("UIForwarder broker", () => {
     const controller = new AbortController();
     const active = forward(broker, AGENT_A, confirm("active"));
     await entered.promise;
-    const editor = broker.forward(AGENT_B, { type: "extension_ui_request", method: "editor", id: "editor", title: "Edit", prefill: "text" }, controller.signal);
+    const editor = broker.forward(AGENT_B, { type: "extension_ui_request", method: "editor", id: testUIRequestId("editor"), title: "Edit", prefill: "text" }, controller.signal);
 
     controller.abort();
-    await expect(editor).resolves.toEqual({ type: "extension_ui_response", id: "editor", cancelled: true });
+    await expect(editor).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId("editor"), cancelled: true });
     release.resolve();
     await active;
     expect(editors).toBe(0);
@@ -214,20 +227,20 @@ describe("UIForwarder broker", () => {
     const release = deferred<string | undefined>();
     const broker = new UIForwarder({ hasUI: true, ui: controlledUI({ editor: async () => { entered.resolve(); return release.promise; } }) });
     const controller = new AbortController();
-    const outcome = broker.forward(AGENT_A, { type: "extension_ui_request", method: "editor", id: "editor-active", title: "Edit" }, controller.signal);
+    const outcome = broker.forward(AGENT_A, { type: "extension_ui_request", method: "editor", id: testUIRequestId("editor-active"), title: "Edit" }, controller.signal);
     await entered.promise;
 
     controller.abort();
     release.resolve("must be discarded");
 
-    await expect(outcome).resolves.toEqual({ type: "extension_ui_response", id: "editor-active", cancelled: true });
+    await expect(outcome).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId("editor-active"), cancelled: true });
   });
 
   test("close settles all queued requests while an active editor remains unresolved", async () => {
     const entered = deferred<void>();
     const release = deferred<string | undefined>();
     const broker = new UIForwarder({ hasUI: true, ui: controlledUI({ editor: async () => { entered.resolve(); return release.promise; } }) });
-    const active = forward(broker, AGENT_A, { type: "extension_ui_request", method: "editor", id: "active-editor", title: "Edit" });
+    const active = forward(broker, AGENT_A, { type: "extension_ui_request", method: "editor", id: testUIRequestId("active-editor"), title: "Edit" });
     await entered.promise;
     const queuedA = forward(broker, AGENT_A, confirm("queued-a"));
     const queuedB = forward(broker, AGENT_B, confirm("queued-b"));
@@ -235,11 +248,11 @@ describe("UIForwarder broker", () => {
     broker.close();
 
     await expect(Promise.all([queuedA, queuedB])).resolves.toEqual([
-      { type: "extension_ui_response", id: "queued-a", cancelled: true },
-      { type: "extension_ui_response", id: "queued-b", cancelled: true },
+      { type: "extension_ui_response", id: testUIRequestId("queued-a"), cancelled: true },
+      { type: "extension_ui_response", id: testUIRequestId("queued-b"), cancelled: true },
     ]);
     release.resolve("late");
-    await expect(active).resolves.toEqual({ type: "extension_ui_response", id: "active-editor", cancelled: true });
+    await expect(active).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId("active-editor"), cancelled: true });
   });
 
   test("close signals an active abort-aware dialog", async () => {
@@ -256,7 +269,7 @@ describe("UIForwarder broker", () => {
     broker.close();
 
     expect(signal.aborted).toBeTrue();
-    await expect(outcome).resolves.toEqual({ type: "extension_ui_response", id: "active", cancelled: true });
+    await expect(outcome).resolves.toEqual({ type: "extension_ui_response", id: testUIRequestId("active"), cancelled: true });
   });
 
   test("relays notifications and cleans scoped resources", () => {
@@ -269,9 +282,9 @@ describe("UIForwarder broker", () => {
       setWidget: (key, lines, options) => widgets.push([key, lines, options]),
     }) });
     const controller = new AbortController();
-    const notification = { type: "extension_ui_request", id: "n", method: "notify", message: "done", notifyType: "warning" } satisfies WireExtensionUINotification;
-    const status = { type: "extension_ui_request", id: "s", method: "setStatus", statusKey: "build", statusText: "running" } satisfies WireExtensionUINotification;
-    const widget = { type: "extension_ui_request", id: "w", method: "setWidget", widgetKey: "jobs", widgetLines: ["one"], widgetPlacement: "belowEditor" } satisfies WireExtensionUINotification;
+    const notification = { type: "extension_ui_request", id: testUIRequestId("n"), method: "notify", message: "done", notifyType: "warning" } satisfies WireExtensionUINotification;
+    const status = { type: "extension_ui_request", id: testUIRequestId("s"), method: "setStatus", statusKey: "build", statusText: "running" } satisfies WireExtensionUINotification;
+    const widget = { type: "extension_ui_request", id: testUIRequestId("w"), method: "setWidget", widgetKey: "jobs", widgetLines: ["one"], widgetPlacement: "belowEditor" } satisfies WireExtensionUINotification;
     broker.forwardNotification(AGENT_A, notification, controller.signal);
     broker.forwardNotification(AGENT_A, status, controller.signal);
     broker.forwardNotification(AGENT_A, widget, controller.signal);
@@ -289,7 +302,7 @@ describe("UIForwarder broker", () => {
     const calls: Array<[string, string | undefined]> = [];
     const broker = new UIForwarder({ hasUI: true, ui: controlledUI({ notify: (message, type) => calls.push([message, type]) }) });
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "notify", method: "notify", message: "done" }, new AbortController().signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("notify"), method: "notify", message: "done" }, new AbortController().signal);
 
     expect(calls).toEqual([["[agent-a] done", "info"]]);
   });
@@ -298,7 +311,7 @@ describe("UIForwarder broker", () => {
     const calls: Array<[string, string[] | undefined, { placement?: "aboveEditor" | "belowEditor" } | undefined]> = [];
     const broker = new UIForwarder({ hasUI: true, ui: controlledUI({ setWidget: (key, lines, options) => calls.push([key, lines, options]) }) });
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "widget", method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, new AbortController().signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("widget"), method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, new AbortController().signal);
 
     expect(calls).toEqual([[expectedParentKey(AGENT_A, "jobs"), ["one"], { placement: "aboveEditor" }]]);
   });
@@ -312,10 +325,10 @@ describe("UIForwarder broker", () => {
     }) });
     const controller = new AbortController();
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "status-set", method: "setStatus", statusKey: "build", statusText: "running" }, controller.signal);
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "widget-set", method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, controller.signal);
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "status-clear", method: "setStatus", statusKey: "build" }, controller.signal);
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "widget-clear", method: "setWidget", widgetKey: "jobs" }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("status-set"), method: "setStatus", statusKey: "build", statusText: "running" }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("widget-set"), method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("status-clear"), method: "setStatus", statusKey: "build" }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("widget-clear"), method: "setWidget", widgetKey: "jobs" }, controller.signal);
     controller.abort();
 
     expect(statuses).toEqual([[expectedParentKey(AGENT_A, "build"), "running"], [expectedParentKey(AGENT_A, "build"), undefined]]);
@@ -332,8 +345,8 @@ describe("UIForwarder broker", () => {
     } }) });
     const controller = new AbortController();
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "set", method: "setStatus", statusKey: "build", statusText: "running" }, controller.signal);
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "clear", method: "setStatus", statusKey: "build" }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("set"), method: "setStatus", statusKey: "build", statusText: "running" }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("clear"), method: "setStatus", statusKey: "build" }, controller.signal);
     controller.abort();
 
     expect(calls).toEqual([[key, "running"], [key, undefined], [key, undefined]]);
@@ -347,8 +360,8 @@ describe("UIForwarder broker", () => {
     }) });
     const controller = new AbortController();
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "status", method: "setStatus", statusKey: "build", statusText: "running" }, controller.signal);
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "widget", method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("status"), method: "setStatus", statusKey: "build", statusText: "running" }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("widget"), method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, controller.signal);
     controller.abort();
 
     expect(calls).toContain(`widget:${expectedParentKey(AGENT_A, "jobs")}:clear`);
@@ -361,9 +374,9 @@ describe("UIForwarder broker", () => {
     const first = new AbortController();
     const second = new AbortController();
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "first", method: "setStatus", statusKey: "build", statusText: "one" }, first.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("first"), method: "setStatus", statusKey: "build", statusText: "one" }, first.signal);
     first.abort();
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "second", method: "setStatus", statusKey: "build", statusText: "two" }, second.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("second"), method: "setStatus", statusKey: "build", statusText: "two" }, second.signal);
     second.abort();
 
     expect(calls).toEqual([[key, "one"], [key, undefined], [key, "two"], [key, undefined]]);
@@ -378,8 +391,8 @@ describe("UIForwarder broker", () => {
     const a = new AbortController();
     const b = new AbortController();
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "status", method: "setStatus", statusKey: "build", statusText: "running" }, a.signal);
-    broker.forwardNotification(AGENT_B, { type: "extension_ui_request", id: "widget", method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, b.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("status"), method: "setStatus", statusKey: "build", statusText: "running" }, a.signal);
+    broker.forwardNotification(AGENT_B, { type: "extension_ui_request", id: testUIRequestId("widget"), method: "setWidget", widgetKey: "jobs", widgetLines: ["one"] }, b.signal);
     broker.close();
     broker.close();
 
@@ -393,9 +406,9 @@ describe("UIForwarder broker", () => {
     const aborted = new AbortController();
     aborted.abort();
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "aborted", method: "notify", message: "no" }, aborted.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("aborted"), method: "notify", message: "no" }, aborted.signal);
     broker.close();
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "closed", method: "notify", message: "no" }, new AbortController().signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("closed"), method: "notify", message: "no" }, new AbortController().signal);
 
     expect(calls).toEqual([]);
   });
@@ -407,8 +420,8 @@ describe("UIForwarder broker", () => {
     }) });
     const signal = new AbortController().signal;
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "title", method: "setTitle", title: "child" }, signal);
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "editor", method: "set_editor_text", text: "draft" }, signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("title"), method: "setTitle", title: "child" }, signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("editor"), method: "set_editor_text", text: "draft" }, signal);
 
     expect(calls).toBe(0);
   });
@@ -425,7 +438,7 @@ describe("UIForwarder broker", () => {
     const dialog = broker.forward(AGENT_A, confirm("dialog"), controller.signal);
     await entered.promise;
 
-    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: "notify", method: "notify", message: "now" }, controller.signal);
+    broker.forwardNotification(AGENT_A, { type: "extension_ui_request", id: testUIRequestId("notify"), method: "notify", message: "now" }, controller.signal);
     expect(notifications).toEqual(["[agent-a] now"]);
     release.resolve(true);
     await dialog;
@@ -437,7 +450,7 @@ describe("UIForwarder broker", () => {
     broker.close();
 
     await expect(forward(broker, AGENT_A, confirm("post-close"))).resolves.toEqual({
-      type: "extension_ui_response", id: "post-close", cancelled: true,
+      type: "extension_ui_response", id: testUIRequestId("post-close"), cancelled: true,
     });
   });
 });

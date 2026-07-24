@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Mutex, RunSemaphore } from "../src/async-primitives.ts";
-import { AgentErrorCode, AgentState, CancellationReason, CodedError, terminalFailureCause, type RunId } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CancellationReason, CodedError, runCapacity, terminalFailureCause, type RunId } from "../src/domain.ts";
 import {
   agentStateOf,
   classifyTerminal,
@@ -21,7 +21,7 @@ import { testRuntime } from "./support/launches.ts";
 
 type AdoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>) => void;
 
-const testReservation = new RunSemaphore(1).tryAcquire()!;
+const testReservation = new RunSemaphore(runCapacity(1)).tryAcquire()!;
 const testIdentity = { runId: testRunId("deadbeef"), runtime: testRuntime() };
 const stopResult: StopResult = { status: "already_stopped", agentId: testAgentId() };
 const testTerminatingPhase: Extract<Phase, { kind: "terminating" }> = { kind: "terminating", reservation: testReservation, terminalState: AgentState.Stopping, contained: false };
@@ -62,7 +62,7 @@ describe("RunController arbitration", () => {
   });
 
   test("restore admission joins an in-flight launch and excludes later launches until commit", async () => {
-    const c = testRunController({ capacity: 1 });
+    const c = testRunController({ capacity: runCapacity(1) });
     const existing = registerStopped(c);
     const launchGate = deferred<void>();
     const launching = c.launch(existing, async () => {
@@ -83,7 +83,7 @@ describe("RunController arbitration", () => {
   });
 
   test("restore admission inherits obligations above current capacity and blocks new launches", async () => {
-    const c = testRunController({ capacity: 1 });
+    const c = testRunController({ capacity: runCapacity(1) });
     const restore = await c.beginRestore();
     restore.reserve([
       { agentId: testAgentId("one"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/one"), runId: testRunId("deadbeef"), runtime: testRuntime() },
@@ -101,7 +101,7 @@ describe("RunController arbitration", () => {
   });
 
   test("capacity rejection is a CodedError carrying the stable message", async () => {
-    const c = testRunController({ capacity: 1 });
+    const c = testRunController({ capacity: runCapacity(1) });
     const restore = await c.beginRestore();
     restore.reserve([
       { agentId: testAgentId("one"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/one"), runId: testRunId("deadbeef"), runtime: testRuntime() },
@@ -135,7 +135,7 @@ describe("RunController arbitration", () => {
   });
 
   test("restore commit validates a mixed staged batch before installing records", async () => {
-    const c = testRunController({ capacity: 1 });
+    const c = testRunController({ capacity: runCapacity(1) });
     const restore = await c.beginRestore();
     restore.reserve([
       { agentId: testAgentId("valid-first"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/valid-first"), runId: testRunId("deadbeef") },
@@ -157,7 +157,7 @@ describe("RunController arbitration", () => {
   });
 
   test("restore retains identified settling and stopping records and pre-native stopping containment", async () => {
-    const c = testRunController({ capacity: 3 });
+    const c = testRunController({ capacity: runCapacity(3) });
     await restoreRuns(c, [
       { agentId: testAgentId("settling-identity"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/settling-identity"), runId: testRunId("deadbeef") },
       { agentId: testAgentId("stopping-identity"), state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/stopping-identity"), runId: testRunId("cafebabe"), runtime: testRuntime() },
@@ -167,7 +167,7 @@ describe("RunController arbitration", () => {
   });
 
   test("restoreRuns inherits every prior-session obligation above capacity", async () => {
-    const c = testRunController({ capacity: 1 });
+    const c = testRunController({ capacity: runCapacity(1) });
     const records = [
       { agentId: testAgentId("first"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/first"), runId: testRunId("deadbeef"), runtime: testRuntime() },
       { agentId: testAgentId("second"), state: AgentState.Stopping, transcriptPath: testSessionPath("/tmp/pi-subagents-test/second"), runId: testRunId("cafebabe"), runtime: testRuntime() },
@@ -178,7 +178,7 @@ describe("RunController arbitration", () => {
   });
 
   test("restoreRuns cannot overwrite an existing record or leak its reservation", async () => {
-    const c = testRunController({ capacity: 2 });
+    const c = testRunController({ capacity: runCapacity(2) });
     const existing = { agentId: testAgentId("existing"), state: AgentState.Settling, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing"), runId: testRunId("deadbeef") };
     await restoreRuns(c, [existing]);
 
@@ -781,7 +781,7 @@ describe("RunController arbitration", () => {
   });
 
   describe("phase projections", () => {
-    const res = () => new RunSemaphore(1).tryAcquire()!;
+    const res = () => new RunSemaphore(runCapacity(1)).tryAcquire()!;
     const identity = { runId: testRunId("deadbeef"), runtime: testRuntime() };
 
     test.each<[string, Phase, AgentState]>([

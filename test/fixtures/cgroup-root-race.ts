@@ -6,6 +6,7 @@ import {
   resolveCgroupV2Backend,
   type CgroupFileSystem,
 } from "../../src/cgroup-v2.ts";
+import { agentId } from "../../src/domain.ts";
 import { containmentReceiptPath, isContainedPath } from "../../src/paths.ts";
 
 type FixtureId = "a" | "b";
@@ -56,7 +57,7 @@ async function main(): Promise<void> {
   };
 
   const backend = resolveCgroupV2Backend({
-    parentSessionId,
+    parentSessionId: agentId(parentSessionId),
     selfCgroupText: `0::${membership}\n`,
     fs,
     receiptPathFor: (attemptId) => containmentReceiptPath(barrierDirectory, `${id}-${attemptId}.json`),

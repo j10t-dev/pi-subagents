@@ -1,7 +1,7 @@
 import type { LaunchSession, LaunchTransport } from "../../src/controller.ts";
 import type { RunRuntime } from "../../src/run-controller.ts";
 import type { VerifiedContainmentReceiptPath } from "../../src/domain.ts";
-import { testAbsolutePath, testAgentId, testAttemptId, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./brands.ts";
+import { testAgentId, testAttemptId, testContainmentAttempt, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./brands.ts";
 
 export function launchSession(suffix = "a", overrides: Partial<LaunchSession> = {}): LaunchSession {
   return {
@@ -32,10 +32,10 @@ export function testRuntime(options: {
 export function runningTransport(session: LaunchSession, overrides: Partial<LaunchTransport> = {}): LaunchTransport {
   const nativeRunId = testRunId();
   let assignment: string | undefined;
+  const containment = testContainmentAttempt(session.attemptId).descriptor;
   return {
-    containment: { backend: "cgroup-v2", scopePath: testAbsolutePath(`/tmp/cgroup/${session.attemptId}`) },
     runtime: testRuntime(),
-    ready: async () => {}, persistLaunchRequested: async () => {},
+    ready: async () => containment, persistLaunchRequested: async () => {},
     persistRunStarted: async () => {}, start: async () => {},
     getEntries: async () => assignment === undefined
       ? { entries: [], leafId: session.previousLeafId }

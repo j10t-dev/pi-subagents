@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { Value } from "typebox/value";
-import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runId, truncateUtf8, type AgentCompletion } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runCapacity, runId, truncateUtf8, utf8Bytes, type AgentCompletion, type ToolName, type Utf8Bytes } from "../src/domain.ts";
 import { diagnosticsPath } from "../src/paths.ts";
 import { CompletionService, type AgentSummary, type ReceiveAgentResult } from "../src/completion-service.ts";
 import { MAX_AGGREGATE_RECEIVE_BYTES } from "../src/constants.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PublicStopOutcome } from "../src/controller.ts";
 import { deferred } from "./support/async.ts";
-import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
+import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testReceiptPath, testRunId, testSessionPath, testToolName, testVerifiedReceiptPath } from "./support/brands.ts";
 import { launchSession, runningTransport as sharedRunningTransport, testRuntime } from "./support/launches.ts";
 import {
   allocateFairOutputs,
@@ -56,8 +56,10 @@ function withFixtureExtras<T extends object, TExtras extends object>(value: T, e
 const TEST_SELECTION = Object.freeze({
   model: modelSpec("mock-provider/luna"),
   thinkingLevel: "high" as const,
-  tools: Object.freeze(["read"]),
+  tools: Object.freeze([testToolName("read")]),
 });
+const _internalSelectionTools: readonly ToolName[] = TEST_SELECTION.tools;
+void _internalSelectionTools;
 
 describe("exact tool contracts", () => {
   test("returns each exported input schema by identity", () => {
@@ -76,6 +78,11 @@ describe("exact tool contracts", () => {
     expect(Value.Check(receiveAgentSchema, { timeoutMs: 0 })).toBeTrue();
     expect(Value.Check(receiveAgentSchema, { timeout_ms: 0 })).toBeFalse();
     expect(Value.Check(stopAgentSchema, { agentIds: ["agent-a", "agent-a"] })).toBeTrue();
+  });
+
+  test("receive_agent schema rejects unsafe timeout integers at the public boundary", () => {
+    expect(Value.Check(receiveAgentSchema, { timeoutMs: Number.MAX_SAFE_INTEGER })).toBeTrue();
+    expect(Value.Check(receiveAgentSchema, { timeoutMs: Number.MAX_SAFE_INTEGER + 1 })).toBeFalse();
   });
 
   test("spawn schema describes its asynchronous lifecycle and every input field", () => {
@@ -124,8 +131,8 @@ describe("exact tool contracts", () => {
       completions: [
         withFixtureExtras({
           agentId: agentId("agent-a"), runId: runId("deadbeef"), state: CompletionState.Completed,
-          output: withFixtureExtras(truncateUtf8("answer", 50_000), { raw: secret }),
-          outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/out"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"),
+          output: withFixtureExtras(truncateUtf8("answer", utf8Bytes(50_000)), { raw: secret }),
+          outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"), runId: runId("deadbeef") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"),
           usage: withFixtureExtras({
             turns: 1,
             usage: withFixtureExtras({
@@ -136,18 +143,18 @@ describe("exact tool contracts", () => {
         } satisfies AgentCompletion, { message: secret }),
         withFixtureExtras({
           agentId: agentId("agent-b"), runId: runId("cafebabe"), state: CompletionState.Failed,
-          output: truncateUtf8("bad", 50_000),
-          outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/b"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/b-session"),
+          output: truncateUtf8("bad", utf8Bytes(50_000)),
+          outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-b"), runId: runId("cafebabe") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/b-session"),
           error: withFixtureExtras({ code: AgentErrorCode.ProtocolError, message: "child process protocol error", diagnosticsPath: diagnosticsPath("/tmp", "diag") }, { raw: secret }),
         } satisfies AgentCompletion, { exception: secret }),
         withFixtureExtras({
           agentId: agentId("agent-c"), runId: runId("feedface"), state: CompletionState.Cancelled,
-          output: truncateUtf8("", 50_000),
-          outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/c"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/c-session"), reason: "stop_requested",
+          output: truncateUtf8("", utf8Bytes(50_000)),
+          outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-c"), runId: runId("feedface") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/c-session"), reason: "stop_requested",
         } satisfies AgentCompletion, { process: secret }),
       ],
       agents: [
-        withFixtureExtras({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"), currentRunId: runId("deadbeef"), latestCompletionState: CompletionState.Completed, latestOutputPath: testCommittedOutputPath("/tmp/pi-subagents-test/out") } satisfies AgentSummary, { client: { secret } }),
+        withFixtureExtras({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"), currentRunId: runId("deadbeef"), latestCompletionState: CompletionState.Completed, latestOutputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"), runId: runId("deadbeef") }) } satisfies AgentSummary, { client: { secret } }),
         withFixtureExtras({ agentId: agentId("agent-b"), state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/b-session") } satisfies AgentSummary, { raw: secret }),
       ],
       timedOut: false,
@@ -184,11 +191,11 @@ describe("exact tool contracts", () => {
     });
     expect(results[1]!.details).toEqual({ agentId: "agent-a", state: "stopped", error: { code: "spawn_failed", message: "failed to spawn child agent", diagnosticsPath: "/tmp/d" } });
     expect(results[2]!.details).toEqual({ completions: [
-      { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "answer", originalBytes: 6, retainedBytes: 6, truncated: false }, outputPath: "/tmp/pi-subagents-test/out", transcriptPath: "/tmp/pi-subagents-test/session", usage: { turns: 1, usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } } } },
-      { agentId: "agent-b", runId: "cafebabe", state: "failed", output: { text: "bad", originalBytes: 3, retainedBytes: 3, truncated: false }, outputPath: "/tmp/pi-subagents-test/b", transcriptPath: "/tmp/pi-subagents-test/b-session", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "/tmp/diag" } },
-      { agentId: "agent-c", runId: "feedface", state: "cancelled", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/pi-subagents-test/c", transcriptPath: "/tmp/pi-subagents-test/c-session", reason: "stop_requested" },
+      { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "answer", originalBytes: 6, retainedBytes: 6, truncated: false }, outputPath: "/tmp/pi-subagents-test/output/agent-a/deadbeef.committed", transcriptPath: "/tmp/pi-subagents-test/session", usage: { turns: 1, usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } } } },
+      { agentId: "agent-b", runId: "cafebabe", state: "failed", output: { text: "bad", originalBytes: 3, retainedBytes: 3, truncated: false }, outputPath: "/tmp/pi-subagents-test/output/agent-b/cafebabe.committed", transcriptPath: "/tmp/pi-subagents-test/b-session", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "/tmp/diag" } },
+      { agentId: "agent-c", runId: "feedface", state: "cancelled", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/pi-subagents-test/output/agent-c/feedface.committed", transcriptPath: "/tmp/pi-subagents-test/c-session", reason: "stop_requested" },
     ], agents: [
-      { agentId: "agent-a", state: "running", transcriptPath: "/tmp/pi-subagents-test/session", currentRunId: "deadbeef", latestCompletionState: "completed", latestOutputPath: "/tmp/pi-subagents-test/out" },
+      { agentId: "agent-a", state: "running", transcriptPath: "/tmp/pi-subagents-test/session", currentRunId: "deadbeef", latestCompletionState: "completed", latestOutputPath: "/tmp/pi-subagents-test/output/agent-a/deadbeef.committed" },
       { agentId: "agent-b", state: "stopped", transcriptPath: "/tmp/pi-subagents-test/b-session" },
     ], timedOut: false });
     expect(results[3]!.details).toEqual({ outcomes: [
@@ -337,6 +344,7 @@ describe("exact tool contracts", () => {
     ["invalid output byte metadata", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "x", originalBytes: 1, retainedBytes: 999, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }], agents: [], timedOut: false }) })).receive_agent.execute({})],
     ["invalid path", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [], agents: [{ agentId: "agent-a", state: "stopped", transcriptPath: "relative/secret" }], timedOut: false }) })).receive_agent.execute({})],
     ["invalid canonical model reference", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "unqualified-model", thinkingLevel: "high", tools: [] }) })).spawn_agent.execute({ task: "work" })],
+    ["invalid canonical model components", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider /luna", thinkingLevel: "high", tools: [] }) })).spawn_agent.execute({ task: "work" })],
     ["overlong warning", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider/luna", thinkingLevel: "high", tools: [], warning: "x".repeat(100_000) }) })).spawn_agent.execute({ task: "work" })],
     ["overlong tool value", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider/luna", thinkingLevel: "high", tools: ["x".repeat(1_000)] }) })).spawn_agent.execute({ task: "work" })],
     ["invalid diagnostics path", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "failed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "relative/secret" } }], agents: [], timedOut: false }) })).receive_agent.execute({})],
@@ -416,7 +424,7 @@ describe("exact tool contracts", () => {
       let preparations = 0;
       const running = launchSession("capacity-running");
       const idle = launchSession(`capacity-idle-${operation}`);
-      const controller = new SubagentController({ capacity: 1, composition: {
+      const controller = new SubagentController({ capacity: runCapacity(1), composition: {
         prepareSpawn: async () => {
           preparations++;
           return { selection: TEST_SELECTION, createSession: async () => running, persistSpawned: async () => {}, createLaunch: async () => runningTransport(running) };
@@ -484,7 +492,7 @@ describe("exact tool contracts", () => {
     expect((failure as Error).name).toBe("AbortError");
     expect((failure as Error).message).not.toContain("internal_error");
     await controller.publish({ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: CompletionState.Completed,
-      output: truncateUtf8("done", 50_000), outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/a.md"), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl") });
+      output: truncateUtf8("done", utf8Bytes(50_000)), outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"), runId: runId("deadbeef") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl") });
     expect(controller.completions.queuedCount()).toBe(1);
     expect((await receive.execute({})).details).toMatchObject({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed" }] });
   });
@@ -551,7 +559,7 @@ describe("exact tool contracts", () => {
       receive: async () => ({
         completions: [{
           agentId: "agent-a", runId: "deadbeef", state: CompletionState.Failed,
-          output: truncateUtf8(secret, 50_000), outputPath: "/tmp/out.md", transcriptPath: "/tmp/session.jsonl",
+          output: truncateUtf8(secret, utf8Bytes(50_000)), outputPath: "/tmp/out.md", transcriptPath: "/tmp/session.jsonl",
           error: { code: "protocol_error", message: secret },
         }],
         agents: [{
@@ -893,7 +901,7 @@ describe("fair prefix cost tables", () => {
     ["newline", "\n"],
     ["NUL", "\0"],
   ])("fair prefix accounts exactly for %s", (_name, text) => {
-    const retainedBytes = Buffer.byteLength(text, "utf8");
+    const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
     const table = buildFairOutputTable(text, retainedBytes, false);
     const zero = projectedFairCompletion("", retainedBytes, false);
 
@@ -902,32 +910,41 @@ describe("fair prefix cost tables", () => {
       originalRetainedBytes: retainedBytes,
       previouslyTruncated: false,
     }));
-    expect(table.prefixes[0]).toEqual({ endOffset: 0, retainedBytes: 0, serialisedDeltaBytes: 0 });
-    expect(table.prefixes.at(-1)?.endOffset).toBe(text.length);
+    expect(table.prefixes[0] as unknown).toEqual({ endOffset: 0, retainedBytes: 0, serialisedDeltaBytes: 0 });
+    expect(Number(table.prefixes.at(-1)?.endOffset)).toBe(text.length);
     expect(table.prefixes.at(-1)?.retainedBytes).toBe(retainedBytes);
 
     for (const prefix of table.prefixes) {
       const prefixText = text.slice(0, prefix.endOffset);
-      expect(Buffer.byteLength(prefixText, "utf8")).toBe(prefix.retainedBytes);
+      expect(Buffer.byteLength(prefixText, "utf8")).toBe(Number(prefix.retainedBytes));
       expect(Buffer.byteLength(JSON.stringify(projectedFairCompletion(prefixText, retainedBytes, false)), "utf8")
-        - Buffer.byteLength(JSON.stringify(zero), "utf8")).toBe(prefix.serialisedDeltaBytes);
+        - Buffer.byteLength(JSON.stringify(zero), "utf8")).toBe(Number(prefix.serialisedDeltaBytes));
     }
 
     expect(table.prefixes.slice(1).every((prefix, index) =>
       prefix.retainedBytes > table.prefixes[index]!.retainedBytes)).toBeTrue();
   });
 
+  test("distinguishes UTF-16 offsets from retained UTF-8 bytes across a surrogate pair", () => {
+    const text = "A£😀";
+    const table = buildFairOutputTable(text, utf8Bytes(7), false);
+
+    expect(table.prefixes.map((prefix) => Number(prefix.endOffset))).toEqual([0, 1, 2, 4]);
+    expect(table.prefixes.map((prefix) => Number(prefix.retainedBytes))).toEqual([0, 1, 3, 7]);
+    expect(text.slice(0, table.prefixes.at(-1)!.endOffset)).toBe(text);
+  });
+
   test("fair prefix tracks mixed complete boundaries across decimal byte lengths", () => {
     const text = "12345678ab😀é";
-    const retainedBytes = Buffer.byteLength(text, "utf8");
+    const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
     const table = buildFairOutputTable(text, retainedBytes, false);
     const zero = projectedFairCompletion("", retainedBytes, false);
 
     expect(table.prefixes).toHaveLength(13);
-    expect(table.prefixes.map((prefix) => prefix.endOffset)).toEqual([
+    expect(table.prefixes.map((prefix) => Number(prefix.endOffset))).toEqual([
       0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13,
     ]);
-    expect(table.prefixes.map((prefix) => prefix.retainedBytes)).toEqual([
+    expect(table.prefixes.map((prefix) => Number(prefix.retainedBytes))).toEqual([
       0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 16,
     ]);
     expect(table.prefixes.slice(1).every((prefix, index) =>
@@ -937,38 +954,38 @@ describe("fair prefix cost tables", () => {
       const prefixText = text.slice(0, prefix.endOffset);
       const measuredDelta = Buffer.byteLength(JSON.stringify(projectedFairCompletion(prefixText, retainedBytes, false)), "utf8")
         - Buffer.byteLength(JSON.stringify(zero), "utf8");
-      expect(measuredDelta).toBe(prefix.serialisedDeltaBytes);
+      expect(measuredDelta).toBe(Number(prefix.serialisedDeltaBytes));
     }
   });
 
   test("fair prefix preserves prior truncation when costing boolean metadata", () => {
-    const table = buildFairOutputTable("A", 1, true);
+    const table = buildFairOutputTable("A", utf8Bytes(1), true);
     const final = table.prefixes.at(-1)!;
     const zero = projectedFairCompletion("", 1, true);
 
-    expect(final.serialisedDeltaBytes).toBe(
+    expect(Number(final.serialisedDeltaBytes)).toBe(
       Buffer.byteLength(JSON.stringify(projectedFairCompletion("A", 1, true)), "utf8")
         - Buffer.byteLength(JSON.stringify(zero), "utf8"),
     );
   });
 
   test("fair prefix rejects retained-byte metadata that does not match complete input", () => {
-    expect(() => buildFairOutputTable("é", 1, false)).toThrow(CodedError);
-    expect(() => buildFairOutputTable("é", 1, false)).toThrow("internal_error");
+    expect(() => buildFairOutputTable("é", utf8Bytes(1), false)).toThrow(CodedError);
+    expect(() => buildFairOutputTable("é", utf8Bytes(1), false)).toThrow("internal_error");
   });
 });
 
 describe("nominal max-min allocation", () => {
-  const zeroTextSerialisedBytes = 1_000;
+  const zeroTextSerialisedBytes = utf8Bytes(1_000);
 
   test("fully admits a 2 KB output and redistributes its unused share to a 60 KB output", () => {
     const tables = [fairTable("a".repeat(60_000)), fairTable("b".repeat(2_000))];
-    const cap = zeroTextSerialisedBytes + 10_000;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 10_000);
 
     const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
 
     expect(allocation.prefixIndices[1]).toBe(tables[1]!.prefixes.length - 1);
-    expect(allocation.retainedBytes[1]).toBe(2_000);
+    expect(Number(allocation.retainedBytes[1])).toBe(2_000);
     expect(allocation.serialisedBytes).toBe(cap);
     expect(allocation.retainedBytes[0]).toBeGreaterThan(5_000);
     expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
@@ -976,7 +993,7 @@ describe("nominal max-min allocation", () => {
 
   test("gives the first equally large ASCII output the nominal remainder byte", () => {
     const tables = [fairTable("a".repeat(1_000)), fairTable("b".repeat(1_000))];
-    const cap = zeroTextSerialisedBytes + 101;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 101);
 
     const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
     const deltas = selectedDeltas(allocation.prefixIndices, tables);
@@ -988,7 +1005,7 @@ describe("nominal max-min allocation", () => {
 
   test("removes every demand below the waterline before redividing among large outputs", () => {
     const tables = [fairTable("a".repeat(2)), fairTable("b".repeat(8)), fairTable("c".repeat(100)), fairTable("d".repeat(100))];
-    const cap = zeroTextSerialisedBytes + 50;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 50);
 
     const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
     const deltas = selectedDeltas(allocation.prefixIndices, tables);
@@ -1003,48 +1020,48 @@ describe("nominal max-min allocation", () => {
 
   test("selects complete emoji and multibyte prefixes when a nominal share ends inside a code point", () => {
     const tables = [fairTable("😀".repeat(10)), fairTable("é".repeat(10))];
-    const cap = zeroTextSerialisedBytes + 11;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 11);
 
     const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
 
     expect(allocation.prefixIndices).toEqual([1, 3]);
-    expect(allocation.retainedBytes).toEqual([4, 6]);
+    expect(allocation.retainedBytes.map(Number)).toEqual([4, 6]);
     expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([4, 6]);
     expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
   });
 
   test("uses exact escaped JSON cost rather than raw UTF-8 size", () => {
     const tables = [fairTable("\n".repeat(100))];
-    const cap = zeroTextSerialisedBytes + 11;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 11);
 
     const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
 
     expect(allocation.prefixIndices).toEqual([5]);
-    expect(allocation.retainedBytes).toEqual([5]);
+    expect(allocation.retainedBytes.map(Number)).toEqual([5]);
     expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([10]);
     expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
   });
 
   test("offers pooled unusable complete-prefix slack in queue order and restarts", () => {
     const tables = [fairTable("😀".repeat(10)), fairTable("😀".repeat(10)), fairTable("😀".repeat(10))];
-    const cap = zeroTextSerialisedBytes + 17;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 17);
 
     const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
 
     expect(allocation.prefixIndices).toEqual([2, 1, 1]);
     expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([8, 4, 4]);
-    expect(allocation.serialisedBytes).toBe(zeroTextSerialisedBytes + 16);
+    expect(allocation.serialisedBytes).toBe(utf8Bytes(zeroTextSerialisedBytes + 16));
     expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
   });
 
   test("keeps previous truncation metadata after full admission", () => {
-    const table = buildFairOutputTable("abc", 3, true);
-    const cap = zeroTextSerialisedBytes + table.prefixes.at(-1)!.serialisedDeltaBytes;
+    const table = buildFairOutputTable("abc", utf8Bytes(3), true);
+    const cap = utf8Bytes(zeroTextSerialisedBytes + table.prefixes.at(-1)!.serialisedDeltaBytes);
 
     const allocation = allocateFairOutputs([table], zeroTextSerialisedBytes, cap);
 
     expect(allocation.prefixIndices).toEqual([table.prefixes.length - 1]);
-    expect(allocation.retainedBytes).toEqual([3]);
+    expect(allocation.retainedBytes.map(Number)).toEqual([3]);
     expect(projectedFairCompletion("abc", 3, true)).toMatchObject({ output: { truncated: true } });
     expectFairAllocationWithinCap(allocation.prefixIndices, [table], zeroTextSerialisedBytes, cap);
   });
@@ -1052,7 +1069,7 @@ describe("nominal max-min allocation", () => {
   test("is deterministic across repeated calls and does not mutate inputs", () => {
     const tables = [fairTable("😀".repeat(10)), fairTable("x".repeat(100)), fairTable("")];
     const before = JSON.stringify(tables);
-    const cap = zeroTextSerialisedBytes + 31;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 31);
 
     const first = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
     const second = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
@@ -1065,24 +1082,24 @@ describe("nominal max-min allocation", () => {
   test("returns zero-text bytes unchanged for zero outputs and empty outputs", () => {
     const emptyTable = fairTable("");
 
-    const noOutputs = allocateFairOutputs([], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
-    const emptyOutput = allocateFairOutputs([emptyTable], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
+    const noOutputs = allocateFairOutputs([], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
+    const emptyOutput = allocateFairOutputs([emptyTable], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
 
     expect(noOutputs).toEqual({ prefixIndices: [], retainedBytes: [], serialisedBytes: zeroTextSerialisedBytes });
-    expect(emptyOutput).toEqual({ prefixIndices: [0], retainedBytes: [0], serialisedBytes: zeroTextSerialisedBytes });
-    expectFairAllocationWithinCap(noOutputs.prefixIndices, [], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
-    expectFairAllocationWithinCap(emptyOutput.prefixIndices, [emptyTable], zeroTextSerialisedBytes, zeroTextSerialisedBytes + 10);
+    expect(emptyOutput as unknown).toEqual({ prefixIndices: [0], retainedBytes: [0], serialisedBytes: zeroTextSerialisedBytes });
+    expectFairAllocationWithinCap(noOutputs.prefixIndices, [], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
+    expectFairAllocationWithinCap(emptyOutput.prefixIndices, [emptyTable], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
   });
 
   test("throws stable internal_error when zero text exceeds the cap", () => {
-    expect(() => allocateFairOutputs([], zeroTextSerialisedBytes, zeroTextSerialisedBytes - 1))
+    expect(() => allocateFairOutputs([], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes - 1)))
       .toThrow("internal_error: internal agent result is invalid");
   });
 
   test("reports bounded full checks, searches, and admitted slack transitions", () => {
     const tables = [fairTable("a"), fairTable(""), fairTable("😀".repeat(20)), fairTable("é".repeat(20)), fairTable("z".repeat(100))];
     const stats: FairAllocationStats = { fullAdmissionChecks: 0, prefixSearches: 0, slackTransitions: 0 };
-    const cap = zeroTextSerialisedBytes + 32;
+    const cap = utf8Bytes(zeroTextSerialisedBytes + 32);
 
     const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap, stats);
 
@@ -1127,7 +1144,7 @@ interface ReceiveBoundaryContent {
 function receiveFixture(texts: readonly string[]): ReceiveBoundaryFixture {
   return {
     completions: texts.map((text, index) => {
-      const retainedBytes = Buffer.byteLength(text, "utf8");
+      const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
       return {
         agentId: `agent-${index}`,
         runId: (index + 1).toString(16).padStart(8, "0"),
@@ -1167,7 +1184,7 @@ function expectProviderBoundedResult(
 }
 
 function fairTable(text: string, previouslyTruncated = false) {
-  return buildFairOutputTable(text, Buffer.byteLength(text, "utf8"), previouslyTruncated);
+  return buildFairOutputTable(text, utf8Bytes(Buffer.byteLength(text, "utf8")), previouslyTruncated);
 }
 
 function selectedDeltas(prefixIndices: readonly number[], tables: readonly ReturnType<typeof fairTable>[]): number[] {
@@ -1177,8 +1194,8 @@ function selectedDeltas(prefixIndices: readonly number[], tables: readonly Retur
 function expectFairAllocationWithinCap(
   prefixIndices: readonly number[],
   tables: readonly ReturnType<typeof fairTable>[],
-  zeroTextSerialisedBytes: number,
-  cap: number,
+  zeroTextSerialisedBytes: Utf8Bytes,
+  cap: Utf8Bytes,
 ): void {
   const measured = zeroTextSerialisedBytes
     + selectedDeltas(prefixIndices, tables).reduce((total, delta) => total + delta, 0);
@@ -1186,7 +1203,7 @@ function expectFairAllocationWithinCap(
 }
 
 function projectedFairCompletion(text: string, originalRetainedBytes: number, previouslyTruncated: boolean): object {
-  const retainedBytes = Buffer.byteLength(text, "utf8");
+  const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
   return {
     output: {
       text,
@@ -1266,10 +1283,10 @@ function failingTransport(
   // the prompt, and after it) are distinguishable only by that argument.
   return {
     ...base,
-    ready: async () => { if (seam === "ready") throw thrown; },
+    ready: async () => { if (seam === "ready") throw thrown; return base.ready(); },
     persistLaunchRequested: async () => { if (seam === "persistLaunchRequested") throw thrown; },
     start: async () => { if (seam === "start") throw thrown; },
-    getEntries: async (since?: string | null) => {
+    getEntries: async (since) => {
       if (since === undefined && seam === "getEntriesBefore") throw thrown;
       if (since !== undefined && seam === "getEntriesAfter") throw thrown;
       return base.getEntries(since);

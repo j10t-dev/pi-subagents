@@ -13,7 +13,7 @@
  * alt+t opens a self-owned modal "selector" that records ownership of its own Down — the
  * non-vacuous interference control.
  *
- * NOTE (reconciled empirically, both versions): pi.registerShortcut() does NOT override a
+ * NOTE (reconciled empirically against the current global Pi API): pi.registerShortcut() does NOT override a
  * default keybinding — a shortcut bound to an already-bound key (e.g. ctrl+g = app.editor.external,
  * ctrl+t = thinking toggle) never fires; the built-in action wins. The spike therefore binds
  * default-free keys alt+t / alt+g (sent as ESC-prefixed bytes "\x1bt"/"\x1bg"). See docs/keybindings.md.
@@ -22,7 +22,7 @@
  * ctx.ui.custom() + onHandle + handle.focus()/unfocus(), setWidget, registerShortcut.
  * No private focusedComponent access.
  *
- * Reconciled against the installed .d.ts for both 0.80.6 and 0.80.10 (identical surfaces):
+ * Reconciled against the installed global Pi .d.ts:
  * - CustomEditor(tui, theme, keybindings, options?) — 4-arg constructor, tui first.
  * - ctx.ui.getEditorComponent(): EditorFactory | undefined — returns the FACTORY, invoked here
  *   to build the composed base instance (not a component instance as an earlier draft assumed).
@@ -95,7 +95,7 @@ const factory: ExtensionFactory = (pi) => {
     if (ctx.mode !== "tui") return;
 
     // Display-only widget standing in for the eventual agent board; not a focus target. Its
-    // presence in the PTY log confirms setWidget(...belowEditor) renders on this version.
+    // presence in the PTY log confirms setWidget(...belowEditor) renders on the current Pi API.
     ctx.ui.setWidget("focus-spike-board", ["Subagents", "  A1 board row one"], { placement: "belowEditor" });
 
     // Self-owned interference control, available in both modes.

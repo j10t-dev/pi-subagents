@@ -3,7 +3,6 @@ import { isAbsolute } from "node:path";
 
 import type { ResolveCliModelResult, SessionEntry } from "@earendil-works/pi-coding-agent";
 
-import { MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
 import type { ContainmentDescriptor } from "./containment.ts";
 
 // --- Brands ---------------------------------------------------------------
@@ -17,9 +16,15 @@ export type AgentId = Brand<string, "PiSessionId">;
 export type SessionEntryId = Brand<string, "PiSessionEntryId">;
 export type RunId = SessionEntryId & Brand<string, "AssignmentUserMessageEntryId">;
 export type RpcRequestId = Brand<string, "RpcRequestId">;
+export type UIRequestId = Brand<string, "UIRequestId">;
 export type RunAttemptId = Brand<string, "RunAttemptId">;
+export type ProviderId = Brand<string, "ProviderId">;
+export type ModelId = Brand<string, "ModelId">;
+export type ToolName = Brand<string, "ToolName">;
 export type ModelSpec = Brand<string, "PiCliModelSpec">;
 export type AbsolutePath = Brand<string, "AbsolutePath">;
+export type CgroupScopePath = AbsolutePath & Brand<string, "CgroupScopePath">;
+export type ObservationSnapshotPath = AbsolutePath & Brand<string, "ObservationSnapshotPath">;
 export type SessionPath = AbsolutePath & Brand<string, "ContainedSessionFile">;
 export type OutputPath = AbsolutePath & Brand<string, "OutputFileLocation">;
 export type CommittedOutputPath = OutputPath & Brand<string, "CommittedOutputFile">;
@@ -29,6 +34,13 @@ export type VerifiedContainmentReceiptPath = ContainmentReceiptPath &
   Brand<string, "VerifiedContainmentReceipt">;
 export type Milliseconds = Brand<number, "Milliseconds">;
 export type Utf8Bytes = Brand<number, "Utf8Bytes">;
+export type Utf16CodeUnitOffset = Brand<number, "Utf16CodeUnitOffset">;
+export type DelegationDepth = Brand<number, "DelegationDepth">;
+export type RunCapacity = Brand<number, "RunCapacity">;
+export type ProcessCount = Brand<number, "ProcessCount">;
+export type ProcessId = Brand<number, "ProcessId">;
+export type ProcessGroupId = Brand<number, "ProcessGroupId">;
+export type ObservationRevision = Brand<number, "ObservationRevision">;
 
 /** Canonical identity for state belonging to one agent run. Native entry IDs are session-local. */
 export type AgentRunKey = Brand<string, "AgentRunKey">;
@@ -86,6 +98,24 @@ export function runIdFromEntry(entry: EntryLike): RunId | undefined {
   return entry.id as RunId;
 }
 
+export function createRpcRequestId(): RpcRequestId {
+  return rpcRequestId(randomUUID());
+}
+
+export function rpcRequestId(value: string): RpcRequestId {
+  if (value.length === 0) {
+    throw new Error("protocol_error: rpc request id must be non-empty");
+  }
+  return value as RpcRequestId;
+}
+
+export function uiRequestId(value: string): UIRequestId {
+  if (value.length === 0) {
+    throw new Error("protocol_error: ui request id must be non-empty");
+  }
+  return value as UIRequestId;
+}
+
 export function createRunAttemptId(): RunAttemptId {
   return randomUUID() as RunAttemptId;
 }
@@ -110,26 +140,116 @@ export function verifiedContainmentReceiptPath(path: ContainmentReceiptPath): Ve
   return path as VerifiedContainmentReceiptPath;
 }
 
-export function modelSpec(value: string): ModelSpec {
-  if (value.trim().length === 0) {
-    throw new Error("invalid_input: model spec must be non-empty");
+const ASCII_CONTROL_PATTERN = /[\u0000-\u001f\u007f]/u;
+const MAX_TOOL_NAME_BYTES = 256;
+
+export function providerId(value: string): ProviderId {
+  if (value.length === 0 || value.trim() !== value || value.includes("/") || ASCII_CONTROL_PATTERN.test(value)) {
+    throw new Error(`invalid_input: invalid provider id: ${JSON.stringify(value)}`);
   }
-  return value as ModelSpec;
+  return value as ProviderId;
+}
+
+export function modelId(value: string): ModelId {
+  if (value.length === 0 || value.trim() !== value || ASCII_CONTROL_PATTERN.test(value)) {
+    throw new Error(`invalid_input: invalid model id: ${JSON.stringify(value)}`);
+  }
+  return value as ModelId;
+}
+
+export function toolName(value: string): ToolName {
+  if (value.length === 0 || new TextEncoder().encode(value).byteLength > MAX_TOOL_NAME_BYTES ||
+      ASCII_CONTROL_PATTERN.test(value)) {
+    throw new Error(`invalid_input: invalid tool name: ${JSON.stringify(value)}`);
+  }
+  return value as ToolName;
+}
+
+export function modelSpecFrom(provider: ProviderId, model: ModelId): ModelSpec {
+  return `${provider}/${model}` as ModelSpec;
+}
+
+export function modelSpec(value: string): ModelSpec {
+  const slash = value.indexOf("/");
+  if (slash === -1) {
+    throw new Error("invalid_input: model spec must contain provider and model id");
+  }
+  return modelSpecFrom(providerId(value.slice(0, slash)), modelId(value.slice(slash + 1)));
+}
+
+export function modelSpecParts(value: ModelSpec): { readonly provider: ProviderId; readonly modelId: ModelId } {
+  const slash = value.indexOf("/");
+  return {
+    provider: providerId(value.slice(0, slash)),
+    modelId: modelId(value.slice(slash + 1)),
+  };
 }
 
 export function milliseconds(value: number): Milliseconds {
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`invalid_input: milliseconds must be a non-negative integer: ${value}`);
-  }
+  requireNonnegativeSafeInteger(value, "milliseconds");
   return value as Milliseconds;
 }
 
 export function utf8Bytes(value: number): Utf8Bytes {
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`invalid_input: byte count must be a non-negative integer: ${value}`);
-  }
+  requireNonnegativeSafeInteger(value, "byte count");
   return value as Utf8Bytes;
 }
+
+export function utf16CodeUnitOffset(value: number): Utf16CodeUnitOffset {
+  requireNonnegativeSafeInteger(value, "UTF-16 code unit offset");
+  return value as Utf16CodeUnitOffset;
+}
+
+export function delegationDepth(value: number): DelegationDepth {
+  requireNonnegativeSafeInteger(value, "delegation depth");
+  return value as DelegationDepth;
+}
+
+export function nextDelegationDepth(value: DelegationDepth): DelegationDepth {
+  return delegationDepth(value + 1);
+}
+
+export function runCapacity(value: number): RunCapacity {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`invalid_input: run capacity must be a positive safe integer: ${value}`);
+  }
+  return value as RunCapacity;
+}
+
+export function processCount(value: number): ProcessCount {
+  requireNonnegativeSafeInteger(value, "process count");
+  return value as ProcessCount;
+}
+
+export function processId(value: number): ProcessId {
+  requirePositiveSafeInteger(value, "process id");
+  return value as ProcessId;
+}
+
+export function processGroupId(value: number): ProcessGroupId {
+  requirePositiveSafeInteger(value, "process group id");
+  return value as ProcessGroupId;
+}
+
+export function observationRevision(value: number): ObservationRevision {
+  requireNonnegativeSafeInteger(value, "observation revision");
+  return value as ObservationRevision;
+}
+
+function requirePositiveSafeInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`invalid_input: ${label} must be a positive safe integer: ${value}`);
+  }
+}
+
+function requireNonnegativeSafeInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`invalid_input: ${label} must be a non-negative safe integer: ${value}`);
+  }
+}
+
+/** Maximum UTF-8 bytes retained per persisted or model-visible error message. */
+export const MAX_ERROR_MESSAGE_BYTES = utf8Bytes(10_000);
 
 // --- State/completion/error/cancellation literals --------------------------
 
@@ -325,6 +445,18 @@ export interface CancelledCompletion extends CompletionBase {
 
 export type AgentCompletion = CompletedCompletion | FailedCompletion | CancelledCompletion;
 
+export interface RestorableCompletionBase extends Omit<CompletionBase, "outputPath"> {
+  outputPath: OutputPath;
+}
+
+export type RestorableAgentCompletion =
+  | (RestorableCompletionBase & { state: typeof CompletionState.Completed })
+  | (RestorableCompletionBase & { state: typeof CompletionState.Failed; error: AgentError })
+  | (RestorableCompletionBase & {
+      state: typeof CompletionState.Cancelled;
+      reason: CancellationReason;
+    });
+
 const STABLE_ERROR_MESSAGES: Record<AgentErrorCode, string> = {
   [AgentErrorCode.InvalidInput]: "invalid input",
   [AgentErrorCode.InvalidAgent]: "unknown or unowned agent",
@@ -367,33 +499,33 @@ export function codedErrorToAgentError(error: CodedError): AgentError {
  * Truncates `text` to a valid UTF-8 prefix of at most `maxBytes` bytes. Never splits a
  * multi-byte UTF-8 sequence.
  */
-export function truncateUtf8(text: string, maxBytes: number): CompletionOutput {
+export function truncateUtf8(text: string, maxBytes: Utf8Bytes): CompletionOutput {
   const encoded = new TextEncoder().encode(text);
-  const originalBytes = encoded.byteLength;
+  const originalBytes = utf8Bytes(encoded.byteLength);
   if (originalBytes <= maxBytes) {
     return {
       text,
-      originalBytes: originalBytes as Utf8Bytes,
-      retainedBytes: originalBytes as Utf8Bytes,
+      originalBytes,
+      retainedBytes: originalBytes,
       truncated: false,
     };
   }
-  const prefix = encoded.subarray(0, Math.max(0, maxBytes));
+  const prefix = encoded.subarray(0, maxBytes);
   const decoded = new TextDecoder("utf-8", { fatal: false }).decode(prefix, { stream: true });
-  const retainedBytes = new TextEncoder().encode(decoded).byteLength;
+  const retainedBytes = utf8Bytes(new TextEncoder().encode(decoded).byteLength);
   return {
     text: decoded,
-    originalBytes: originalBytes as Utf8Bytes,
-    retainedBytes: retainedBytes as Utf8Bytes,
+    originalBytes,
+    retainedBytes,
     truncated: true,
   };
 }
 
 /** Keeps the newest complete UTF-8 code points within `maxBytes`. */
-export function retainUtf8Tail(text: string, maxBytes: number): string {
+export function retainUtf8Tail(text: string, maxBytes: Utf8Bytes): string {
   const encoded = new TextEncoder().encode(text);
   if (encoded.byteLength <= maxBytes) return text;
-  let start = encoded.byteLength - Math.max(0, maxBytes);
+  let start = encoded.byteLength - maxBytes;
   while (start < encoded.byteLength && (encoded[start]! & 0xc0) === 0x80) start++;
   return new TextDecoder("utf-8", { fatal: true }).decode(encoded.subarray(start));
 }
@@ -404,10 +536,10 @@ export interface SpawnedPayload {
   agentId: AgentId;
   sessionPath: SessionPath;
   cwd: AbsolutePath;
-  provider: string;
-  modelId: ModelSpec;
+  provider: ProviderId;
+  modelId: ModelId;
   thinkingLevel: ThinkingLevel;
-  tools: readonly string[];
+  tools: readonly ToolName[];
 }
 
 export interface RunLaunchRequestedPayloadV1 {

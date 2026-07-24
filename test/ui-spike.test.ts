@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { agentId } from "../src/domain.ts";
+import { agentId, uiRequestId } from "../src/domain.ts";
 import type { WireExtensionUIDialog as WireExtensionUIRequest } from "../src/schemas.ts";
 import { UIForwarder } from "../src/ui-forwarder.ts";
 import type { ExtensionUIContextLike } from "../src/ui-forwarder.ts";
@@ -31,26 +31,26 @@ describe("UIForwarder (direct forwarding, per real-Pi spike result)", () => {
     const forwarder = new UIForwarder({ hasUI: true, ui });
     const request: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-1",
+      id: uiRequestId("req-1"),
       method: "select",
       title: "Pick one",
       options: ["a", "b"],
     };
     const outcome = await forwarder.forward(agentId("agent-1"), request, RUN_SIGNAL);
-    expect(outcome).toEqual({ type: "extension_ui_response", id: "req-1", value: "b" });
+    expect(outcome).toEqual({ type: "extension_ui_response", id: uiRequestId("req-1"), value: "b" });
   });
 
   test("reports cancellation as cancelled:true rather than a value", async () => {
     const forwarder = new UIForwarder({ hasUI: true, ui: fakeUi() });
     const request: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-2",
+      id: uiRequestId("req-2"),
       method: "select",
       title: "Pick one",
       options: ["a", "b"],
     };
     const outcome = await forwarder.forward(agentId("agent-1"), request, RUN_SIGNAL);
-    expect(outcome).toEqual({ type: "extension_ui_response", id: "req-2", cancelled: true });
+    expect(outcome).toEqual({ type: "extension_ui_response", id: uiRequestId("req-2"), cancelled: true });
   });
 
   test("forwards a confirm request and reports the boolean result", async () => {
@@ -58,13 +58,13 @@ describe("UIForwarder (direct forwarding, per real-Pi spike result)", () => {
     const forwarder = new UIForwarder({ hasUI: true, ui });
     const request: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-3",
+      id: uiRequestId("req-3"),
       method: "confirm",
       title: "Proceed?",
       message: "Are you sure?",
     };
     const outcome = await forwarder.forward(agentId("agent-1"), request, RUN_SIGNAL);
-    expect(outcome).toEqual({ type: "extension_ui_response", id: "req-3", confirmed: true });
+    expect(outcome).toEqual({ type: "extension_ui_response", id: uiRequestId("req-3"), confirmed: true });
   });
 
   test("forwards an input request and reports the typed value", async () => {
@@ -72,12 +72,12 @@ describe("UIForwarder (direct forwarding, per real-Pi spike result)", () => {
     const forwarder = new UIForwarder({ hasUI: true, ui });
     const request: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-4",
+      id: uiRequestId("req-4"),
       method: "input",
       title: "Name?",
     };
     const outcome = await forwarder.forward(agentId("agent-1"), request, RUN_SIGNAL);
-    expect(outcome).toEqual({ type: "extension_ui_response", id: "req-4", value: "typed value" });
+    expect(outcome).toEqual({ type: "extension_ui_response", id: uiRequestId("req-4"), value: "typed value" });
   });
 
   test("forwards an editor request and reports the edited value", async () => {
@@ -91,12 +91,12 @@ describe("UIForwarder (direct forwarding, per real-Pi spike result)", () => {
     const forwarder = new UIForwarder({ hasUI: true, ui });
     const request: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-5",
+      id: uiRequestId("req-5"),
       method: "editor",
       title: "Edit",
     };
     const outcome = await forwarder.forward(agentId("agent-1"), request, RUN_SIGNAL);
-    expect(outcome).toEqual({ type: "extension_ui_response", id: "req-5", value: "edited value" });
+    expect(outcome).toEqual({ type: "extension_ui_response", id: uiRequestId("req-5"), value: "edited value" });
     expect(calls).toEqual([["[agent-1] Edit", undefined]]);
   });
 
@@ -104,25 +104,25 @@ describe("UIForwarder (direct forwarding, per real-Pi spike result)", () => {
     const forwarder = new UIForwarder({ hasUI: true, ui: fakeUi() });
     const outcome = await forwarder.forward(agentId("agent-1"), {
       type: "extension_ui_request",
-      id: "req-editor-cancel",
+      id: uiRequestId("req-editor-cancel"),
       method: "editor",
       title: "Edit",
       prefill: "original",
     }, RUN_SIGNAL);
-    expect(outcome).toEqual({ type: "extension_ui_response", id: "req-editor-cancel", cancelled: true });
+    expect(outcome).toEqual({ type: "extension_ui_response", id: uiRequestId("req-editor-cancel"), cancelled: true });
   });
 
   test("cancels every request immediately when the parent context has no UI", async () => {
     const forwarder = new UIForwarder({ hasUI: false, ui: fakeUi() });
     const request: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-6",
+      id: uiRequestId("req-6"),
       method: "confirm",
       title: "Proceed?",
       message: "no ui here",
     };
     const outcome = await forwarder.forward(agentId("agent-1"), request, RUN_SIGNAL);
-    expect(outcome).toEqual({ type: "extension_ui_response", id: "req-6", cancelled: true });
+    expect(outcome).toEqual({ type: "extension_ui_response", id: uiRequestId("req-6"), cancelled: true });
   });
 
   test("labels the dialog title with the owning agent id", async () => {
@@ -136,7 +136,7 @@ describe("UIForwarder (direct forwarding, per real-Pi spike result)", () => {
     const forwarder = new UIForwarder({ hasUI: true, ui });
     const request: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-7",
+      id: uiRequestId("req-7"),
       method: "confirm",
       title: "Proceed?",
       message: "msg",
@@ -164,14 +164,14 @@ describe("UIForwarder (direct forwarding, per real-Pi spike result)", () => {
     const forwarder = new UIForwarder({ hasUI: true, ui });
     const requestA: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-a",
+      id: uiRequestId("req-a"),
       method: "confirm",
       title: "A",
       message: "m",
     };
     const requestB: WireExtensionUIRequest = {
       type: "extension_ui_request",
-      id: "req-b",
+      id: uiRequestId("req-b"),
       method: "confirm",
       title: "B",
       message: "m",

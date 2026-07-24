@@ -4,10 +4,12 @@ import extension, { buildProductionControllerOptions, createPiSubagentsExtension
 import { parseExtensionLaunchContext } from "../src/delegation-policy.ts";
 import { withProductionContainmentPreflight } from "../src/pi-composition.ts";
 import type { ContainmentBackend } from "../src/containment.ts";
+import { delegationDepth, runCapacity, type AbsolutePath } from "../src/domain.ts";
 import { absolutePath } from "../src/paths.ts";
 import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
 import { deferred } from "./support/async.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
+import { testAbsolutePath } from "./support/brands.ts";
 
 interface HarnessContext {
   statuses: Array<string | undefined>;
@@ -187,7 +189,7 @@ describe("Pi subagents extension", () => {
   test.each(invalidContexts)("routes %s invalid metadata through registration wiring", async (_label, env) => {
     const parsed = parseExtensionLaunchContext(env);
     expect(parsed.kind).toBe("invalid");
-    const registration = registrationForLaunchContext(parsed, 1);
+    const registration = registrationForLaunchContext(parsed, delegationDepth(1));
     expect(registration.enabled).toBe(false);
     if (registration.enabled) throw new Error("invalid metadata must disable registration");
     expect(typeof registration.diagnostic).toBe("string");
@@ -211,11 +213,11 @@ describe("Pi subagents extension", () => {
 
   test("zero-depth roots, maximum-depth descendants, and legacy children register nothing", () => {
     const registrations = [
-      registrationForLaunchContext(parseExtensionLaunchContext({}), 0),
+      registrationForLaunchContext(parseExtensionLaunchContext({}), delegationDepth(0)),
       registrationForLaunchContext(parseExtensionLaunchContext({
         PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "2", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1",
-      }), 1),
-      registrationForLaunchContext(parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1" }), 1),
+      }), delegationDepth(1)),
+      registrationForLaunchContext(parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1" }), delegationDepth(1)),
     ];
     for (const registration of registrations) {
       const h = harness();
@@ -228,10 +230,10 @@ describe("Pi subagents extension", () => {
 
   test("a root at the explicit default and a descendant below its maximum register tools", () => {
     const registrations = [
-      registrationForLaunchContext(parseExtensionLaunchContext({}), 1),
+      registrationForLaunchContext(parseExtensionLaunchContext({}), delegationDepth(1)),
       registrationForLaunchContext(parseExtensionLaunchContext({
         PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1",
-      }), 1),
+      }), delegationDepth(1)),
     ];
     for (const registration of registrations) {
       const h = harness();
@@ -383,12 +385,31 @@ describe("Pi subagents extension", () => {
     expect(ctx.statuses.at(-1)).toBe("agents: 0 running, 1 result ready");
   });
 
-  test("passes configured cgroup roots only to root production controllers", () => {
+  test("passes configured absolute roots only to root production controllers", () => {
+    const rootOptions = buildProductionControllerOptions(
+      testAbsolutePath("/agent"),
+      {
+        maxConcurrentRuns: runCapacity(4),
+        maxDepth: delegationDepth(2),
+        cgroupRoot: testAbsolutePath("/sys/fs/cgroup/delegated"),
+      },
+      delegationDepth(0),
+      () => {},
+    );
+    const stateRoot: AbsolutePath = rootOptions.stateRoot;
+    const cgroupRoot: AbsolutePath | undefined = rootOptions.cgroupRoot;
+    expect(String(stateRoot)).toBe("/agent/pi-subagents");
+    expect(String(cgroupRoot)).toBe("/sys/fs/cgroup/delegated");
+    expect(rootOptions).toMatchObject({ cgroupRoot: "/sys/fs/cgroup/delegated", currentDepth: 0 });
     expect(buildProductionControllerOptions(
-      "/agent", { maxConcurrentRuns: 4, maxDepth: 2, cgroupRoot: "/sys/fs/cgroup/delegated" }, 0, () => {},
-    )).toMatchObject({ cgroupRoot: "/sys/fs/cgroup/delegated", currentDepth: 0 });
-    expect(buildProductionControllerOptions(
-      "/agent", { maxConcurrentRuns: 4, maxDepth: 2, cgroupRoot: "/sys/fs/cgroup/delegated" }, 1, () => {},
+      testAbsolutePath("/agent"),
+      {
+        maxConcurrentRuns: runCapacity(4),
+        maxDepth: delegationDepth(2),
+        cgroupRoot: testAbsolutePath("/sys/fs/cgroup/delegated"),
+      },
+      delegationDepth(1),
+      () => {},
     )).not.toHaveProperty("cgroupRoot");
   });
 

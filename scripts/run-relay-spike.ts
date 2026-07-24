@@ -7,39 +7,33 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
-import { agentId } from "../src/domain.ts";
+import { agentId, milliseconds, type Milliseconds } from "../src/domain.ts";
+import { absolutePath } from "../src/paths.ts";
 import { readKnownChildSnapshots, type ObservationSnapshotV1 } from "../src/observation-snapshot-path.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = join(HERE, "..", "test", "fixtures", "relay-spike-extension");
-const LOCAL_CLI = join(HERE, "..", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-
-function argValue(flag: string, fallback: string): string {
-  const index = process.argv.indexOf(flag);
-  return index === -1 ? fallback : (process.argv[index + 1] ?? fallback);
-}
 
 async function main(): Promise<void> {
-  const version = argValue("--pi", "global");
   const workDir = mkdtempSync(join(tmpdir(), "pi-relay-spike-"));
-  const agentDir = join(workDir, "agent");
+  const agentDir = absolutePath(join(workDir, "agent"));
+  const primitiveAgentDir: string = agentDir;
   const sessionDir = join(workDir, "session");
-  const extDir = join(agentDir, "extensions", "relay-spike");
+  const extDir = join(primitiveAgentDir, "extensions", "relay-spike");
   mkdirSync(extDir, { recursive: true });
   mkdirSync(sessionDir, { recursive: true });
   // The fixture is self-contained (no src import), so copy only the fixture into the autoload dir.
   cpSync(FIXTURE_DIR, extDir, { recursive: true });
 
-  const piBase = version === "0.80.6" ? ["node", LOCAL_CLI] : ["pi"];
   const args = [
-    ...piBase.slice(1), "--mode", "rpc", "--session-dir", sessionDir,
+    "--mode", "rpc", "--session-dir", sessionDir,
     "--offline", "--no-context-files", "--no-skills", "--no-prompt-templates", "--approve",
   ];
-  const child = spawn(piBase[0]!, args, {
+  const child = spawn("pi", args, {
     cwd: workDir,
     env: {
       ...process.env,
-      PI_CODING_AGENT_DIR: agentDir,
+      PI_CODING_AGENT_DIR: primitiveAgentDir,
       PI_SUBAGENT_CHILD: "1",
       PI_SUBAGENT_DEPTH: "1",
       PI_SUBAGENT_MAX_DEPTH: "2",
@@ -66,9 +60,9 @@ async function main(): Promise<void> {
   // Everything after spawn runs under a single finally so no exit path — success, UNSUPPORTED,
   // or a thrown error — leaks the RPC child or the temp dir.
   try {
-    await Bun.sleep(1000);
+    await sleep(milliseconds(1_000));
     child.stdin.write(`${JSON.stringify({ type: "get_state" })}\n`);
-    await waitUntil(() => sessionId !== undefined, 10_000);
+    await waitUntil(() => sessionId !== undefined, milliseconds(10_000));
     if (sessionId === undefined) { console.log(`RPC_RELAY_UNSUPPORTED: no sessionId from get_state; stderr=${stderr.slice(0, 300)}`); return; }
 
     // revision 1 is written from session_start and needs no model turn: it alone proves autoload
@@ -79,26 +73,36 @@ async function main(): Promise<void> {
     const childId = agentId(sessionId);
     let best: ObservationSnapshotV1 | undefined;
     let lastSkip: string | undefined;
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + milliseconds(30_000);
     while (Date.now() < deadline) {
       const result = readKnownChildSnapshots(agentDir, [childId]);
       const snap = result.snapshots.get(childId);
       if (snap !== undefined) { best = snap; if (snap.revision >= 2) break; }
       else lastSkip = result.skipped.get(childId);
-      await Bun.sleep(100);
+      await sleep(milliseconds(100));
     }
     if (best === undefined) { console.log(`RPC_RELAY_UNSUPPORTED: relay did not publish a discoverable snapshot for ${sessionId} (last skip reason: ${lastSkip ?? "none"})`); return; }
     // Negative control: an unknown session id must NOT be discovered.
     if (readKnownChildSnapshots(agentDir, [agentId("definitely-not-a-child")]).snapshots.size !== 0) {
       console.log(`RPC_RELAY_UNSUPPORTED: discovery returned an unknown-id snapshot`); return;
     }
-    process.stderr.write(`relay snapshot: ${JSON.stringify(best)}\n`);
-    console.log(`RPC_RELAY_SUPPORTED revision=${best.revision}`);
+    const primitiveSessionId: string = best.sessionId;
+    const primitiveRevision: number = best.revision;
+    const snapshotWire = {
+      version: best.version,
+      sessionId: primitiveSessionId,
+      revision: primitiveRevision,
+      agents: best.agents,
+    };
+    process.stderr.write(`relay snapshot: ${JSON.stringify(snapshotWire)}\n`);
+    console.log(`RPC_RELAY_SUPPORTED revision=${primitiveRevision}`);
   } finally {
     try { child.stdin.write(`${JSON.stringify({ type: "shutdown" })}\n`); } catch { /* stdin may be closed */ }
     child.kill("SIGTERM");
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 2_000);
+      const shutdownTimeout = milliseconds(2_000);
+      const primitiveShutdownTimeout: number = shutdownTimeout;
+      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, primitiveShutdownTimeout);
       child.once("exit", () => { clearTimeout(timer); resolve(); });
     });
     rl.close();
@@ -106,9 +110,17 @@ async function main(): Promise<void> {
   }
 }
 
-async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<void> {
+async function waitUntil(predicate: () => boolean, timeoutMs: Milliseconds): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) { if (predicate()) return; await Bun.sleep(50); }
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await sleep(milliseconds(50));
+  }
+}
+
+function sleep(duration: Milliseconds): Promise<void> {
+  const primitiveDuration: number = duration;
+  return Bun.sleep(primitiveDuration);
 }
 
 await main();

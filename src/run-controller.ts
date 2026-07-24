@@ -6,6 +6,7 @@ import {
   CodedError,
   terminalFailureCause,
   type AgentId,
+  type RunCapacity,
   type RunId,
   type SessionPath,
   type TerminalFailureCause,
@@ -238,7 +239,7 @@ export function classifyTerminal(observation: TerminalObservation, controllerSto
 }
 
 export interface RunControllerOptions {
-  capacity: number;
+  capacity: RunCapacity;
   onReserve?: () => void;
   onStopping?: (record: Readonly<RunRecord>, reason: CancellationReason) => void | Promise<void>;
   onTerminal?: (record: Readonly<RunRecord>, settlement: Settlement) => RunId | void | Promise<RunId | void>;
