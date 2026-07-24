@@ -6,11 +6,17 @@ import { Value } from "typebox/value";
 import {
   truncateUtf8,
   retainUtf8Tail,
+  utf8Bytes,
+  type AbsolutePath,
+  type AgentCompletion,
   type CommittedOutputPath,
   type CompletionOutput,
+  type OutputPath,
+  type RestorableAgentCompletion,
   type RunAttemptId,
   type RunId,
   type SessionPath,
+  type Utf8Bytes,
 } from "./domain.ts";
 import type { WireAssistantMessage } from "./schemas.ts";
 import { MAX_COMPLETION_OUTPUT_BYTES, MAX_SESSION_RECOVERY_BYTES, MAX_STDERR_TAIL_BYTES } from "./constants.ts";
@@ -31,10 +37,10 @@ export interface TranscriptFileSystem {
 }
 
 export interface OutputStoreOptions {
-  workDir: string;
-  maxOutputBytes?: number;
-  maxTailBytes?: number;
-  maxRecoveryBytes?: number;
+  workDir: AbsolutePath;
+  maxOutputBytes?: Utf8Bytes;
+  maxTailBytes?: Utf8Bytes;
+  maxRecoveryBytes?: Utf8Bytes;
   durableFileSystem?: DurableFileSystem;
   transcriptFileSystem?: TranscriptFileSystem;
 }
@@ -43,19 +49,23 @@ export interface RecoveryFailure { recovered: false; reason: string }
 export interface RecoverySuccess { recovered: true; output: CompletionOutput }
 export type RecoveryResult = RecoveryFailure | RecoverySuccess;
 
-interface PendingPublication {
-  destination: CommittedOutputPath;
-  digest: string;
-  byteLength: number;
-  output: CompletionOutput;
+interface PublicationEvidence {
+  readonly digest: string;
+  readonly byteLength: Utf8Bytes;
+  readonly output: CompletionOutput;
+}
+
+interface PendingPublication extends PublicationEvidence {
+  destination: OutputPath;
   renamed: boolean;
 }
 
 interface RunRecord {
-  committedPath: CommittedOutputPath;
+  destination: OutputPath;
   candidatePath: string | undefined;
   output: CompletionOutput;
   pendingPublication: PendingPublication | undefined;
+  lastPublication: PublicationEvidence | undefined;
   transportIncomplete: boolean;
   transportLossDetected: boolean;
 }
@@ -75,16 +85,16 @@ type AuthoritativeProjection =
 
 const EMPTY_OUTPUT: CompletionOutput = {
   text: "",
-  originalBytes: 0 as CompletionOutput["originalBytes"],
-  retainedBytes: 0 as CompletionOutput["retainedBytes"],
+  originalBytes: utf8Bytes(0),
+  retainedBytes: utf8Bytes(0),
   truncated: false,
 };
 
 /** Tracks candidate output separately from crash-durable authoritative sidecars. */
 export class OutputStore {
-  private readonly workDir: string;
-  private readonly maxOutputBytes: number;
-  private readonly maxRecoveryBytes: number;
+  private readonly workDir: AbsolutePath;
+  private readonly maxOutputBytes: Utf8Bytes;
+  private readonly maxRecoveryBytes: Utf8Bytes;
   private readonly durableFileSystem: DurableFileSystem;
   private readonly transcriptFileSystem: TranscriptFileSystem;
   private readonly attempts = new Map<RunAttemptId, AttemptRecord>();
@@ -92,7 +102,7 @@ export class OutputStore {
   private readonly promotableRuns = new Set<RunId>();
   private stderrTail = "";
   private diagnosticsTail = "";
-  private readonly maxTailBytes: number;
+  private readonly maxTailBytes: Utf8Bytes;
   private stagingDirectoryReady = false;
 
   constructor(options: OutputStoreOptions) {
@@ -152,16 +162,17 @@ export class OutputStore {
     attempt.transportIncomplete = true;
   }
 
-  /** Transfers attempt ownership into an addressable run without fallible committed publication. */
-  adoptRun(attemptId: RunAttemptId, runId: RunId, ownershipTransferred?: () => void): CommittedOutputPath {
+  /** Transfers attempt ownership into an addressable run without claiming durable publication. */
+  adoptRun(attemptId: RunAttemptId, runId: RunId, ownershipTransferred?: () => void): OutputPath {
     if (this.runs.has(runId)) throw new Error(`invalid_state: run ${runId} is already bound`);
     const attempt = this.requireAttempt(attemptId);
-    const committedPath = outputPath(this.workDir, `${runId}.committed`) as CommittedOutputPath;
+    const destination = outputPath(this.workDir, `${runId}.committed`);
     const run: RunRecord = {
-      committedPath,
+      destination,
       candidatePath: undefined,
       output: EMPTY_OUTPUT,
       pendingPublication: undefined,
+      lastPublication: undefined,
       transportIncomplete: true,
       transportLossDetected: true,
     };
@@ -175,48 +186,51 @@ export class OutputStore {
       ? this.durableFileSystem.readFile(run.candidatePath)
       : Buffer.alloc(0);
     const output = attempt.finalised ? attempt.output : EMPTY_OUTPUT;
-    run.pendingPublication = pending(committedPath, candidateBytes, output, false);
+    run.pendingPublication = pending(destination, candidateBytes, output, false);
     run.transportIncomplete = attempt.transportIncomplete;
     run.transportLossDetected = attempt.transportLossDetected;
     if (attempt.finalised) this.promotableRuns.add(runId);
-    return committedPath;
+    return destination;
   }
 
   /** Publishes the initial empty or finalised pre-bind projection after identity is aligned. */
-  publishInitial(runId: RunId): void {
+  publishInitial(runId: RunId): CommittedOutputPath {
     const run = this.requireRun(runId);
     const staged = run.candidatePath === undefined ? undefined : this.durableFileSystem.readFile(run.candidatePath);
     if (this.promotableRuns.has(runId) && staged !== undefined && run.pendingPublication !== undefined && matches(run.pendingPublication, staged)) {
-      this.publishAuthoritative(run, { promotionSource: run.candidatePath! }, run.pendingPublication.output);
+      const committed = this.publishAuthoritative(run, { promotionSource: run.candidatePath! }, run.pendingPublication.output);
       this.promotableRuns.delete(runId);
-    } else {
-      const partialCandidate = run.candidatePath;
-      run.candidatePath = undefined;
-      try { this.publishAuthoritative(run, { data: "" }, EMPTY_OUTPUT); }
-      finally { run.candidatePath = partialCandidate; }
+      return committed;
+    }
+    const partialCandidate = run.candidatePath;
+    run.candidatePath = undefined;
+    try {
+      return this.publishAuthoritative(run, { data: "" }, EMPTY_OUTPUT);
+    } finally {
+      run.candidatePath = partialCandidate;
     }
   }
 
   /** Compatibility boundary for direct store users; RPC binding uses the explicit two phases. */
   bindRun(attemptId: RunAttemptId, runId: RunId): CommittedOutputPath {
-    const path = this.adoptRun(attemptId, runId);
-    this.publishInitial(runId);
-    return path;
+    this.adoptRun(attemptId, runId);
+    return this.publishInitial(runId);
   }
 
-  restoreRun(runId: RunId): CommittedOutputPath {
+  restoreRun(runId: RunId): OutputPath {
     const existing = this.runs.get(runId);
-    if (existing !== undefined) return existing.committedPath;
-    const committedPath = outputPath(this.workDir, `${runId}.committed`) as CommittedOutputPath;
+    if (existing !== undefined) return existing.destination;
+    const destination = outputPath(this.workDir, `${runId}.committed`);
     this.runs.set(runId, {
-      committedPath,
+      destination,
       candidatePath: undefined,
       output: EMPTY_OUTPUT,
       pendingPublication: undefined,
+      lastPublication: undefined,
       transportIncomplete: true,
       transportLossDetected: true,
     });
-    return committedPath;
+    return destination;
   }
 
   onMessageStart(runId: RunId, _message: WireAssistantMessage): void {
@@ -257,7 +271,7 @@ export class OutputStore {
   }
 
   discardPartial(id: RunAttemptId | RunId): void {
-    const attempt = this.attempts.get(id as RunAttemptId);
+    const attempt = getByStringIdentity(this.attempts, id);
     if (attempt !== undefined) {
       if (attempt.finalised) return;
       if (attempt.candidatePath !== undefined) removeIfPresent(attempt.candidatePath);
@@ -267,7 +281,7 @@ export class OutputStore {
       attempt.transportIncomplete = true;
       return;
     }
-    const run = this.runs.get(id as RunId);
+    const run = getByStringIdentity(this.runs, id);
     if (run !== undefined) this.removeCandidate(run);
   }
 
@@ -285,21 +299,66 @@ export class OutputStore {
     }
   }
 
-  ensureDurable(runId: RunId, transcriptPath: SessionPath): { output: CompletionOutput; committedPath: CommittedOutputPath } {
-    const run = this.requireRun(runId);
-    if (!run.transportIncomplete && run.pendingPublication === undefined) {
-      return { output: run.output, committedPath: run.committedPath };
+  restoreCompletion(
+    candidate: RestorableAgentCompletion,
+    transcriptPath: SessionPath,
+  ): AgentCompletion {
+    const expected = outputPath(this.workDir, `${candidate.runId}.committed`);
+    if (normalisedOutputDestination(candidate.outputPath, this.durableFileSystem) !==
+        normalisedOutputDestination(expected, this.durableFileSystem)) {
+      throw new Error("output_error: restored completion destination does not match its managed output path");
     }
 
+    const destinationBytes = readIfPresent(expected, this.durableFileSystem);
+    if (destinationBytes !== undefined && completionEvidenceMatches(candidate.output, destinationBytes, this.maxOutputBytes)) {
+      try {
+        syncPublishedFileSync(expected, this.durableFileSystem);
+        return withRestoredOutput(
+          candidate,
+          candidate.output,
+          committedAfterDurablePublication(expected),
+        );
+      } catch (error) {
+        throw outputError(error);
+      }
+    }
+
+    this.restoreRun(candidate.runId);
+    const durable = this.ensureDurable(candidate.runId, transcriptPath);
+    return withRestoredOutput(candidate, durable.output, durable.committedPath);
+  }
+
+  ensureDurable(runId: RunId, transcriptPath: SessionPath): { output: CompletionOutput; committedPath: CommittedOutputPath } {
+    const run = this.requireRun(runId);
     if (!run.transportIncomplete && run.pendingPublication !== undefined) {
-      const destination = readIfPresent(run.committedPath, this.durableFileSystem);
-      if (destination !== undefined && matches(run.pendingPublication, destination)) {
+      const destinationBytes = readIfPresent(run.destination, this.durableFileSystem);
+      if (destinationBytes !== undefined && matches(run.pendingPublication, destinationBytes)) {
         try {
-          syncPublishedFileSync(run.committedPath, this.durableFileSystem);
-          run.output = run.pendingPublication.output;
+          syncPublishedFileSync(run.destination, this.durableFileSystem);
+          const evidence = publicationEvidence(run.pendingPublication);
+          run.output = evidence.output;
+          run.lastPublication = evidence;
           run.pendingPublication = undefined;
           this.removeCandidate(run);
-          return { output: run.output, committedPath: run.committedPath };
+          return {
+            output: run.output,
+            committedPath: committedAfterDurablePublication(run.destination),
+          };
+        } catch (error) {
+          throw outputError(error);
+        }
+      }
+    }
+
+    if (!run.transportIncomplete && run.pendingPublication === undefined && run.lastPublication !== undefined) {
+      const destinationBytes = readIfPresent(run.destination, this.durableFileSystem);
+      if (destinationBytes !== undefined && matches(run.lastPublication, destinationBytes)) {
+        try {
+          syncPublishedFileSync(run.destination, this.durableFileSystem);
+          return {
+            output: run.lastPublication.output,
+            committedPath: committedAfterDurablePublication(run.destination),
+          };
         } catch (error) {
           throw outputError(error);
         }
@@ -309,10 +368,10 @@ export class OutputStore {
     const projection = this.projectTranscript(runId, transcriptPath);
     if (projection.kind === "failure") throw new Error(`output_error: ${projection.reason}`);
     try {
-      this.publishAuthoritative(run, { data: projection.text }, projection.output);
+      const committedPath = this.publishAuthoritative(run, { data: projection.text }, projection.output);
       run.transportLossDetected = false;
       run.transportIncomplete = false;
-      return { output: run.output, committedPath: run.committedPath };
+      return { output: run.output, committedPath };
     } catch (error) {
       throw outputError(error);
     }
@@ -327,22 +386,24 @@ export class OutputStore {
     run: RunRecord,
     source: { data: string } | { promotionSource: string },
     output: CompletionOutput,
-  ): void {
+  ): CommittedOutputPath {
     const bytes = "data" in source ? Buffer.from(source.data) : this.durableFileSystem.readFile(source.promotionSource);
-    run.pendingPublication = pending(run.committedPath, bytes, output, false);
+    run.pendingPublication = pending(run.destination, bytes, output, false);
     try {
-      publishCommittedSync({ destination: run.committedPath, ...source }, this.durableFileSystem);
+      publishCommittedSync({ destination: run.destination, ...source }, this.durableFileSystem);
     } catch (error) {
-      const visible = readIfPresent(run.committedPath, this.durableFileSystem);
+      const visible = readIfPresent(run.destination, this.durableFileSystem);
       if (visible !== undefined && run.pendingPublication !== undefined && matches(run.pendingPublication, visible)) {
         run.pendingPublication.renamed = true;
       }
       throw error;
     }
     run.output = output;
+    run.lastPublication = publicationEvidence(run.pendingPublication);
     run.pendingPublication = undefined;
     this.removeCandidate(run);
     run.transportIncomplete = run.transportLossDetected;
+    return committedAfterDurablePublication(run.destination);
   }
 
   private projectTranscript(runId: RunId, sessionPath: SessionPath): AuthoritativeProjection {
@@ -428,7 +489,7 @@ const systemTranscriptFileSystem: TranscriptFileSystem = {
   close: closeSync,
 };
 
-function readTailBounded(path: string, maxBytes: number, fs: TranscriptFileSystem):
+function readTailBounded(path: string, maxBytes: Utf8Bytes, fs: TranscriptFileSystem):
   | { kind: "success"; bytes: Buffer; startsAtByteZero: boolean }
   | { kind: "failure"; reason: string } {
   let fd: number;
@@ -439,13 +500,19 @@ function readTailBounded(path: string, maxBytes: number, fs: TranscriptFileSyste
     | { kind: "success"; bytes: Buffer; startsAtByteZero: boolean }
     | { kind: "failure"; reason: string };
   try {
-    const size = fs.fstat(fd).size;
+    const rawSize = fs.fstat(fd).size;
+    if (!Number.isSafeInteger(rawSize) || rawSize < 0) throw new Error("invalid session file size");
+    const size = utf8Bytes(rawSize);
     const readLength = Math.min(size, maxBytes);
     const start = size - readLength;
     const allocation = Buffer.alloc(readLength);
     let offset = 0;
     while (offset < readLength) {
-      const bytesRead = fs.read(fd, allocation, offset, readLength - offset, start + offset);
+      const rawBytesRead = fs.read(fd, allocation, offset, readLength - offset, start + offset);
+      if (!Number.isSafeInteger(rawBytesRead) || rawBytesRead < 0 || rawBytesRead > readLength - offset) {
+        throw new Error("invalid session read length");
+      }
+      const bytesRead = utf8Bytes(rawBytesRead);
       if (bytesRead === 0) break;
       offset += bytesRead;
     }
@@ -483,20 +550,71 @@ function parseCompleteRecords(tail: Buffer, startsAtByteZero: boolean):
   return { kind: "success", records };
 }
 
-function pending(destination: CommittedOutputPath, bytes: Uint8Array, output: CompletionOutput, renamed: boolean): PendingPublication {
-  return { destination, digest: digest(bytes), byteLength: bytes.byteLength, output, renamed };
+function pending(destination: OutputPath, bytes: Uint8Array, output: CompletionOutput, renamed: boolean): PendingPublication {
+  return { destination, digest: digest(bytes), byteLength: utf8Bytes(bytes.byteLength), output, renamed };
 }
+
+function publicationEvidence(publication: PublicationEvidence): PublicationEvidence {
+  return Object.freeze({
+    digest: publication.digest,
+    byteLength: publication.byteLength,
+    output: Object.freeze({ ...publication.output }),
+  });
+}
+
+/** Called only after file fsync and containing-directory fsync have succeeded. */
+function committedAfterDurablePublication(destination: OutputPath): CommittedOutputPath {
+  return destination as CommittedOutputPath;
+}
+
 function digest(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
-function matches(publication: PendingPublication, bytes: Uint8Array): boolean {
+function matches(publication: PublicationEvidence, bytes: Uint8Array): boolean {
   return bytes.byteLength === publication.byteLength && digest(bytes) === publication.digest;
 }
+/** Map lookup is safe across string brands: a mismatched identity simply has no entry. */
+function getByStringIdentity<K extends string, V>(map: ReadonlyMap<K, V>, key: string): V | undefined {
+  return map.get(key as K);
+}
+
 function readIfPresent(path: string, fs: DurableFileSystem): Buffer | undefined {
   try { return fs.readFile(path); } catch { return undefined; }
 }
+
+function normalisedOutputDestination(path: OutputPath, fs: DurableFileSystem): string {
+  return fs.exists(path) ? fs.realpath(path) : path;
+}
+
+function completionEvidenceMatches(
+  expected: CompletionOutput,
+  bytes: Uint8Array,
+  maxOutputBytes: Utf8Bytes,
+): boolean {
+  if (bytes.byteLength !== expected.originalBytes) return false;
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return false;
+  }
+  const projected = truncateUtf8(text, maxOutputBytes);
+  return projected.text === expected.text &&
+    projected.originalBytes === expected.originalBytes &&
+    projected.retainedBytes === expected.retainedBytes &&
+    projected.truncated === expected.truncated;
+}
+
+function withRestoredOutput(
+  candidate: RestorableAgentCompletion,
+  output: CompletionOutput,
+  outputPath: CommittedOutputPath,
+): AgentCompletion {
+  return { ...candidate, output, outputPath };
+}
+
 function writeCandidate(path: string, data: string): void { writeFileSync(path, data, { mode: 0o600 }); }
 function appendOwnerOnlySync(path: string, data: string): void { appendFileSync(path, data, { encoding: "utf8", mode: 0o600 }); }
 function removeIfPresent(path: string): void { if (existsSync(path)) unlinkSync(path); }
 function boundedReason(error: unknown): string {
-  return retainUtf8Tail(error instanceof Error ? error.message : String(error), 512);
+  return retainUtf8Tail(error instanceof Error ? error.message : String(error), utf8Bytes(512));
 }
 function outputError(error: unknown): Error { return new Error(`output_error: ${boundedReason(error)}`); }

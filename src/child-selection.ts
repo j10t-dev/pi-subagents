@@ -3,17 +3,32 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   AgentErrorCode,
   PublicPreflightError,
-  modelSpec,
+  modelId,
+  modelSpecFrom,
+  providerId,
+  toolName,
   truncateUtf8,
+  utf8Bytes,
+  type ModelId,
   type ModelSpec,
+  type ProviderId,
   type ThinkingLevel,
+  type ToolName,
 } from "./domain.ts";
+import { MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
 
-export const LIFECYCLE_TOOL_NAMES = Object.freeze([
-  "spawn_agent", "send_input", "receive_agent", "stop_agent",
-] as const);
+export const LIFECYCLE_TOOL_NAMES: readonly ToolName[] = Object.freeze([
+  toolName("spawn_agent"),
+  toolName("send_input"),
+  toolName("receive_agent"),
+  toolName("stop_agent"),
+]);
 
 type NativeModel = Model<Api>;
+type BrandedNativeModel = Omit<NativeModel, "provider" | "id"> & {
+  readonly provider: ProviderId;
+  readonly id: ModelId;
+};
 type NativeThinkingLevel = ThinkingLevel;
 
 export interface ModelCatalogue {
@@ -33,13 +48,17 @@ export interface ChildSelectionInput {
 export interface EffectiveChildSelection {
   readonly model: ModelSpec;
   readonly thinkingLevel: NativeThinkingLevel;
-  readonly tools: readonly string[];
+  readonly tools: readonly ToolName[];
   readonly warning?: string;
 }
 
 export function resolveChildSelection(input: ChildSelectionInput): EffectiveChildSelection {
-  const selection = selectModel(input);
-  const tools = selectTools(input.requestedTools, input.parentActiveTools, input.allowLifecycleTools);
+  const parentModel = projectNativeModel(input.parentModel);
+  const catalogue = input.requestedModel === undefined ? [] : input.modelRegistry.getAll();
+  const models = catalogue.flatMap((model) => projectCatalogueModel(model) ?? []);
+  const selection = selectModel(input, parentModel, models, catalogue.length - models.length);
+  const activeTools = input.parentActiveTools.map(toolName);
+  const tools = selectTools(input.requestedTools, activeTools, input.allowLifecycleTools);
   return Object.freeze({ ...selection, tools });
 }
 
@@ -48,7 +67,7 @@ export function projectCustomModelWarning(pattern: string): string {
   const result = projectedPattern === undefined
     ? "The supplied child model pattern uses the custom model-id fallback."
     : `Model pattern "${projectedPattern}" uses the custom model-id fallback.`;
-  return truncateUtf8(result, 10_000).text;
+  return truncateUtf8(result, MAX_ERROR_MESSAGE_BYTES).text;
 }
 
 const THINKING_LEVELS: ReadonlySet<string> = new Set([
@@ -56,7 +75,7 @@ const THINKING_LEVELS: ReadonlySet<string> = new Set([
 ]);
 const SAFE_MODEL_DIAGNOSTIC = /^[A-Za-z0-9@._+:/?*\[\]-]{1,512}$/u;
 const SAFE_TOOL_DIAGNOSTIC = /^[A-Za-z0-9_.:-]{1,128}$/u;
-const LIFECYCLE_TOOLS: ReadonlySet<string> = new Set(LIFECYCLE_TOOL_NAMES);
+const LIFECYCLE_TOOLS: ReadonlySet<ToolName> = new Set(LIFECYCLE_TOOL_NAMES);
 
 interface RequestedModelSelection {
   readonly model: ModelSpec;
@@ -65,25 +84,28 @@ interface RequestedModelSelection {
 }
 
 type ModelMatch =
-  | { readonly status: "found"; readonly model: NativeModel }
+  | { readonly status: "found"; readonly model: BrandedNativeModel }
   | { readonly status: "ambiguous" | "none" };
 
 function selectModel(
   input: ChildSelectionInput,
+  parentModel: BrandedNativeModel,
+  models: readonly BrandedNativeModel[],
+  skippedModels: number,
 ): Pick<EffectiveChildSelection, "model" | "thinkingLevel" | "warning"> {
   if (input.requestedModel === undefined) {
     return {
-      model: modelSpec(`${input.parentModel.provider}/${input.parentModel.id}`),
+      model: modelSpecFrom(parentModel.provider, parentModel.id),
       thinkingLevel: input.parentThinking,
     };
   }
 
   const resolved = resolveRequestedModel(
     input.requestedModel,
-    input.modelRegistry.getAll(),
-    input.parentModel.provider,
+    models,
+    parentModel.provider,
   );
-  if (resolved === undefined) throw unavailableModel(input.requestedModel);
+  if (resolved === undefined) throw unavailableModel(input.requestedModel, skippedModels);
   return {
     model: resolved.model,
     thinkingLevel: resolved.thinkingLevel ?? input.parentThinking,
@@ -93,8 +115,8 @@ function selectModel(
 
 function resolveRequestedModel(
   pattern: string,
-  models: readonly NativeModel[],
-  preferredProvider: string,
+  models: readonly BrandedNativeModel[],
+  preferredProvider: ProviderId,
 ): RequestedModelSelection | undefined {
   if (diagnosticText(pattern, "model") === undefined) return undefined;
 
@@ -118,8 +140,8 @@ function resolveRequestedModel(
 
 function findModel(
   pattern: string,
-  models: readonly NativeModel[],
-  preferredProvider: string,
+  models: readonly BrandedNativeModel[],
+  preferredProvider: ProviderId,
 ): ModelMatch {
   const normalized = pattern.toLowerCase();
   const qualified = models.filter((model) => canonicalModel(model).toLowerCase() === normalized);
@@ -149,7 +171,7 @@ function findModel(
   return { status: "found", model: selected };
 }
 
-function compareCanonicalDescending(left: NativeModel, right: NativeModel): number {
+function compareCanonicalDescending(left: BrandedNativeModel, right: BrandedNativeModel): number {
   const leftReference = canonicalModel(left);
   const rightReference = canonicalModel(right);
   return leftReference < rightReference ? 1 : leftReference > rightReference ? -1 : 0;
@@ -168,7 +190,7 @@ function splitThinkingSuffix(
 
 function customModelFallback(
   pattern: string,
-  models: readonly NativeModel[],
+  models: readonly BrandedNativeModel[],
 ): RequestedModelSelection | undefined {
   const slash = pattern.indexOf("/");
   if (slash <= 0 || slash === pattern.length - 1) return undefined;
@@ -176,25 +198,37 @@ function customModelFallback(
   const provider = models.find((model) =>
     model.provider.toLowerCase() === requestedProvider.toLowerCase())?.provider;
   if (provider === undefined) return undefined;
-  const modelId = pattern.slice(slash + 1);
+  const requestedModelId = modelId(pattern.slice(slash + 1));
   return {
-    model: modelSpec(`${provider}/${modelId}`),
-    warning: projectCustomModelWarning(`${provider}/${modelId}`),
+    model: modelSpecFrom(provider, requestedModelId),
+    warning: projectCustomModelWarning(`${provider}/${requestedModelId}`),
   };
 }
 
-function modelReference(model: NativeModel): ModelSpec {
-  return modelSpec(canonicalModel(model));
+function projectNativeModel(model: NativeModel): BrandedNativeModel {
+  return { ...model, provider: providerId(model.provider), id: modelId(model.id) };
 }
 
-function canonicalModel(model: NativeModel): string {
-  return `${model.provider}/${model.id}`;
+function projectCatalogueModel(model: NativeModel): BrandedNativeModel | undefined {
+  try {
+    return projectNativeModel(model);
+  } catch {
+    return undefined;
+  }
+}
+
+function modelReference(model: BrandedNativeModel): ModelSpec {
+  return modelSpecFrom(model.provider, model.id);
+}
+
+function canonicalModel(model: BrandedNativeModel): ModelSpec {
+  return modelSpecFrom(model.provider, model.id);
 }
 
 export function filterLifecycleTools(
-  tools: readonly string[],
+  tools: readonly ToolName[],
   allowLifecycleTools: boolean,
-): readonly string[] {
+): readonly ToolName[] {
   return Object.freeze(
     allowLifecycleTools
       ? [...tools]
@@ -204,24 +238,33 @@ export function filterLifecycleTools(
 
 function selectTools(
   requestedTools: readonly string[] | undefined,
-  parentActiveTools: readonly string[],
+  parentActiveTools: readonly ToolName[],
   allowLifecycleTools: boolean,
-): readonly string[] {
+): readonly ToolName[] {
   const eligible = filterLifecycleTools(parentActiveTools, allowLifecycleTools);
   if (requestedTools === undefined) return Object.freeze([...eligible]);
 
-  const requested = [...new Set(requestedTools)];
-  const unavailable = requested.filter((tool) => !eligible.includes(tool));
+  const eligibleByName = new Map<string, ToolName>(eligible.map((tool) => [tool, tool]));
+  const selected: ToolName[] = [];
+  const unavailable: string[] = [];
+  for (const requested of new Set(requestedTools)) {
+    const activeMember = eligibleByName.get(requested);
+    if (activeMember === undefined) unavailable.push(requested);
+    else selected.push(activeMember);
+  }
   if (unavailable.length > 0) throw unavailableTools(unavailable);
-  return Object.freeze(requested);
+  return Object.freeze(selected);
 }
 
-function unavailableModel(pattern: string): PublicPreflightError {
+function unavailableModel(pattern: string, skippedModels: number): PublicPreflightError {
   const projected = diagnosticText(pattern, "model");
-  const message = projected === undefined
+  const base = projected === undefined
     ? "supplied model pattern is unavailable; use a printable Pi model identifier"
     : `model pattern "${projected}" is unavailable; use a configured Pi model identifier`;
-  return new PublicPreflightError(AgentErrorCode.ModelUnavailable, message);
+  const skipped = skippedModels === 0
+    ? ""
+    : `; ignored ${skippedModels} invalid configured model ${skippedModels === 1 ? "entry" : "entries"}`;
+  return new PublicPreflightError(AgentErrorCode.ModelUnavailable, `${base}${skipped}`);
 }
 
 function unavailableTools(tools: readonly string[]): PublicPreflightError {
@@ -237,5 +280,5 @@ function diagnosticText(value: string, kind: "model" | "tool"): string | undefin
   if (value.startsWith("/") || value.startsWith("./") || value.startsWith("../") || value.includes("\\")) return undefined;
   if (kind === "model" && value.split("/").some((segment) => segment === "." || segment === "..")) return undefined;
   if (!pattern.test(value)) return undefined;
-  return truncateUtf8(value, kind === "model" ? 512 : 128).truncated ? undefined : value;
+  return truncateUtf8(value, utf8Bytes(kind === "model" ? 512 : 128)).truncated ? undefined : value;
 }

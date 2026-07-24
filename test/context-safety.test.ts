@@ -14,7 +14,7 @@ import {
   MAX_RPC_RECORD_BYTES,
   MAX_STDERR_TAIL_BYTES,
 } from "../src/constants.ts";
-import { AgentErrorCode, AgentState, CompletionState, modelSpec, runId, terminalFailureCause, toAgentError, truncateUtf8, verifiedContainmentReceiptPath } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CompletionState, modelSpec, runId, terminalFailureCause, toAgentError, truncateUtf8, utf8Bytes, verifiedContainmentReceiptPath } from "../src/domain.ts";
 import { BoundedJsonlDecoder } from "../src/jsonl.ts";
 import { OutputStore } from "../src/output-store.ts";
 import { RpcRunClient } from "../src/rpc-client.ts";
@@ -22,7 +22,7 @@ import { createSubagentTools } from "../src/tools.ts";
 import { containmentReceiptPath, diagnosticsPath, outputPath as outputPathIn, sessionPath } from "../src/paths.ts";
 import {
   testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath,
-  testSessionPath,
+  testContainmentAttempt, testSessionPath, testToolName,
 } from "./support/brands.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort } from "./support/extension-api.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
@@ -37,7 +37,7 @@ const parentProbeSchema = Type.Object({
 const TEST_SELECTION = Object.freeze({
   model: modelSpec("mock-provider/luna"),
   thinkingLevel: "high" as const,
-  tools: Object.freeze(["read"]),
+  tools: Object.freeze([testToolName("read")]),
 });
 
 describe("context safety", () => {
@@ -54,7 +54,7 @@ describe("context safety", () => {
     decoder.push(Uint8Array.of(0x0a));
     expect(peak).toBeLessThanOrEqual(MAX_RPC_RECORD_BYTES);
     expect(oversized).toBe(1);
-    expect(decoder.pendingBytes).toBe(0);
+    expect(decoder.pendingBytes).toBe(utf8Bytes(0));
   });
 
   test("receive_agent provider content retains at most 50 KB and the service remains usable", async () => {
@@ -62,7 +62,10 @@ describe("context safety", () => {
     for (const [index, id] of ["deadbeef", "cafebabe"].entries()) {
       await service.publish({ agentId: testAgentId(`context-${index}`), runId: runId(id), state: CompletionState.Completed,
         output: truncateUtf8("x".repeat(MAX_COMPLETION_OUTPUT_BYTES), MAX_COMPLETION_OUTPUT_BYTES),
-        outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/output/${id}.output`),
+        outputPath: testCommittedOutputPath({
+          workDir: testAbsolutePath("/tmp/pi-subagents-test/output"),
+          runId: runId(id),
+        }),
         transcriptPath: testSessionPath(`/tmp/pi-subagents-test/sessions/${id}.jsonl`) });
     }
     const receive = createSubagentTools(new SubagentController({ completions: service })).receive_agent;
@@ -89,7 +92,7 @@ describe("context safety", () => {
 
   test("published safety limits retain their exact operator contract", () => {
     expect({ output: MAX_COMPLETION_OUTPUT_BYTES, error: MAX_ERROR_MESSAGE_BYTES, stderr: MAX_STDERR_TAIL_BYTES })
-      .toEqual({ output: 50_000, error: 10_000, stderr: 50_000 });
+      .toEqual({ output: utf8Bytes(50_000), error: utf8Bytes(10_000), stderr: utf8Bytes(50_000) });
   });
 
   test("cumulative message updates and a huge tool result retain bounded authoritative output", async () => {
@@ -188,7 +191,7 @@ function hostileController(): {
   close(): Promise<void>;
 } {
   const state = temporaryStateRoot("pi-context-controller-");
-  const root: string = state.path;
+  const root = state.path;
   const clients = new Set<RpcRunClient>();
   const stores = new Map<string, OutputStore>();
   let sequence = 0;
@@ -221,13 +224,19 @@ function hostileController(): {
       const outputPath = outputPathIn(root, `${record.agentId}-${record.runId}.output`);
       writeFileSync(outputPath, output.text);
       if (settlement.kind === "completed") return { agentId: record.agentId, runId: record.runId, state: CompletionState.Completed,
-        output, outputPath: testCommittedOutputPath(outputPath, root), transcriptPath: record.transcriptPath };
+        output, outputPath: testCommittedOutputPath({
+          workDir: testAbsolutePath(root),
+          runId: record.runId,
+        }), transcriptPath: record.transcriptPath };
       const diagnostic = store.getDiagnosticsTail() + store.getStderrTail();
       const diagnosticPath = diagnosticsPath(root, `${record.agentId}-${record.runId}.diagnostic`);
       writeFileSync(diagnosticPath, diagnostic);
       return { agentId: record.agentId, runId: record.runId, state: CompletionState.Failed,
         error: toAgentError(AgentErrorCode.ProtocolError, diagnosticPath), output,
-        outputPath: testCommittedOutputPath(outputPath, root), transcriptPath: record.transcriptPath };
+        outputPath: testCommittedOutputPath({
+          workDir: testAbsolutePath(root),
+          runId: record.runId,
+        }), transcriptPath: record.transcriptPath };
     },
   } });
   return { controller, close: async () => {
@@ -329,7 +338,9 @@ function hostileLaunch(
   clients: Set<RpcRunClient>,
   stores: Map<string, OutputStore>,
 ): LaunchTransport {
-  const store = new OutputStore({ workDir: join(root, `store-${session.agentId}`) });
+  const store = new OutputStore({
+    workDir: testAbsolutePath(join(root, `store-${session.agentId}`)),
+  });
   const child = spawn(process.execPath, [FAKE_CHILD], { cwd: root,
     env: { ...process.env, FAKE_RPC_SCENARIO: scenario }, stdio: ["pipe", "pipe", "pipe"] });
   const client = new RpcRunClient({
@@ -345,14 +356,14 @@ function hostileLaunch(
   stores.set(session.agentId, store);
   let queried = false;
   let assignment = "";
+  const containment = testContainmentAttempt(session.attemptId).descriptor;
   return {
     runtime: { abort: async () => { await client.abort(); }, contain: async () => {
       await client.shutdown();
       // The session receipt is already validated against this suite's temp root.
       return verifiedContainmentReceiptPath(session.containmentReceiptPath);
     } },
-    containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/test-cgroup/attempt") },
-    ready: async () => {}, persistLaunchRequested: async () => {}, persistRunStarted: async () => {},
+    ready: async () => containment, persistLaunchRequested: async () => {}, persistRunStarted: async () => {},
     start: async () => { client.start(); },
     getEntries: async () => queried
       ? { entries: [{ type: "message", id: nativeRunId, message: { role: "user", content: assignment } }], leafId: nativeRunId }
@@ -365,7 +376,7 @@ function fakeClient(scenario: string): { client: RpcRunClient; store: OutputStor
   // Bun defers disposal of closed child-process epoll handles across this large process suite.
   Bun.gc(true);
   const state = temporaryStateRoot("pi-context-safety-");
-  const dir: string = state.path;
+  const dir = state.path;
   const store = new OutputStore({ workDir: dir });
   const child = spawn(process.execPath, [FAKE_CHILD], {
     cwd: dir, env: { ...process.env, FAKE_RPC_SCENARIO: scenario }, stdio: ["pipe", "pipe", "pipe"],

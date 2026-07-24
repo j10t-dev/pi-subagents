@@ -16,14 +16,24 @@ import {
   type SessionPath,
   type VerifiedContainmentReceiptPath,
 } from "./domain.ts";
-import type { ContainmentDescriptor } from "./containment.ts";
-import type { AgentEventAppender, RestorationAction, RestoredAgentRecord, RestoredRegistry } from "./persistence.ts";
+import type { RestorationContainmentDescriptor } from "./containment.ts";
+import {
+  pickMetadata,
+  type AgentEventAppender,
+  type AgentMetadata,
+  type CompletedRunCandidate,
+  type DurableCompletedRun,
+  type FoldedAgentRecord,
+  type PendingLaunch,
+  type RestorationAction,
+  type RestoredRegistry,
+} from "./persistence.ts";
 import type { RestoreAdmission, RunRecord, RunRuntime } from "./run-controller.ts";
 
 export interface RestorationContainmentInput {
   readonly attemptId: RunAttemptId;
   readonly receiptPath: ContainmentReceiptPath;
-  readonly descriptor?: ContainmentDescriptor;
+  readonly descriptor?: RestorationContainmentDescriptor;
   readonly eventVersion: 1 | 2;
 }
 
@@ -36,12 +46,35 @@ export type RestorationContainmentDecision =
   | { kind: "requires-containment"; runtime: RunRuntime }
   | { kind: "unresolved-historical"; runtime: RunRuntime };
 
+export type PlannedLifecycleState =
+  | { state: typeof AgentState.Stopped; pendingLaunch?: PendingLaunch }
+  | {
+      state: typeof AgentState.Settling | typeof AgentState.Stopping;
+      runId: RunId;
+      pendingLaunch?: PendingLaunch;
+    }
+  | { state: typeof AgentState.Stopping; runId?: undefined; pendingLaunch: PendingLaunch };
+
+export type CandidatePlannedAgentRecord = AgentMetadata & {
+  readonly completion?: CompletedRunCandidate;
+} & PlannedLifecycleState;
+
+export type AppliedAgentRecord = AgentMetadata & {
+  readonly completion?: DurableCompletedRun;
+} & PlannedLifecycleState;
+
+/** Candidate planning compatibility name; application boundaries use `AppliedAgentRecord`. */
+export type PlannedAgentRecord = CandidatePlannedAgentRecord;
+
 export interface RestorationPort {
   stateRoot: AbsolutePath;
   getBranch(): readonly { readonly type: string; readonly customType?: string; readonly data?: unknown }[];
   resolveContainment(input: RestorationContainmentInput): Promise<RestorationContainmentDecision>;
   firstUserEntryAfter(sessionPath: SessionPath, cursor: SessionEntryId | null): Promise<RunId | undefined>;
-  finaliseContained(record: RestoredAgentRecord, runId: RunId, settlement: RestoredSettlement): Promise<AgentCompletion>;
+  finaliseContained(record: FoldedAgentRecord, runId: RunId, settlement: RestoredSettlement): Promise<AgentCompletion>;
+  restoreCompletion(
+    record: FoldedAgentRecord & { readonly completion: CompletedRunCandidate },
+  ): Promise<AgentCompletion>;
   appender: AgentEventAppender;
 }
 
@@ -158,17 +191,17 @@ function containedRuntime(receipt: VerifiedContainmentReceiptPath): RunRuntime {
 }
 
 export interface RestoredCompletionIntent {
-  readonly record: RestoredAgentRecord;
+  readonly record: FoldedAgentRecord;
   readonly runId: RunId;
   readonly settlement: RestoredSettlement;
 }
 
 export type RestoredTerminalObligation =
-  | { readonly kind: "finalise"; readonly record: RestoredAgentRecord; readonly settlement: RestoredSettlement; readonly start?: { runId: RunId; attemptId: RunAttemptId } }
-  | { readonly kind: "restore-completion"; readonly record: RestoredAgentRecord };
+  | { readonly kind: "finalise"; readonly record: FoldedAgentRecord; readonly settlement: RestoredSettlement; readonly start?: { runId: RunId; attemptId: RunAttemptId } }
+  | { readonly kind: "restore-completion"; readonly record: FoldedAgentRecord };
 
 export interface StagedRestorePlan {
-  readonly restored: RestoredAgentRecord[];
+  readonly restored: CandidatePlannedAgentRecord[];
   readonly runtimeRecords: RunRecord[];
   readonly durableWrites: RestoredCompletionIntent[];
   readonly obligations: ReadonlyMap<AgentId, RestoredTerminalObligation>;
@@ -184,7 +217,7 @@ export interface RestorationApplicationState {
 export class RestorationApplicationError extends Error {
   constructor(
     override readonly cause: unknown,
-    readonly restored: readonly RestoredAgentRecord[],
+    readonly restored: readonly AppliedAgentRecord[],
     readonly admissionCommitted = true,
     readonly recoveryCause?: unknown,
   ) {
@@ -198,10 +231,13 @@ export async function applyRestoration(
   admission: RestoreAdmission,
   port: RestorationPort,
   state: RestorationApplicationState,
-): Promise<RestoredAgentRecord[]> {
+  onCompletionRestoreFailure?: (agentId: AgentId, error: unknown) => void,
+): Promise<AppliedAgentRecord[]> {
   admission.reserve(plan.runtimeRecords);
   const runtimeRecords = new Map(plan.runtimeRecords.map((record) => [record.agentId, record]));
   const replacedRecords: RunRecord[] = [];
+  const restored = plan.restored.map(withoutCandidateCompletion);
+  const unappliedObligations = new Set(plan.obligations.keys());
 
   try {
     for (const obligation of plan.obligations.values()) {
@@ -214,6 +250,33 @@ export async function applyRestoration(
         attemptId: obligation.start.attemptId,
       });
       state.restoredStartedAppends.add(key);
+    }
+
+    for (let index = 0; index < plan.restored.length; index++) {
+      const candidate = plan.restored[index]!;
+      if (candidate.state !== AgentState.Stopped || candidate.completion === undefined) continue;
+      const completionCandidate = candidate.completion;
+      const key = agentRunKey(candidate.agentId, completionCandidate.payload.runId);
+      state.durableCompletions.delete(key);
+      let completion: AgentCompletion;
+      try {
+        completion = await port.restoreCompletion({
+          ...candidate,
+          completion: completionCandidate,
+        });
+      } catch (error) {
+        try {
+          onCompletionRestoreFailure?.(candidate.agentId, error);
+        } catch { /* diagnostics cannot widen one agent's restoration failure */ }
+        continue;
+      }
+      state.durableCompletions.set(key, completion);
+      restored[index] = {
+        ...withoutCandidateCompletion(candidate),
+        completion: { ...completionCandidate, payload: completion },
+      };
+      unappliedObligations.delete(candidate.agentId);
+      state.restoredRecords.delete(candidate.agentId);
     }
 
     for (const intent of plan.durableWrites) {
@@ -229,11 +292,10 @@ export async function applyRestoration(
       await port.appender.appendRunCompleted(completion);
     }
 
-    const restored = [...plan.restored];
     for (const intent of plan.durableWrites) {
       const completion = state.durableCompletions.get(agentRunKey(intent.record.agentId, intent.runId));
       if (completion === undefined) throw new CodedError(AgentErrorCode.InvalidState);
-      const stopped = asStopped(intent.record, completion);
+      const stopped = asDurableStopped(intent.record, completion);
       admission.replace({ agentId: stopped.agentId, state: AgentState.Stopped, transcriptPath: stopped.sessionPath });
       const original = runtimeRecords.get(stopped.agentId);
       if (original === undefined) throw new CodedError(AgentErrorCode.InvalidState);
@@ -245,7 +307,11 @@ export async function applyRestoration(
     for (const record of restored) {
       const obligation = plan.obligations.get(record.agentId);
       if (record.state === AgentState.Stopped) {
-        state.restoredRecords.delete(record.agentId);
+        if (obligation?.kind === "restore-completion" && unappliedObligations.has(record.agentId)) {
+          state.restoredRecords.set(record.agentId, obligation);
+        } else {
+          state.restoredRecords.delete(record.agentId);
+        }
       } else if (obligation !== undefined) {
         state.restoredRecords.set(record.agentId, obligation);
       }
@@ -261,7 +327,10 @@ export async function applyRestoration(
         recoveryFailures.push(recoveryError);
       }
     }
-    for (const [agentId, obligation] of plan.obligations) state.restoredRecords.set(agentId, obligation);
+    for (const [agentId, obligation] of plan.obligations) {
+      if (unappliedObligations.has(agentId)) state.restoredRecords.set(agentId, obligation);
+      else state.restoredRecords.delete(agentId);
+    }
     if (recoveryFailures.length === 0) {
       try {
         admission.commit();
@@ -274,13 +343,18 @@ export async function applyRestoration(
       : recoveryFailures.length === 1
         ? recoveryFailures[0]
         : new AggregateError(recoveryFailures, "restoration admission recovery failed");
-    throw new RestorationApplicationError(error, plan.restored, recoveryFailures.length === 0, recoveryCause);
+    throw new RestorationApplicationError(error, restored, recoveryFailures.length === 0, recoveryCause);
   }
+}
+
+function withoutCandidateCompletion(record: CandidatePlannedAgentRecord): AppliedAgentRecord {
+  const { completion: _candidate, ...proofSafe } = record;
+  return proofSafe;
 }
 
 export function planRestoration(registry: RestoredRegistry, evidence: RestorationEvidence): StagedRestorePlan {
   const actions = indexActions(registry);
-  const restored: RestoredAgentRecord[] = [];
+  const restored: CandidatePlannedAgentRecord[] = [];
   const durableWrites: RestoredCompletionIntent[] = [];
   const obligations = new Map<AgentId, RestoredTerminalObligation>();
   const warnings: AgentId[] = [];
@@ -319,7 +393,7 @@ export function planRestoration(registry: RestoredRegistry, evidence: Restoratio
                 restored.push(asStopped(record));
                 break;
               case "lookup-failed":
-                restored.push(asUncontained(record));
+                restored.push(asUncontained(record, true));
                 obligations.set(record.agentId, { kind: "finalise", record, settlement });
                 warnings.push(record.agentId);
                 break;
@@ -329,7 +403,7 @@ export function planRestoration(registry: RestoredRegistry, evidence: Restoratio
             break;
           case "uncontained":
           case "historical-unresolved":
-            restored.push(asUncontained(withoutLatestCompletion(record)));
+            restored.push(asUncontained(record));
             obligations.set(record.agentId, { kind: "finalise", record, settlement });
             warnings.push(record.agentId);
             break;
@@ -367,14 +441,15 @@ export function planRestoration(registry: RestoredRegistry, evidence: Restoratio
         break;
       }
       case RestorationActionType.ValidateCompletedReceipt:
+        if (record.state !== AgentState.Stopped) throw new CodedError(AgentErrorCode.InvalidState);
+        obligations.set(record.agentId, { kind: "restore-completion", record });
         switch (agentEvidence.containment.kind) {
           case "contained":
             restored.push(record);
             break;
           case "uncontained":
           case "historical-unresolved":
-            restored.push(asUncontained(withoutLatestCompletion(record)));
-            obligations.set(record.agentId, { kind: "restore-completion", record });
+            restored.push(asUncontained(record));
             warnings.push(record.agentId);
             break;
         }
@@ -388,7 +463,7 @@ export function planRestoration(registry: RestoredRegistry, evidence: Restoratio
     }
     const agentEvidence = usedEvidence.get(record.agentId);
     if (agentEvidence === undefined) throw new CodedError(AgentErrorCode.InvalidState);
-    const preNative = record.pendingLaunch !== undefined && record.currentRunId === undefined;
+    const preNative = record.runId === undefined;
     const responsibility = agentEvidence.containment.kind === "historical-unresolved"
       ? "historical-unresolved" as const
       : preNative
@@ -398,7 +473,7 @@ export function planRestoration(registry: RestoredRegistry, evidence: Restoratio
       agentId: record.agentId,
       state: record.state,
       transcriptPath: record.sessionPath,
-      ...(record.currentRunId === undefined ? {} : { runId: record.currentRunId }),
+      ...(record.runId === undefined ? {} : { runId: record.runId }),
       runtime: agentEvidence.containment.runtime,
       ...(responsibility === undefined ? {} : { containmentResponsibility: responsibility }),
       ...(preNative && obligations.has(record.agentId) ? { restoredTerminalObligation: true as const } : {}),
@@ -434,36 +509,62 @@ function unavailableRuntime(): RunRuntime {
 }
 
 export function asActiveRestored(
-  record: RestoredAgentRecord,
+  record: FoldedAgentRecord,
   runId: RunId,
   state: typeof AgentState.Settling | typeof AgentState.Stopping,
-): RestoredAgentRecord {
-  const { latestCompletion: _completion, ...rest } = record;
-  return { ...rest, state, currentRunId: runId };
-}
-
-export function asStopped(record: RestoredAgentRecord, latestCompletion?: AgentCompletion): RestoredAgentRecord {
-  const { currentRunId: _run, pendingLaunch: _launch, pendingStopReason: _reason, ...durable } = record;
-  return { ...durable, state: AgentState.Stopped, ...(latestCompletion === undefined ? {} : { latestCompletion }) };
-}
-
-export function asUncontained(record: RestoredAgentRecord): RestoredAgentRecord {
+): CandidatePlannedAgentRecord {
   return {
-    ...record,
-    state: record.state === AgentState.Stopping || record.pendingLaunch !== undefined
-      ? AgentState.Stopping
-      : AgentState.Settling,
+    ...pickMetadata(record),
+    state,
+    runId,
+    ...(record.state === AgentState.Stopped && record.pendingLaunch !== undefined
+      ? { pendingLaunch: record.pendingLaunch }
+      : {}),
   };
 }
 
-export function withoutLatestCompletion(record: RestoredAgentRecord): RestoredAgentRecord {
-  const {
-    latestCompletion: _completion,
-    latestCompletionAttemptId: _attempt,
-    latestCompletionReceiptPath: _receipt,
-    latestCompletionContainment: _containment,
-    latestCompletionEventVersion: _eventVersion,
-    ...rest
-  } = record;
-  return rest;
+export function asStopped(record: FoldedAgentRecord): CandidatePlannedAgentRecord {
+  return {
+    ...pickMetadata(record),
+    state: AgentState.Stopped,
+    ...(record.completion === undefined ? {} : { completion: record.completion }),
+  };
+}
+
+function asDurableStopped(record: FoldedAgentRecord, completion: AgentCompletion): AppliedAgentRecord {
+  return {
+    ...pickMetadata(record),
+    state: AgentState.Stopped,
+    completion: completedRunFor(record, completion),
+  };
+}
+
+function completedRunFor(record: FoldedAgentRecord, payload: AgentCompletion): DurableCompletedRun {
+  if (record.state !== AgentState.Stopped) {
+    const { runId: _runId, ...provenance } = record.run;
+    return { payload, ...provenance };
+  }
+  const launch = record.pendingLaunch;
+  if (launch === undefined) throw new CodedError(AgentErrorCode.InvalidState);
+  return {
+    payload,
+    receiptPath: launch.payload.containmentReceiptPath,
+    attemptId: launch.payload.attemptId,
+    ...(launch.eventVersion === 2 ? { containment: launch.payload.containment } : {}),
+    eventVersion: launch.eventVersion,
+  };
+}
+
+export function asUncontained(record: FoldedAgentRecord, keepCompletion = false): CandidatePlannedAgentRecord {
+  if (record.state !== AgentState.Stopped) throw new CodedError(AgentErrorCode.InvalidState);
+  const base = {
+    ...pickMetadata(record),
+    ...(keepCompletion && record.completion !== undefined ? { completion: record.completion } : {}),
+  };
+  if (record.pendingLaunch !== undefined) {
+    return { ...base, state: AgentState.Stopping, pendingLaunch: record.pendingLaunch };
+  }
+  const runId = record.completion?.payload.runId;
+  if (runId === undefined) throw new CodedError(AgentErrorCode.InvalidState);
+  return { ...base, state: AgentState.Settling, runId };
 }

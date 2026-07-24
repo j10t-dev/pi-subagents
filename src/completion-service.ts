@@ -6,6 +6,7 @@ import {
   CompletionState,
   type AgentCompletion,
   type AgentId,
+  type AgentRunKey,
   type CommittedOutputPath,
   type Milliseconds,
   type RunId,
@@ -44,7 +45,7 @@ export interface PublishResult {
   queueSize: number;
 }
 
-/** Minimal restored-agent shape `restore()` needs; matches `persistence.ts`'s `RestoredAgentRecord`. */
+/** Stable DTO consumed by `restore()` and populated by the planner adapter. */
 export interface RestorableAgent {
   agentId: AgentId;
   state: AgentState;
@@ -66,7 +67,7 @@ interface CompletionWaiter {
 export class CompletionService {
   private readonly mutex = new Mutex();
   private readonly queue: AgentCompletion[] = [];
-  private readonly publishedRuns = new Set<string>();
+  private readonly publishedRuns = new Set<AgentRunKey>();
   private readonly agents = new Map<AgentId, AgentSummary>();
   private waitingReceiver: CompletionWaiter | undefined;
   private notifiedSinceEmpty = false;
@@ -299,6 +300,8 @@ export class CompletionService {
   }
 }
 
-function completionKey(completion: Pick<AgentCompletion, "agentId" | "runId">): string {
+export function completionKey(
+  completion: Pick<AgentCompletion, "agentId" | "runId">,
+): AgentRunKey {
   return agentRunKey(completion.agentId, completion.runId);
 }

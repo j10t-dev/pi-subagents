@@ -5,17 +5,16 @@ import {
   AgentErrorCode,
   AgentEventType,
   AgentState,
+  type AbsolutePath,
   type AgentCompletion,
   type AgentEventPayloadMap,
   type AgentId,
   type AgentUsage,
-  type AbsolutePath,
   type CancellationReason,
   type ContainmentReceiptPath,
-  type DiagnosticsPath,
   type PersistedAgentEvent,
+  type RestorableAgentCompletion,
   type RunAttemptId,
-  type RunCompletedPayload,
   type RunId,
   type RunLaunchRequestedPayloadV1,
   type RunLaunchRequestedPayloadV2,
@@ -27,36 +26,82 @@ import {
   runAttemptId,
   runId as brandRunId,
   sessionEntryId,
-  modelSpec,
+  modelId,
+  observedCgroupScopePath,
+  providerId,
+  toolName,
   utf8Bytes,
   truncateUtf8,
 } from "./domain.ts";
-import { absolutePath, restoredStatePath } from "./paths.ts";
+import {
+  absolutePath,
+  restoredContainmentReceiptPath,
+  restoredDiagnosticsPath,
+  restoredOutputPath,
+  restoredSessionPath,
+} from "./paths.ts";
 import { PersistenceSequencer } from "./async-primitives.ts";
 import { Value } from "typebox/value";
 import { AgentUsageSchema, decodePersistedAgentEvent, type AgentCompletionDto } from "./schemas.ts";
-import type { ContainmentDescriptor } from "./containment.ts";
+import type { RestorationContainmentDescriptor } from "./containment.ts";
+
+interface DecodedAgentEventPayloadMapV1 {
+  [AgentEventType.Spawned]: SpawnedPayload;
+  [AgentEventType.RunLaunchRequested]: RunLaunchRequestedPayloadV1;
+  [AgentEventType.RunStarted]: RunStartedPayload;
+  [AgentEventType.RunStopping]: RunStoppingPayload;
+  [AgentEventType.RunCompleted]: RestorableAgentCompletion;
+}
+
+export interface RestorationRunLaunchRequestedPayloadV2
+  extends RunLaunchRequestedPayloadV1 {
+  readonly containment: RestorationContainmentDescriptor;
+}
+
+export interface DecodedAgentEventPayloadMap extends DecodedAgentEventPayloadMapV1 {
+  [AgentEventType.RunLaunchRequested]: RestorationRunLaunchRequestedPayloadV2;
+}
+
+type DecodedPersistedAgentEventV1 = {
+  [K in AgentEventType]: {
+    schemaVersion: 1;
+    eventType: K;
+    payload: DecodedAgentEventPayloadMapV1[K];
+  };
+}[AgentEventType];
+
+type DecodedPersistedAgentEventV2 = {
+  [K in AgentEventType]: {
+    schemaVersion: 2;
+    eventType: K;
+    payload: DecodedAgentEventPayloadMap[K];
+  };
+}[AgentEventType];
+
+export type DecodedPersistedAgentEvent =
+  | DecodedPersistedAgentEventV1
+  | DecodedPersistedAgentEventV2;
 
 /** Matches Pi's `ExtensionAPI.appendEntry<T>(customType, data)` shape so it can be injected in tests. */
 export type AppendEntryFn = (customType: string, data: unknown) => void;
 
 /**
- * Decodes an `unknown` custom-entry payload into a fully-branded `PersistedAgentEvent`.
+ * Decodes an `unknown` custom-entry payload into a fully-branded `DecodedPersistedAgentEvent`.
  * Throws `invalid_input: ...` when the envelope fails schema validation or a field fails
  * to brand; callers convert that failure into a bounded diagnostic rather than propagating it.
  */
-export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAgentEvent {
+export function decodeAgentEvent(value: unknown, stateRoot: AbsolutePath): DecodedPersistedAgentEvent {
   const dto = decodePersistedAgentEvent(value);
   switch (dto.eventType) {
     case AgentEventType.Spawned: {
       const payload: SpawnedPayload = {
         agentId: agentId(dto.payload.agentId),
-        sessionPath: restoredSessionPath(dto.payload.sessionPath, stateRoot),
+        sessionPath: restoredSessionPath(stateRoot, dto.payload.sessionPath),
         cwd: absolutePath(dto.payload.cwd),
-        provider: dto.payload.provider,
-        modelId: modelSpec(dto.payload.modelId),
+        provider: providerId(dto.payload.provider),
+        modelId: modelId(dto.payload.modelId),
         thinkingLevel: dto.payload.thinkingLevel,
-        tools: dto.payload.tools,
+        tools: dto.payload.tools.map(toolName),
       };
       return { schemaVersion: dto.schemaVersion, eventType: dto.eventType, payload };
     }
@@ -66,16 +111,16 @@ export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAg
         previousLeafId:
           dto.payload.previousLeafId === null ? null : sessionEntryId(dto.payload.previousLeafId),
         attemptId: runAttemptId(dto.payload.attemptId),
-        containmentReceiptPath: restoredReceiptPath(dto.payload.containmentReceiptPath, stateRoot),
+        containmentReceiptPath: restoredContainmentReceiptPath(stateRoot, dto.payload.containmentReceiptPath),
       };
       if (dto.schemaVersion === 1) {
         return { schemaVersion: 1, eventType: dto.eventType, payload: common };
       }
-      const payload: RunLaunchRequestedPayloadV2 = {
+      const payload: RestorationRunLaunchRequestedPayloadV2 = {
         ...common,
         containment: {
           backend: dto.payload.containment.backend,
-          scopePath: absolutePath(dto.payload.containment.scopePath),
+          scopePath: observedCgroupScopePath(absolutePath(dto.payload.containment.scopePath)),
         },
       };
       return { schemaVersion: 2, eventType: dto.eventType, payload };
@@ -93,7 +138,7 @@ export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAg
         agentId: agentId(dto.payload.agentId),
         runId: brandRunId(dto.payload.runId),
         reason: dto.payload.reason as CancellationReason,
-        containmentReceiptPath: restoredReceiptPath(dto.payload.containmentReceiptPath, stateRoot),
+        containmentReceiptPath: restoredContainmentReceiptPath(stateRoot, dto.payload.containmentReceiptPath),
       };
       return { schemaVersion: dto.schemaVersion, eventType: dto.eventType, payload };
     }
@@ -104,7 +149,7 @@ export function decodeAgentEvent(value: unknown, stateRoot: string): PersistedAg
   }
 }
 
-function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): RunCompletedPayload {
+function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: AbsolutePath): RestorableAgentCompletion {
   const textBytes = new TextEncoder().encode(dto.output.text).byteLength;
   if (textBytes !== dto.output.retainedBytes || dto.output.retainedBytes > MAX_COMPLETION_OUTPUT_BYTES ||
       dto.output.originalBytes < dto.output.retainedBytes ||
@@ -114,7 +159,7 @@ function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): Ru
   if (dto.state === "failed" && new TextEncoder().encode(dto.error.message).byteLength > MAX_ERROR_MESSAGE_BYTES) {
     throw new Error("invalid_input: persisted completion error exceeds byte limit");
   }
-  const base: Omit<AgentCompletion, "state" | "error" | "reason"> = {
+  const base: Omit<RestorableAgentCompletion, "state" | "error" | "reason"> = {
     agentId: agentId(dto.agentId),
     runId: brandRunId(dto.runId),
     output: {
@@ -123,15 +168,15 @@ function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): Ru
       retainedBytes: utf8Bytes(dto.output.retainedBytes),
       truncated: dto.output.truncated,
     },
-    outputPath: restoredOutputPath(dto.outputPath, stateRoot) as AgentCompletion["outputPath"],
-    transcriptPath: restoredSessionPath(dto.transcriptPath, stateRoot),
+    outputPath: restoredOutputPath(stateRoot, dto.outputPath),
+    transcriptPath: restoredSessionPath(stateRoot, dto.transcriptPath),
     ...(dto.usage !== undefined ? { usage: validateUsage(dto.usage) } : {}),
   };
   if (dto.state === "failed" && dto.error !== undefined) {
     const diagnosticsPath =
       dto.error.diagnosticsPath === undefined
         ? undefined
-        : (restoredDiagnosticsPath(dto.error.diagnosticsPath, stateRoot) as DiagnosticsPath);
+        : restoredDiagnosticsPath(stateRoot, dto.error.diagnosticsPath);
     return {
       ...base,
       state: "failed",
@@ -145,22 +190,6 @@ function decodeCompletionPayload(dto: AgentCompletionDto, stateRoot: string): Ru
     return { ...base, state: "cancelled", reason: dto.reason as CancellationReason };
   }
   return { ...base, state: "completed" };
-}
-
-function restoredSessionPath(value: string, root: string): SpawnedPayload["sessionPath"] {
-  return restoredStatePath(root, value) as SpawnedPayload["sessionPath"];
-}
-
-function restoredReceiptPath(value: string, root: string): ContainmentReceiptPath {
-  return restoredStatePath(root, value) as ContainmentReceiptPath;
-}
-
-function restoredOutputPath(value: string, root: string): AbsolutePath {
-  return restoredStatePath(root, value);
-}
-
-function restoredDiagnosticsPath(value: string, root: string): AbsolutePath {
-  return restoredStatePath(root, value);
 }
 
 function validateUsage(value: NonNullable<AgentCompletionDto["usage"]>): AgentUsage {
@@ -263,28 +292,52 @@ export class AgentEventAppender {
 
 // --- Pure event fold ------------------------------------------------------
 
-export interface RestoredAgentRecord {
+export interface AgentMetadata {
   agentId: AgentId;
   sessionPath: SpawnedPayload["sessionPath"];
   cwd: SpawnedPayload["cwd"];
-  provider: string;
+  provider: SpawnedPayload["provider"];
   modelId: SpawnedPayload["modelId"];
   thinkingLevel: SpawnedPayload["thinkingLevel"];
-  tools: readonly string[];
-  state: AgentState;
-  currentRunId?: RunId;
-  currentReceiptPath?: ContainmentReceiptPath;
-  currentAttemptId?: RunAttemptId;
-  currentContainment?: ContainmentDescriptor;
-  currentEventVersion?: 1 | 2;
-  pendingLaunch?: RunLaunchRequestedPayloadV1 | RunLaunchRequestedPayloadV2;
-  pendingLaunchEventVersion?: 1 | 2;
-  pendingStopReason?: CancellationReason;
-  latestCompletion?: AgentCompletion;
-  latestCompletionReceiptPath?: ContainmentReceiptPath;
-  latestCompletionAttemptId?: RunAttemptId;
-  latestCompletionContainment?: ContainmentDescriptor;
-  latestCompletionEventVersion?: 1 | 2;
+  tools: SpawnedPayload["tools"];
+}
+
+export type PendingLaunch =
+  | { payload: RunLaunchRequestedPayloadV1; eventVersion: 1 }
+  | { payload: RestorationRunLaunchRequestedPayloadV2; eventVersion: 2 };
+
+export interface ActiveRun {
+  runId: RunId;
+  receiptPath: ContainmentReceiptPath;
+  attemptId: RunAttemptId;
+  containment?: RestorationContainmentDescriptor;
+  eventVersion: 1 | 2;
+}
+
+export interface CompletedRunMetadata {
+  readonly receiptPath: ContainmentReceiptPath;
+  readonly attemptId: RunAttemptId;
+  readonly containment?: RestorationContainmentDescriptor;
+  readonly eventVersion: 1 | 2;
+}
+
+export interface CompletedRunCandidate extends CompletedRunMetadata {
+  readonly payload: RestorableAgentCompletion;
+}
+
+export interface DurableCompletedRun extends CompletedRunMetadata {
+  readonly payload: AgentCompletion;
+}
+
+export type FoldedAgentRecord = AgentMetadata & { completion?: CompletedRunCandidate } & (
+  | { state: typeof AgentState.Stopped; pendingLaunch?: PendingLaunch }
+  | { state: typeof AgentState.Running; run: ActiveRun }
+  | { state: typeof AgentState.Stopping; run: ActiveRun; stopReason: CancellationReason }
+);
+
+export function pickMetadata(record: AgentMetadata): AgentMetadata {
+  const { agentId, sessionPath, cwd, provider, modelId, thinkingLevel, tools } = record;
+  return { agentId, sessionPath, cwd, provider, modelId, thinkingLevel, tools };
 }
 
 export type RestorationAction =
@@ -293,7 +346,7 @@ export type RestorationAction =
       agentId: AgentId;
       containmentReceiptPath: ContainmentReceiptPath;
       attemptId: RunAttemptId;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     }
   | {
@@ -302,7 +355,7 @@ export type RestorationAction =
       attemptId: RunAttemptId;
       previousLeafId: SessionEntryId | null;
       containmentReceiptPath: ContainmentReceiptPath;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     }
   | {
@@ -311,7 +364,7 @@ export type RestorationAction =
       runId: RunId;
       containmentReceiptPath: ContainmentReceiptPath;
       attemptId: RunAttemptId;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     }
   | {
@@ -321,12 +374,12 @@ export type RestorationAction =
       reason: CancellationReason;
       containmentReceiptPath: ContainmentReceiptPath;
       attemptId: RunAttemptId;
-      descriptor?: ContainmentDescriptor;
+      descriptor?: RestorationContainmentDescriptor;
       eventVersion: 1 | 2;
     };
 
 export interface RestoredRegistry {
-  agents: Map<AgentId, RestoredAgentRecord>;
+  agents: Map<AgentId, FoldedAgentRecord>;
   actions: RestorationAction[];
   invalidEvents: string[];
 }
@@ -346,8 +399,8 @@ interface FoldableEntry {
  * only what the persisted log proves; the transient runtime `Settling` state has no persisted
  * event and is therefore not observable here.
  */
-export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: string): RestoredRegistry {
-  const agents = new Map<AgentId, RestoredAgentRecord>();
+export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: AbsolutePath): RestoredRegistry {
+  const agents = new Map<AgentId, FoldedAgentRecord>();
   const actions: RestorationAction[] = [];
   const invalidEvents: string[] = [];
   const rejectedAgents = new Set<AgentId>();
@@ -361,7 +414,7 @@ export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: st
       continue;
     }
 
-    let event: PersistedAgentEvent;
+    let event: DecodedPersistedAgentEvent;
     try {
       event = decodeAgentEvent(entry.data, stateRoot);
     } catch (error) {
@@ -383,45 +436,46 @@ export function foldAgentEvents(entries: readonly FoldableEntry[], stateRoot: st
   }
 
   for (const record of agents.values()) {
-    if (record.pendingLaunch !== undefined) {
+    if (record.state === AgentState.Stopped && record.pendingLaunch !== undefined) {
+      const { payload, eventVersion } = record.pendingLaunch;
       actions.push({
         type: RestorationActionType.ReconcileLaunch,
         agentId: record.agentId,
-        attemptId: record.pendingLaunch.attemptId,
-        previousLeafId: record.pendingLaunch.previousLeafId,
-        containmentReceiptPath: record.pendingLaunch.containmentReceiptPath,
-        ...("containment" in record.pendingLaunch ? { descriptor: record.pendingLaunch.containment } : {}),
-        eventVersion: record.pendingLaunchEventVersion ?? 1,
+        attemptId: payload.attemptId,
+        previousLeafId: payload.previousLeafId,
+        containmentReceiptPath: payload.containmentReceiptPath,
+        ...("containment" in payload ? { descriptor: payload.containment } : {}),
+        eventVersion,
       });
-    } else if (record.state === AgentState.Running && record.currentRunId !== undefined) {
+    } else if (record.state === AgentState.Running) {
       actions.push({
         type: RestorationActionType.ReconcileStarted,
         agentId: record.agentId,
-        runId: record.currentRunId,
-        containmentReceiptPath: record.currentReceiptPath as ContainmentReceiptPath,
-        attemptId: record.currentAttemptId as RunAttemptId,
-        ...(record.currentContainment === undefined ? {} : { descriptor: record.currentContainment }),
-        eventVersion: record.currentEventVersion ?? 1,
+        runId: record.run.runId,
+        containmentReceiptPath: record.run.receiptPath,
+        attemptId: record.run.attemptId,
+        ...(record.run.containment === undefined ? {} : { descriptor: record.run.containment }),
+        eventVersion: record.run.eventVersion,
       });
-    } else if (record.state === AgentState.Stopping && record.currentRunId !== undefined) {
+    } else if (record.state === AgentState.Stopping) {
       actions.push({
         type: RestorationActionType.ReconcileStopping,
         agentId: record.agentId,
-        runId: record.currentRunId,
-        reason: record.pendingStopReason as CancellationReason,
-        containmentReceiptPath: record.currentReceiptPath as ContainmentReceiptPath,
-        attemptId: record.currentAttemptId as RunAttemptId,
-        ...(record.currentContainment === undefined ? {} : { descriptor: record.currentContainment }),
-        eventVersion: record.currentEventVersion ?? 1,
+        runId: record.run.runId,
+        reason: record.stopReason,
+        containmentReceiptPath: record.run.receiptPath,
+        attemptId: record.run.attemptId,
+        ...(record.run.containment === undefined ? {} : { descriptor: record.run.containment }),
+        eventVersion: record.run.eventVersion,
       });
-    } else if (record.state === AgentState.Stopped && record.latestCompletion !== undefined) {
+    } else if (record.completion !== undefined) {
       actions.push({
         type: RestorationActionType.ValidateCompletedReceipt,
         agentId: record.agentId,
-        containmentReceiptPath: record.latestCompletionReceiptPath as ContainmentReceiptPath,
-        attemptId: record.latestCompletionAttemptId as RunAttemptId,
-        ...(record.latestCompletionContainment === undefined ? {} : { descriptor: record.latestCompletionContainment }),
-        eventVersion: record.latestCompletionEventVersion ?? 1,
+        containmentReceiptPath: record.completion.receiptPath,
+        attemptId: record.completion.attemptId,
+        ...(record.completion.containment === undefined ? {} : { descriptor: record.completion.containment }),
+        eventVersion: record.completion.eventVersion,
       });
     }
   }
@@ -435,8 +489,8 @@ function persistedAgentId(value: unknown): AgentId | undefined {
 }
 
 function applyEvent(
-  agents: Map<AgentId, RestoredAgentRecord>,
-  event: PersistedAgentEvent,
+  agents: Map<AgentId, FoldedAgentRecord>,
+  event: DecodedPersistedAgentEvent,
   pushInvalid: (message: string) => void,
 ): void {
   switch (event.eventType) {
@@ -471,8 +525,12 @@ function applyEvent(
         pushInvalid(`overlapping run_launch_requested for agent ${event.payload.agentId}`);
         return;
       }
-      record.pendingLaunch = event.payload;
-      record.pendingLaunchEventVersion = event.schemaVersion;
+      agents.set(event.payload.agentId, {
+        ...record,
+        pendingLaunch: event.schemaVersion === 1
+          ? { payload: event.payload, eventVersion: 1 }
+          : { payload: event.payload, eventVersion: 2 },
+      });
       return;
     }
     case AgentEventType.RunStarted: {
@@ -481,7 +539,8 @@ function applyEvent(
         pushInvalid(`run_started for unknown agent ${event.payload.agentId}`);
         return;
       }
-      if (record.pendingLaunch?.attemptId !== event.payload.attemptId) {
+      const pending = record.state === AgentState.Stopped ? record.pendingLaunch : undefined;
+      if (pending?.payload.attemptId !== event.payload.attemptId) {
         pushInvalid(`unmatched run_started for agent ${event.payload.agentId}`);
         return;
       }
@@ -489,16 +548,18 @@ function applyEvent(
         pushInvalid(`run_started while agent ${event.payload.agentId} was not stopped`);
         return;
       }
-      record.state = AgentState.Running;
-      record.currentRunId = event.payload.runId;
-      record.currentReceiptPath = record.pendingLaunch.containmentReceiptPath;
-      record.currentAttemptId = record.pendingLaunch.attemptId;
-      if (record.pendingLaunchEventVersion === undefined) delete record.currentEventVersion;
-      else record.currentEventVersion = record.pendingLaunchEventVersion;
-      if ("containment" in record.pendingLaunch) record.currentContainment = record.pendingLaunch.containment;
-      else delete record.currentContainment;
-      delete record.pendingLaunch;
-      delete record.pendingLaunchEventVersion;
+      agents.set(event.payload.agentId, {
+        ...pickMetadata(record),
+        ...(record.completion === undefined ? {} : { completion: record.completion }),
+        state: AgentState.Running,
+        run: {
+          runId: event.payload.runId,
+          receiptPath: pending.payload.containmentReceiptPath,
+          attemptId: pending.payload.attemptId,
+          ...(pending.eventVersion === 2 ? { containment: pending.payload.containment } : {}),
+          eventVersion: pending.eventVersion,
+        },
+      });
       return;
     }
     case AgentEventType.RunStopping: {
@@ -507,13 +568,17 @@ function applyEvent(
         pushInvalid(`run_stopping for unknown agent ${event.payload.agentId}`);
         return;
       }
-      if (record.state !== AgentState.Running || record.currentRunId !== event.payload.runId) {
+      if (record.state !== AgentState.Running || record.run.runId !== event.payload.runId) {
         pushInvalid(`unmatched run_stopping for agent ${event.payload.agentId}`);
         return;
       }
-      record.state = AgentState.Stopping;
-      record.currentReceiptPath = event.payload.containmentReceiptPath;
-      record.pendingStopReason = event.payload.reason;
+      agents.set(event.payload.agentId, {
+        ...pickMetadata(record),
+        ...(record.completion === undefined ? {} : { completion: record.completion }),
+        state: AgentState.Stopping,
+        run: { ...record.run, receiptPath: event.payload.containmentReceiptPath },
+        stopReason: event.payload.reason,
+      });
       return;
     }
     case AgentEventType.RunCompleted: {
@@ -522,7 +587,7 @@ function applyEvent(
         pushInvalid(`run_completed for unknown agent ${event.payload.agentId}`);
         return;
       }
-      if (record.currentRunId !== event.payload.runId || record.state === AgentState.Stopped) {
+      if (record.state === AgentState.Stopped || record.run.runId !== event.payload.runId) {
         pushInvalid(`duplicate or unmatched run_completed for agent ${event.payload.agentId}`);
         return;
       }
@@ -531,15 +596,17 @@ function applyEvent(
         pushInvalid(`run_completed transcript mismatch for agent ${event.payload.agentId}`);
         return;
       }
-      record.state = AgentState.Stopped;
-      record.latestCompletion = event.payload;
-      if (record.currentReceiptPath !== undefined) record.latestCompletionReceiptPath = record.currentReceiptPath;
-      if (record.currentAttemptId !== undefined) record.latestCompletionAttemptId = record.currentAttemptId;
-      if (record.currentContainment !== undefined) record.latestCompletionContainment = record.currentContainment;
-      else delete record.latestCompletionContainment;
-      if (record.currentEventVersion === undefined) delete record.latestCompletionEventVersion;
-      else record.latestCompletionEventVersion = record.currentEventVersion;
-      delete record.pendingStopReason;
+      agents.set(event.payload.agentId, {
+        ...pickMetadata(record),
+        state: AgentState.Stopped,
+        completion: {
+          payload: event.payload,
+          receiptPath: record.run.receiptPath,
+          attemptId: record.run.attemptId,
+          ...(record.run.containment === undefined ? {} : { containment: record.run.containment }),
+          eventVersion: record.run.eventVersion,
+        },
+      });
       return;
     }
   }

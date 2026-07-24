@@ -2,16 +2,24 @@ import { isAbsolute, join } from "node:path";
 
 import { DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_MAX_DEPTH, MAX_MAX_DEPTH, MAX_TREE_CHILD_PROCESSES } from "./constants.ts";
 import { boundedTreeChildCount, type DelegationLimits } from "./delegation-policy.ts";
+import {
+  delegationDepth,
+  runCapacity,
+  type AbsolutePath,
+  type DelegationDepth,
+  type RunCapacity,
+} from "./domain.ts";
+import { absolutePath } from "./paths.ts";
 
 export interface SubagentSettingsResolved {
-  maxConcurrentRuns: number;
-  maxDepth: number;
-  cgroupRoot?: string;
+  maxConcurrentRuns: RunCapacity;
+  maxDepth: DelegationDepth;
+  cgroupRoot?: AbsolutePath;
 }
 
 export interface SubagentSettingsFileInput {
-  agentDir: string;
-  cwd: string;
+  agentDir: AbsolutePath;
+  cwd: AbsolutePath;
   projectTrusted: boolean;
   configDirName: string;
   readOptional(path: string): string | undefined;
@@ -77,7 +85,7 @@ export function loadSubagentSettings(
       diagnostics.push(
         `subagents maxDepth ${maxDepth} with maxConcurrentRuns ${maxConcurrentRuns} allows more than 100 concurrent child processes; using maxDepth 1`,
       );
-      maxDepth = 1;
+      maxDepth = delegationDepth(1);
     }
   }
   diagnoseProjectMaxDepth(project, diagnostics);
@@ -98,14 +106,14 @@ export function loadSubagentSettings(
 function extractCgroupRoot(
   subagents: Record<string, unknown> | undefined,
   diagnostics: string[],
-): string | undefined {
+): AbsolutePath | undefined {
   if (subagents === undefined || subagents.cgroupRoot === undefined) return undefined;
   const value = subagents.cgroupRoot;
   if (typeof value !== "string" || !isAbsolute(value) || value.includes("\0")) {
     diagnostics.push("global subagents.cgroupRoot must be an absolute path; ignoring");
     return undefined;
   }
-  return value;
+  return absolutePath(value);
 }
 
 function diagnoseProjectCgroupRoot(
@@ -144,7 +152,7 @@ function readSubagents(
   return subagents as Record<string, unknown>;
 }
 
-export function readGlobalMaxDepth(globalText: string | undefined): number {
+export function readGlobalMaxDepth(globalText: string | undefined): DelegationDepth {
   const diagnostics: string[] = [];
   const maxDepth = extractMaxDepth(readSubagents(globalText, "global", diagnostics), "global", diagnostics);
   return maxDepth ?? DEFAULT_MAX_DEPTH;
@@ -154,7 +162,7 @@ function extractMaxDepth(
   subagents: Record<string, unknown> | undefined,
   source: string,
   diagnostics: string[],
-): number | undefined {
+): DelegationDepth | undefined {
   if (subagents === undefined || subagents.maxDepth === undefined) return undefined;
   const maxDepth = subagents.maxDepth;
   if (
@@ -164,7 +172,7 @@ function extractMaxDepth(
     diagnostics.push(`${source} subagents.maxDepth must be an integer from 0 through 8; ignoring`);
     return undefined;
   }
-  return maxDepth;
+  return delegationDepth(maxDepth);
 }
 
 function diagnoseProjectMaxDepth(
@@ -180,7 +188,7 @@ function extractMaxConcurrentRuns(
   subagents: Record<string, unknown> | undefined,
   source: string,
   diagnostics: string[],
-): number | undefined {
+): RunCapacity | undefined {
   if (subagents === undefined) return undefined;
 
   const maxConcurrentRuns = subagents.maxConcurrentRuns;
@@ -198,5 +206,5 @@ function extractMaxConcurrentRuns(
     return undefined;
   }
 
-  return maxConcurrentRuns;
+  return runCapacity(maxConcurrentRuns);
 }

@@ -7,13 +7,37 @@ import {
   projectCustomModelWarning,
   resolveChildSelection,
   type ChildSelectionInput,
+  type EffectiveChildSelection,
   type ModelCatalogue,
 } from "../src/child-selection.ts";
 import {
   AgentErrorCode,
   PublicPreflightError,
   isPublicPreflightError,
+  modelSpecParts,
+  type ModelId,
+  type ModelSpec,
+  type ProviderId,
+  type ToolName,
 } from "../src/domain.ts";
+
+function assertBrandedSelection(selection: EffectiveChildSelection): void {
+  const model: ModelSpec = selection.model;
+  const tools: readonly ToolName[] = selection.tools;
+  const parts = modelSpecParts(model);
+  const provider: ProviderId = parts.provider;
+  const modelId: ModelId = parts.modelId;
+  void tools;
+  void provider;
+  void modelId;
+}
+
+const _lifecycleToolNames: readonly ToolName[] = LIFECYCLE_TOOL_NAMES;
+void _lifecycleToolNames;
+
+function primitiveTools(tools: readonly ToolName[]): readonly string[] {
+  return tools;
+}
 
 const MODELS: readonly Model<Api>[] = [
   fixtureModel("mock-provider", "luna", "Luna"),
@@ -113,29 +137,70 @@ describe("resolveChildSelection", () => {
     expect(resolveChildSelection(selectionInput({ parentThinking: "off" })).thinkingLevel).toBe("off");
   });
 
+  test("does not read the model catalogue when inheriting the parent model", () => {
+    const input = selectionInput();
+    expect(resolveChildSelection({
+      ...input,
+      modelRegistry: { getAll: () => { throw new Error("catalogue must not be read"); } },
+    }).model as string).toBe("mock-provider/luna");
+  });
+
+  test("ignores unusable catalogue entries when resolving an explicit model", () => {
+    const input = selectionInput({ requestedModel: "solar" });
+    expect(resolveChildSelection({
+      ...input,
+      modelRegistry: {
+        getAll: () => [
+          fixtureModel("invalid/provider", "broken", "Invalid"),
+          fixtureModel("second-provider", "solar", "BrightStar"),
+        ],
+      },
+    }).model as string).toBe("second-provider/solar");
+  });
+
+  test("reports the number of unusable catalogue entries when no model resolves", () => {
+    const input = selectionInput({ requestedModel: "broken" });
+    const error = capturePublicError(() => resolveChildSelection({
+      ...input,
+      modelRegistry: {
+        getAll: () => [fixtureModel("invalid/provider", "broken", "Invalid")],
+      },
+    }));
+    expect(error.message).toContain("ignored 1 invalid configured model entry");
+  });
+
   test.each([
     [undefined, ["read", "web_fetch", "spawn_agent"], ["read", "web_fetch"]],
     [["web_fetch", "read", "web_fetch"], ["read", "web_fetch"], ["web_fetch", "read"]],
     [[], ["read", "web_fetch"], []],
   ] as const)("selects tools %#", (requestedTools, parentActiveTools, expected) => {
-    expect(resolveChildSelection(selectionInput({
+    expect(primitiveTools(resolveChildSelection(selectionInput({
       ...(requestedTools === undefined ? {} : { requestedTools }),
       parentActiveTools,
-    })).tools)
+    })).tools))
       .toEqual(expected);
   });
 
+  test("returns branded selected model and tool identities", () => {
+    assertBrandedSelection(resolveChildSelection(selectionInput({ requestedTools: ["read"] })));
+  });
+
+  test("validates active parent tools before selection", () => {
+    expect(() => resolveChildSelection(selectionInput({ parentActiveTools: ["read", "bad\ntool"] })))
+      .toThrow(/invalid_input/);
+  });
+
   test("retains inherited and explicitly requested lifecycle tools below the boundary", () => {
-    expect(resolveChildSelection(selectionInput({
+    expect(primitiveTools(resolveChildSelection(selectionInput({
       allowLifecycleTools: true,
       parentActiveTools: ["read", "spawn_agent", "receive_agent"],
-    })).tools).toEqual(["read", "spawn_agent", "receive_agent"]);
+    })).tools)).toEqual(["read", "spawn_agent", "receive_agent"]);
 
-    expect(resolveChildSelection(selectionInput({
+    expect(primitiveTools(resolveChildSelection(selectionInput({
       allowLifecycleTools: true,
       requestedTools: ["spawn_agent"],
       parentActiveTools: ["read", "spawn_agent"],
-    })).tools).toEqual(["spawn_agent"]);
+    })).tools)).toEqual(["spawn_agent"]);
   });
 
   test("rejects inactive lifecycle tools below the boundary", () => {
@@ -147,9 +212,9 @@ describe("resolveChildSelection", () => {
   });
 
   test("strips inherited lifecycle tools and rejects each explicit lifecycle tool at the boundary", () => {
-    expect(resolveChildSelection(selectionInput({
+    expect(primitiveTools(resolveChildSelection(selectionInput({
       parentActiveTools: ["read", ...LIFECYCLE_TOOL_NAMES],
-    })).tools).toEqual(["read"]);
+    })).tools)).toEqual(["read"]);
     for (const tool of LIFECYCLE_TOOL_NAMES) {
       expect(() => resolveChildSelection(selectionInput({
         requestedTools: [tool],

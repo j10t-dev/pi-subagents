@@ -15,84 +15,95 @@ import { CONTAINMENT_TIMEOUT_MS } from "./constants.ts";
 import type {
   ContainmentAttempt,
   ContainmentBackend,
+  ContainmentCandidateDescriptor,
   ContainmentDescriptor,
   ContainmentOutcome,
+  RestorationContainmentDescriptor,
 } from "./containment.ts";
 import { publishCommittedSync } from "./durable-fs.ts";
 import {
   AgentErrorCode,
   PublicPreflightError,
+  milliseconds,
+  processId,
   verifiedContainmentReceiptPath,
   type AbsolutePath,
+  type AgentId,
+  type CgroupScopePath,
   type ContainmentReceiptPath,
+  type Milliseconds,
+  type ProcessId,
   type RunAttemptId,
   type VerifiedContainmentReceiptPath,
 } from "./domain.ts";
-import { isContainedPath } from "./paths.ts";
+import { absolutePath, isContainedPath } from "./paths.ts";
 
 const UNAVAILABLE_PREFIX = "containment_unavailable:";
+
+export interface CgroupStat {
+  isDirectory(): boolean;
+  readonly mode: number;
+}
 
 export interface CgroupFileSystem {
   readFile(path: string): string;
   writeFile(path: string, value: string): void;
   mkdir(path: string, mode: number): void;
   realpath(path: string): string;
-  stat(path: string): { isDirectory(): boolean };
+  stat(path: string): CgroupStat;
   removeDirectory(path: string): void;
   /** Returns direct directory-entry names, matching `readdirSync(path)`. */
   list(path: string): readonly string[];
 }
 
 export interface ProbeProcess {
-  readonly pid: number;
+  readonly pid: ProcessId;
   release(): void;
   readonly exited: Promise<void>;
   kill(): void;
 }
 
 export interface CgroupV2Options {
-  readonly parentSessionId: string;
+  readonly parentSessionId: AgentId;
   readonly configuredRoot?: string;
   readonly mountPath?: string;
   readonly selfCgroupText?: string;
   readonly fs?: CgroupFileSystem;
   readonly spawnProbe?: () => ProbeProcess;
   readonly receiptPathFor: (attemptId: RunAttemptId) => ContainmentReceiptPath;
-  readonly pollDelay?: (milliseconds: number) => Promise<void>;
+  readonly pollDelay?: (milliseconds: Milliseconds) => Promise<void>;
   readonly now?: () => number;
   readonly randomBytes?: (bytes: number) => Buffer;
   readonly diagnostic?: (message: string) => void;
 }
 
-export function cgroupScopeName(value: string): string {
+export function cgroupScopeName(value: AgentId | RunAttemptId): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
 export function resolveCgroupV2Backend(options: CgroupV2Options): ContainmentBackend {
-  const fs = options.fs ?? nodeFileSystem;
+  const fs = options.fs ?? nodeCgroupFileSystem;
   const mountReal = canonicalDirectory(fs, options.mountPath ?? "/sys/fs/cgroup", "mount");
   if (options.configuredRoot !== undefined &&
       (!isAbsolute(options.configuredRoot) || options.configuredRoot.includes("\0"))) {
     unavailable("configured root");
   }
-  const resolution = options.configuredRoot === undefined
+  const root = options.configuredRoot === undefined
     ? resolveDefaultRoot(
       fs,
       mountReal,
       options.selfCgroupText ?? readFileSync("/proc/self/cgroup", "utf8"),
     )
-    : {
-      root: canonicalContainedDirectory(fs, mountReal, options.configuredRoot, "configured root"),
-      autoCreatedRoot: false,
-    };
-  const parentCandidate = join(resolution.root, cgroupScopeName(options.parentSessionId));
-  if (directoryExists(fs, parentCandidate)) {
-    requireDirectory(fs, parentCandidate, "parent scope");
-  } else {
+    : canonicalContainedDirectory(fs, mountReal, options.configuredRoot, "configured root");
+  const parentCandidate = join(root, cgroupScopeName(options.parentSessionId));
+  const parentStat = probeDirectoryStrict(fs, parentCandidate, "parent scope");
+  if (parentStat === undefined) {
     filesystemOperation("parent scope", () => fs.mkdir(parentCandidate, 0o700));
+  } else if (!parentStat.isDirectory()) {
+    unavailable("parent scope");
   }
-  const parentReal = canonicalContainedDirectory(fs, resolution.root, parentCandidate, "parent scope");
-  return new CgroupV2Backend(fs, resolution.root, parentReal, resolution.autoCreatedRoot, options);
+  const parentReal = canonicalContainedDirectory(fs, root, parentCandidate, "parent scope");
+  return new CgroupV2Backend(fs, root, parentReal, options);
 }
 
 export type ContainmentProvider =
@@ -125,11 +136,10 @@ class CgroupV2Backend implements ContainmentBackend {
     private readonly fs: CgroupFileSystem,
     root: string,
     parentScope: string,
-    private readonly autoCreatedRoot: boolean,
     private readonly options: CgroupV2Options,
   ) {
-    this.root = root as AbsolutePath;
-    this.parentScope = parentScope as AbsolutePath;
+    this.root = absolutePath(root);
+    this.parentScope = absolutePath(parentScope);
   }
 
   async preflight(): Promise<void> {
@@ -173,15 +183,18 @@ class CgroupV2Backend implements ContainmentBackend {
     assertContained(this.root, this.parentScope, "parent scope");
     const existing = this.attempts.get(attemptId);
     if (existing !== undefined) return existing;
-    const scope = join(this.parentScope, cgroupScopeName(attemptId));
+    const scope = absolutePath(join(this.parentScope, cgroupScopeName(attemptId)));
     assertContained(this.parentScope, scope, "attempt path");
-    const attempt = new CgroupAttempt(this, attemptId, scope as AbsolutePath, scope);
+    const attempt = new CgroupAttempt(this, attemptId, scope);
     this.attempts.set(attemptId, attempt);
     return attempt;
   }
 
-  restoreAttempt(attemptId: RunAttemptId, descriptor: ContainmentDescriptor): ContainmentAttempt {
-    const expected = join(this.parentScope, cgroupScopeName(attemptId));
+  restoreAttempt(
+    attemptId: RunAttemptId,
+    descriptor: RestorationContainmentDescriptor,
+  ): ContainmentAttempt {
+    const expected = absolutePath(join(this.parentScope, cgroupScopeName(attemptId)));
     if (descriptor.backend !== "cgroup-v2" || descriptor.scopePath !== expected) {
       unavailable("attempt descriptor");
     }
@@ -191,12 +204,7 @@ class CgroupV2Backend implements ContainmentBackend {
     if (operationScope !== expected) unavailable("attempt scope");
     const existing = this.attempts.get(attemptId);
     if (existing !== undefined) return existing;
-    const attempt = new CgroupAttempt(
-      this,
-      attemptId,
-      descriptor.scopePath,
-      operationScope,
-    );
+    const attempt = new CgroupAttempt(this, attemptId, absolutePath(operationScope));
     this.attempts.set(attemptId, attempt);
     return attempt;
   }
@@ -205,8 +213,28 @@ class CgroupV2Backend implements ContainmentBackend {
     for (const attempt of [...this.attempts.values()]) {
       await attempt.retryCleanup();
     }
-    const parentRemoved = this.removeIntermediate(this.parentScope, "parent scope");
-    if (parentRemoved && this.autoCreatedRoot) this.removeIntermediate(this.root, "root");
+    this.removeIntermediate(this.parentScope, "parent scope");
+  }
+
+  proveRuntimeDescriptor(
+    attempt: CgroupAttempt,
+    evidence: RestorationContainmentDescriptor,
+  ): ContainmentDescriptor {
+    if (evidence.backend !== attempt.candidate.backend ||
+        evidence.scopePath !== attempt.candidate.scopePath) {
+      unavailable("attempt descriptor");
+    }
+    const canonicalScope = canonicalContainedDirectory(
+      this.fs,
+      this.parentScope,
+      attempt.operationScope,
+      "attempt scope",
+    );
+    if (canonicalScope !== attempt.operationScope) unavailable("attempt scope");
+    return {
+      backend: "cgroup-v2",
+      scopePath: provenCgroupScopePath(attempt.candidate.scopePath),
+    };
   }
 
   ensureNoProcessScope(scope: string): void {
@@ -240,7 +268,7 @@ class CgroupV2Backend implements ContainmentBackend {
         version: 2,
         attemptId: attempt.attemptId,
         backend: "cgroup-v2",
-        scopePath: attempt.descriptor.scopePath,
+        scopePath: attempt.candidate.scopePath,
         outcome,
         timestamp: new Date((this.options.now ?? Date.now)()).toISOString(),
         populated: false,
@@ -312,7 +340,7 @@ class CgroupV2Backend implements ContainmentBackend {
     while (true) {
       if (this.readPopulated(scope) === 0) return;
       if (now() >= deadline) unavailable("empty timeout");
-      await (this.options.pollDelay ?? delay)(20);
+      await (this.options.pollDelay ?? delay)(milliseconds(20));
     }
   }
 
@@ -344,18 +372,21 @@ class CgroupV2Backend implements ContainmentBackend {
 }
 
 class CgroupAttempt implements ContainmentAttempt {
-  readonly descriptor: ContainmentDescriptor;
+  readonly candidate: ContainmentCandidateDescriptor;
   readonly parentScope: AbsolutePath;
   acceptedReceipt: VerifiedContainmentReceiptPath | undefined;
 
   constructor(
     private readonly backend: CgroupV2Backend,
     readonly attemptId: RunAttemptId,
-    scope: AbsolutePath,
-    readonly operationScope: string,
+    readonly operationScope: AbsolutePath,
   ) {
     this.parentScope = backend.parentScope;
-    this.descriptor = { backend: "cgroup-v2", scopePath: scope };
+    this.candidate = { backend: "cgroup-v2", scopePath: operationScope };
+  }
+
+  proveRuntimeDescriptor(evidence: RestorationContainmentDescriptor): ContainmentDescriptor {
+    return this.backend.proveRuntimeDescriptor(this, evidence);
   }
 
   async terminate(outcome: ContainmentOutcome): Promise<VerifiedContainmentReceiptPath> {
@@ -405,23 +436,27 @@ function resolveDefaultRoot(
   fs: CgroupFileSystem,
   mountReal: string,
   selfCgroupText: string,
-): { root: string; autoCreatedRoot: boolean } {
+): string {
   const unified = parseUnifiedPath(selfCgroupText);
   const current = resolve(mountReal, `.${unified}`);
   assertContained(mountReal, current, "parent cgroup");
   const currentReal = canonicalContainedDirectory(fs, mountReal, current, "parent cgroup");
   const rootCandidate = join(currentReal, "pi-subagents");
-  if (directoryExists(fs, rootCandidate)) {
-    return {
-      root: canonicalContainedDirectory(fs, mountReal, rootCandidate, "root"),
-      autoCreatedRoot: false,
-    };
+
+  const existing = probeDirectoryStrict(fs, rootCandidate, "root");
+  if (existing === undefined) {
+    try {
+      fs.mkdir(rootCandidate, 0o700);
+    } catch (error) {
+      if (error instanceof TypeError) throw error;
+      if (errorCode(error) !== "EEXIST") unavailable("root");
+    }
   }
-  filesystemOperation("root", () => fs.mkdir(rootCandidate, 0o700));
-  return {
-    root: canonicalContainedDirectory(fs, mountReal, rootCandidate, "root"),
-    autoCreatedRoot: true,
-  };
+
+  const resolved = probeDirectoryStrict(fs, rootCandidate, "root");
+  if (resolved === undefined) unavailable("root");
+  requirePrivateDirectory(resolved, "root");
+  return canonicalContainedDirectory(fs, mountReal, rootCandidate, "root");
 }
 
 function parseUnifiedPath(text: string): string {
@@ -445,12 +480,12 @@ function parsePopulated(text: string): 0 | 1 {
   return populated[0]![2] === "0" ? 0 : 1;
 }
 
-function parsePids(text: string): number[] {
+function parsePids(text: string): ProcessId[] {
   const lines = text.split("\n").filter((line) => line.length > 0);
   if (lines.some((line) => !/^[1-9]\d*$/.test(line))) unavailable("cgroup membership");
-  const pids = lines.map(Number);
-  if (pids.some((pid) => !Number.isSafeInteger(pid))) unavailable("cgroup membership");
-  return pids;
+  const primitivePids = lines.map(Number);
+  if (primitivePids.some((pid) => !Number.isSafeInteger(pid))) unavailable("cgroup membership");
+  return primitivePids.map(processId);
 }
 
 function canonicalDirectory(fs: CgroupFileSystem, path: string, label: string): string {
@@ -474,6 +509,24 @@ function requireDirectory(fs: CgroupFileSystem, path: string, label: string): vo
   if (!stat.isDirectory()) unavailable(label);
 }
 
+function probeDirectoryStrict(
+  fs: CgroupFileSystem,
+  path: string,
+  label: string,
+): CgroupStat | undefined {
+  try {
+    return fs.stat(path);
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    if (errorCode(error) === "ENOENT") return undefined;
+    unavailable(label);
+  }
+}
+
+function requirePrivateDirectory(stat: CgroupStat, label: string): void {
+  if (!stat.isDirectory() || (stat.mode & 0o777) !== 0o700) unavailable(label);
+}
+
 function directoryExists(fs: CgroupFileSystem, path: string): boolean {
   try {
     fs.stat(path);
@@ -486,6 +539,14 @@ function directoryExists(fs: CgroupFileSystem, path: string): boolean {
 
 function assertContained(parent: string, child: string, label: string): void {
   if (!isContainedPath(parent, child)) unavailable(label);
+}
+
+/**
+ * Promotes an absolute path only after this module has proved the exact attempt identity and
+ * containment beneath the backend's canonical parent scope.
+ */
+function provenCgroupScopePath(path: AbsolutePath): CgroupScopePath {
+  return path as CgroupScopePath;
 }
 
 function filesystemOperation<T>(category: string, operation: () => T): T {
@@ -519,20 +580,16 @@ class CgroupUnavailableError extends Error {
 }
 
 function errorCode(error: unknown): string | undefined {
-  if (typeof error === "object" && error !== null && "code" in error) {
-    const code = Reflect.get(error, "code");
-    if (typeof code === "string") return code;
-  }
-  return error instanceof Error && /^(?:ENOENT|ENOTEMPTY)$/.test(error.message)
-    ? error.message
-    : undefined;
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const code = Reflect.get(error, "code");
+  return typeof code === "string" ? code : undefined;
 }
 
 function bestEffort(operation: () => void): void {
   try { operation(); } catch { /* retain the primary capability failure */ }
 }
 
-function delay(milliseconds: number): Promise<void> {
+function delay(milliseconds: Milliseconds): Promise<void> {
   return new Promise((done) => setTimeout(done, milliseconds));
 }
 
@@ -544,7 +601,7 @@ function defaultProbe(): ProbeProcess {
   });
   if (child.pid === undefined) throw new Error("probe pid unavailable");
   return {
-    pid: child.pid,
+    pid: processId(child.pid),
     release: () => child.stdin.end(),
     exited: new Promise((done, reject) => {
       child.once("exit", () => done());
@@ -554,7 +611,7 @@ function defaultProbe(): ProbeProcess {
   };
 }
 
-const nodeFileSystem: CgroupFileSystem = {
+export const nodeCgroupFileSystem: CgroupFileSystem = {
   readFile: (path) => readFileSync(path, "utf8"),
   writeFile: (path, value) => writeFileSync(path, value),
   mkdir: (path, mode) => mkdirSync(path, { mode }),

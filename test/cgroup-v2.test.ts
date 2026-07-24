@@ -6,27 +6,51 @@ import {
   createContainmentProvider,
   resolveCgroupV2Backend,
   type CgroupFileSystem,
+  type CgroupV2Options,
   type ProbeProcess,
 } from "../src/cgroup-v2.ts";
-import { PublicPreflightError, runAttemptId, verifiedContainmentReceiptPath } from "../src/domain.ts";
-import type { ContainmentDescriptor } from "../src/containment.ts";
+import {
+  agentId,
+  observedCgroupScopePath,
+  processId,
+  PublicPreflightError,
+  runAttemptId,
+  verifiedContainmentReceiptPath,
+} from "../src/domain.ts";
+import type { AbsolutePath, CgroupScopePath } from "../src/domain.ts";
+import type { ContainmentDescriptor, RestorationContainmentDescriptor } from "../src/containment.ts";
 import { absolutePath, containmentReceiptPath } from "../src/paths.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const MOUNT = "/sys/fs/cgroup";
 const CURRENT = `${MOUNT}/user.slice/pi.scope`;
 const ROOT = `${CURRENT}/pi-subagents`;
-const PARENT = `${ROOT}/${cgroupScopeName("parent-session")}`;
-const ATTEMPT = `${PARENT}/${cgroupScopeName("attempt-1")}`;
-const PREFLIGHT = `${PARENT}/preflight-00112233445566778899aabbccddeeff`;
+const PARENT_ID = agentId("parent-session");
+const PARENT = `${ROOT}/${cgroupScopeName(PARENT_ID)}`;
 const ATTEMPT_ID = runAttemptId("attempt-1");
+const ATTEMPT = `${PARENT}/${cgroupScopeName(ATTEMPT_ID)}`;
+const PREFLIGHT = `${PARENT}/preflight-00112233445566778899aabbccddeeff`;
+
+function runtimeDescriptor(path = ATTEMPT): RestorationContainmentDescriptor {
+  return { backend: "cgroup-v2", scopePath: observedCgroupScopePath(absolutePath(path)) };
+}
+const RAW_PARENT_ID: string = PARENT_ID;
+// @ts-expect-error raw strings must be validated before cgroup parent identity construction.
+const _scopeFromRawParent = cgroupScopeName(RAW_PARENT_ID);
+const _optionsWithRawParent: CgroupV2Options = {
+  // @ts-expect-error cgroup options retain the validated parent identity internally.
+  parentSessionId: RAW_PARENT_ID,
+  receiptPathFor: () => containmentReceiptPath("/state", "type-flow.json"),
+};
+void _scopeFromRawParent;
+void _optionsWithRawParent;
 
 describe("cgroup-v2", () => {
   test("uses complete SHA-256 scope names", () => {
-    expect(cgroupScopeName("parent-session")).toBe(
+    expect(cgroupScopeName(PARENT_ID)).toBe(
       "a1bdc27ac7582a7459555e91884123666722003a729ba3fbfc29676fc4f724c7",
     );
-    expect(cgroupScopeName("attempt-1")).toBe(
+    expect(cgroupScopeName(ATTEMPT_ID)).toBe(
       "3dafcfaa6218343276ff42263fe100bab5e2b0475a8d98b96abc88c57bfd9992",
     );
   });
@@ -62,6 +86,91 @@ describe("cgroup-v2", () => {
     expect(fs.directories.has(ROOT)).toBeTrue();
   });
 
+  test.each([
+    ["pre-existing", true, undefined],
+    ["newly created", false, undefined],
+    ["concurrently adopted", false, "EEXIST"],
+  ] as const)("requires a private canonical directory for a %s default root", (_name, exists, mkdirFailure) => {
+    const fs = baseFs(...(exists ? [ROOT] : []));
+    if (mkdirFailure !== undefined) {
+      fs.beforeMkdirFailure(ROOT, mkdirFailure, () => fs.addDirectory(ROOT, 0o700));
+    }
+
+    const resolved = backend(fs);
+
+    expect(String(resolved.root)).toBe(ROOT);
+    expect(fs.stat(ROOT).mode & 0o777).toBe(0o700);
+  });
+
+  test.each([
+    ["mode 0755", (fs: MemoryCgroupFileSystem) => fs.addDirectory(ROOT, 0o755)],
+    ["non-directory", (fs: MemoryCgroupFileSystem) => fs.nonDirectories.add(ROOT)],
+    ["escaped realpath", (fs: MemoryCgroupFileSystem) => fs.reals.set(ROOT, "/outside/root")],
+  ])("rejects a %s default root without creating its parent", (_name, arrange) => {
+    const fs = baseFs(ROOT);
+    arrange(fs);
+
+    expect(() => backend(fs)).toThrow(/^containment_unavailable:root/);
+    expect(fs.trace).not.toContain(`mkdir:${PARENT}:700`);
+  });
+
+  test.each([
+    ["root", ROOT, "EACCES"],
+    ["parent scope", PARENT, "EACCES"],
+    ["root", ROOT, "EIO"],
+  ] as const)("does not mkdir after a non-ENOENT %s stat failure", (category, path, code) => {
+    const fs = baseFs(ROOT);
+    fs.statFailures.set(path, code);
+
+    expect(() => backend(fs)).toThrow(`containment_unavailable:${category}`);
+    expect(fs.trace).not.toContain(`mkdir:${path}:700`);
+  });
+
+  test("preserves a TypeError from a strict root stat probe", () => {
+    const fs = baseFs(ROOT);
+    fs.stat = (path: string) => {
+      if (path === ROOT) throw new TypeError("programming failure");
+      return { isDirectory: () => fs.directories.has(path), mode: 0o700 };
+    };
+
+    expect(() => backend(fs)).toThrow(new TypeError("programming failure"));
+  });
+
+  test.each([
+    ["non-directory", (fs: MemoryCgroupFileSystem) => fs.nonDirectories.add(ROOT)],
+    ["mode 0755", (fs: MemoryCgroupFileSystem) => fs.modes.set(ROOT, 0o755)],
+    ["missing", (fs: MemoryCgroupFileSystem) => fs.directories.delete(ROOT)],
+    ["escaped realpath", (fs: MemoryCgroupFileSystem) => fs.reals.set(ROOT, "/outside/root")],
+  ])("rejects root creation EEXIST followed by %s", (_name, arrange) => {
+    const fs = baseFs();
+    fs.beforeMkdirFailure(ROOT, "EEXIST", () => {
+      fs.addDirectory(ROOT, 0o700);
+      arrange(fs);
+    });
+
+    expect(() => backend(fs)).toThrow(/^containment_unavailable:root/);
+    expect(fs.trace).not.toContain(`mkdir:${PARENT}:700`);
+  });
+
+  test.each(["EACCES", "EIO"] as const)("rejects root creation %s without creating its parent", (code) => {
+    const fs = baseFs();
+    fs.mkdirFailures.set(ROOT, code);
+
+    expect(() => backend(fs)).toThrow(/^containment_unavailable:root/);
+    expect(fs.trace).not.toContain(`mkdir:${PARENT}:700`);
+  });
+
+  test("does not adopt a bare-message root creation EEXIST failure", () => {
+    const fs = baseFs();
+    fs.mkdir = () => {
+      fs.addDirectory(ROOT, 0o700);
+      throw new Error("EEXIST");
+    };
+
+    expect(() => backend(fs)).toThrow(/^containment_unavailable:root/);
+    expect(fs.trace).not.toContain(`mkdir:${PARENT}:700`);
+  });
+
   const nonDirectories = [
     ["mount", MOUNT],
     ["root", ROOT],
@@ -94,41 +203,67 @@ describe("cgroup-v2", () => {
     expect(() => backend(current)).toThrow(/^containment_unavailable:parent cgroup/);
   });
 
-  test("prepare is non-I/O, deterministic and reuses attempt identity", () => {
+  test("prepare retains only a candidate until the created scope receives canonical proof", () => {
     const fs = baseFs();
     const resolved = backend(fs);
     fs.trace.length = 0;
     const first = resolved.prepareAttempt(ATTEMPT_ID);
     const second = resolved.prepareAttempt(ATTEMPT_ID);
+    const candidateScope: AbsolutePath = first.candidate.scopePath;
+    // @ts-expect-error lexical preparation is not observed runtime evidence.
+    const _candidateAsObserved: RestorationContainmentDescriptor = first.candidate;
+    // @ts-expect-error lexical preparation cannot produce a live canonical cgroup proof.
+    const _candidateAsProven: CgroupScopePath = first.candidate.scopePath;
+    void _candidateAsObserved;
+    void _candidateAsProven;
     expect(first).toBe(second);
-    expect(first.descriptor).toEqual({ backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    expect(JSON.parse(JSON.stringify(first.candidate))).toEqual({ backend: "cgroup-v2", scopePath: ATTEMPT });
     expect(fs.trace).toEqual([]);
     expect(fs.directories.has(ATTEMPT)).toBeFalse();
+    expect(() => first.proveRuntimeDescriptor(runtimeDescriptor())).toThrow(/^containment_unavailable:attempt scope/);
+
+    fs.addDirectory(candidateScope);
+    const proven: ContainmentDescriptor = first.proveRuntimeDescriptor(runtimeDescriptor());
+    expect(proven.backend).toBe("cgroup-v2");
+    expect(String(proven.scopePath)).toBe(candidateScope);
   });
 
-  test("prepare performs no filesystem I/O after resolution", () => {
+  test.each([
+    ["changed identity", `${PARENT}/different-attempt`],
+    ["root escape", "/outside/attempt"],
+  ])("runtime proof rejects a %s realpath", (_name, canonicalScope) => {
     const fs = baseFs();
     const resolved = backend(fs);
-    fs.reals.set(PARENT, "/outside/parent");
-    expect(resolved.prepareAttempt(ATTEMPT_ID).descriptor.scopePath).toBe(absolutePath(ATTEMPT));
+    const attempt = resolved.prepareAttempt(ATTEMPT_ID);
+    fs.addDirectory(ATTEMPT);
+    fs.reals.set(ATTEMPT, canonicalScope);
+
+    expect(() => attempt.proveRuntimeDescriptor(runtimeDescriptor()))
+      .toThrow(/^containment_unavailable:attempt scope/);
   });
 
-  test("restore validates backend, exact identity and extant canonical containment", () => {
+  test("restore validates backend, exact identity and extant canonical containment without minting live proof", () => {
     const fs = baseFs();
     const resolved = backend(fs);
-    const descriptor = resolved.prepareAttempt(ATTEMPT_ID).descriptor;
-    expect(resolved.restoreAttempt(ATTEMPT_ID, descriptor).descriptor).toEqual(descriptor);
-    expect(() => resolved.restoreAttempt(ATTEMPT_ID, { ...descriptor, scopePath: absolutePath(`${ATTEMPT}-wrong`) }))
+    const stored = runtimeDescriptor();
+    const restored = resolved.restoreAttempt(ATTEMPT_ID, stored);
+    const candidateScope: AbsolutePath = restored.candidate.scopePath;
+    // @ts-expect-error restoration validation alone does not prove a live cgroup scope.
+    const _restoredAsLive: CgroupScopePath = restored.candidate.scopePath;
+    void _restoredAsLive;
+    expect(candidateScope).toBe(stored.scopePath);
+    expect(restored.candidate).toEqual(stored);
+    expect(() => resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor(`${ATTEMPT}-wrong`)))
       .toThrow(/^containment_unavailable:attempt descriptor/);
-    const malformedDescriptor: ContainmentDescriptor = { ...descriptor };
+    const malformedDescriptor: RestorationContainmentDescriptor = { ...stored };
     Reflect.set(malformedDescriptor, "backend", "other");
     expect(() => resolved.restoreAttempt(ATTEMPT_ID, malformedDescriptor))
       .toThrow(/^containment_unavailable:attempt descriptor/);
     fs.addDirectory(ATTEMPT);
     fs.reals.set(ATTEMPT, `${PARENT}/different-attempt`);
-    expect(() => resolved.restoreAttempt(ATTEMPT_ID, descriptor)).toThrow(/^containment_unavailable:attempt scope/);
+    expect(() => resolved.restoreAttempt(ATTEMPT_ID, stored)).toThrow(/^containment_unavailable:attempt scope/);
     fs.reals.set(ATTEMPT, "/outside/attempt");
-    expect(() => resolved.restoreAttempt(ATTEMPT_ID, descriptor)).toThrow(/^containment_unavailable:attempt scope/);
+    expect(() => resolved.restoreAttempt(ATTEMPT_ID, stored)).toThrow(/^containment_unavailable:attempt scope/);
   });
 
   test("preflight proves the exact authoritative operation trace", async () => {
@@ -192,7 +327,7 @@ describe("cgroup-v2", () => {
   test("absence without matching durable proof never proves cleanup", async () => {
     const fs = baseFs();
     const resolved = backend(fs);
-    const attempt = resolved.restoreAttempt(ATTEMPT_ID, { backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    const attempt = resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor());
     await expect(attempt.cleanup()).rejects.toThrow(/^containment_unavailable:missing attempt scope/);
     await expect(attempt.cleanup(verifiedContainmentReceiptPath(containmentReceiptPath("/wrong", "receipt.json"))))
       .rejects.toThrow(/^containment_unavailable:missing attempt scope/);
@@ -252,10 +387,10 @@ describe("cgroup-v2", () => {
     const fs = baseFs();
     const receipt = containmentReceiptPath("/state", "receipt.json");
     const resolved = backend(fs, { receiptPathFor: () => receipt, diagnostic: (message) => fs.diagnostics.push(message) });
-    const attempt = resolved.restoreAttempt(ATTEMPT_ID, { backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    const attempt = resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor());
     const childRoot = `${ATTEMPT}/pi-subagents`;
-    const childParent = `${childRoot}/${cgroupScopeName("child-session")}`;
-    const childAttempt = `${childParent}/${cgroupScopeName("child-attempt")}`;
+    const childParent = `${childRoot}/${cgroupScopeName(agentId("child-session"))}`;
+    const childAttempt = `${childParent}/${cgroupScopeName(runAttemptId("child-attempt"))}`;
     for (const path of [ATTEMPT, childRoot, childParent, childAttempt]) fs.addDirectory(path);
 
     await attempt.cleanup(verifiedContainmentReceiptPath(receipt));
@@ -278,7 +413,7 @@ describe("cgroup-v2", () => {
     const fs = baseFs();
     const receipt = containmentReceiptPath("/state", "receipt.json");
     const resolved = backend(fs, { receiptPathFor: () => receipt, diagnostic: (message) => fs.diagnostics.push(message) });
-    const attempt = resolved.restoreAttempt(ATTEMPT_ID, { backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    const attempt = resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor());
     fs.addDirectory(ATTEMPT);
     fs.failure = "attempt-remove-once";
     const proof = verifiedContainmentReceiptPath(receipt);
@@ -328,19 +463,40 @@ describe("cgroup-v2", () => {
     } finally { root.cleanup(); }
   });
 
-  test("shutdown removes empty parent then only an auto-created root", async () => {
+  test("reuses a parent scope found by the strict probe", () => {
+    const fs = baseFs(ROOT, PARENT);
+    const resolved = backend(fs);
+    expect(String(resolved.parentScope)).toBe(PARENT);
+    expect(fs.trace).not.toContain(`mkdir:${PARENT}:700`);
+  });
+
+  test("fails closed when parent mkdir loses an absent-check fast-restart race", () => {
+    const fs = baseFs(ROOT);
+    fs.beforeMkdirFailure(PARENT, "EEXIST", () => fs.addDirectory(PARENT));
+    expect(() => backend(fs)).toThrow("containment_unavailable:parent scope");
+  });
+
+  test("shutdown removes the parent but retains a newly created default root", async () => {
     const fs = baseFs();
     const resolved = backend(fs);
     fs.trace.length = 0;
-    await resolved.shutdown();
-    expect(fs.trace).toEqual([`rmdir:${PARENT}`, `rmdir:${ROOT}`]);
 
-    const configuredFs = baseFs(`${MOUNT}/delegated`);
-    const configured = backend(configuredFs, { configuredRoot: `${MOUNT}/delegated` });
-    configuredFs.trace.length = 0;
-    await configured.shutdown();
-    expect(configuredFs.trace).toEqual([`rmdir:${configured.parentScope}`]);
-    expect(configuredFs.directories.has(`${MOUNT}/delegated`)).toBeTrue();
+    await resolved.shutdown();
+
+    expect(fs.trace).toEqual([`rmdir:${PARENT}`]);
+    expect(fs.directories.has(ROOT)).toBeTrue();
+  });
+
+  test("shutdown leaves a configured root and removes only its parent", async () => {
+    const configuredRoot = `${MOUNT}/delegated`;
+    const fs = baseFs(configuredRoot);
+    const resolved = backend(fs, { configuredRoot });
+    fs.trace.length = 0;
+
+    await resolved.shutdown();
+
+    expect(fs.trace).toEqual([`rmdir:${resolved.parentScope}`]);
+    expect(fs.directories.has(configuredRoot)).toBeTrue();
   });
 
   test("shutdown diagnoses ENOTEMPTY and absent intermediates but rejects other removal errors", async () => {
@@ -387,7 +543,7 @@ interface BackendOverrides {
 
 function options(fs: MemoryCgroupFileSystem, overrides: BackendOverrides = {}) {
   return {
-    parentSessionId: "parent-session",
+    parentSessionId: PARENT_ID,
     mountPath: MOUNT,
     selfCgroupText: "0::/user.slice/pi.scope\n",
     fs,
@@ -407,21 +563,29 @@ class MemoryCgroupFileSystem implements CgroupFileSystem {
   readonly nonDirectories = new Set<string>();
   readonly files = new Map<string, string[]>();
   readonly reals = new Map<string, string>();
+  readonly modes = new Map<string, number>();
+  readonly statFailures = new Map<string, string>();
+  readonly mkdirFailures = new Map<string, string>();
   readonly trace: string[] = [];
   readonly diagnostics: string[] = [];
   failure?: string;
+  private readonly beforeMkdirFailures = new Map<string, { code: string; action: () => void }>();
   private attemptRemovalFailed = false;
 
   constructor(paths: readonly string[]) { for (const path of paths) this.addDirectory(path); }
-  addDirectory(path: string): void {
+  addDirectory(path: string, mode = 0o700): void {
     this.directories.add(path);
+    this.modes.set(path, mode);
     this.files.set(`${path}/cgroup.events`, ["populated 0\n"]);
     this.files.set(`${path}/cgroup.procs`, []);
+  }
+  beforeMkdirFailure(path: string, code: string, action: () => void): void {
+    this.beforeMkdirFailures.set(path, { code, action });
   }
   readFile(path: string): string {
     const name = path.slice(path.lastIndexOf("/") + 1);
     if (name === "cgroup.events") {
-      if (this.failure === "events") { this.failure = "events-recovery"; throw new Error("EIO"); }
+      if (this.failure === "events") { this.failure = "events-recovery"; throw errno("EIO"); }
       if (this.failure === "empty") {
         this.trace.push("read:cgroup.events:populated 1");
         return "populated 1\n";
@@ -436,13 +600,13 @@ class MemoryCgroupFileSystem implements CgroupFileSystem {
       if (this.failure === "membership") return "9999\n";
       return (this.files.get(path) ?? []).at(-1) ?? "";
     }
-    throw new Error("ENOENT");
+    throw errno("ENOENT");
   }
   writeFile(path: string, value: string): void {
     const name = path.slice(path.lastIndexOf("/") + 1);
     this.trace.push(`write:${name}:${value.trim()}`);
-    if (name === "cgroup.procs" && this.failure === "move") throw new Error("EACCES");
-    if (name === "cgroup.kill" && this.failure === "kill") { this.failure = "kill-recovery"; throw new Error("EACCES"); }
+    if (name === "cgroup.procs" && this.failure === "move") throw errno("EACCES");
+    if (name === "cgroup.kill" && this.failure === "kill") { this.failure = "kill-recovery"; throw errno("EACCES"); }
     this.files.set(path, [value]);
     if (name === "cgroup.kill" && this.failure !== "empty") {
       this.files.set(path.replace("cgroup.kill", "cgroup.events"), ["populated 1\n", "populated 0\n"]);
@@ -451,22 +615,36 @@ class MemoryCgroupFileSystem implements CgroupFileSystem {
   mkdir(path: string, mode: number): void {
     const short = path.startsWith(PARENT + "/preflight-") ? path.slice(PARENT.length + 1) : path;
     this.trace.push(path.startsWith(PARENT + "/preflight-") ? `mkdir:${short}` : `mkdir:${short}:${mode.toString(8)}`);
-    if (this.failure === "create" && path === PREFLIGHT) throw new Error("EACCES");
-    this.addDirectory(path);
+    if (this.failure === "create" && path === PREFLIGHT) throw errno("EACCES");
+    const beforeFailure = this.beforeMkdirFailures.get(path);
+    if (beforeFailure !== undefined) {
+      this.beforeMkdirFailures.delete(path);
+      beforeFailure.action();
+      throw errno(beforeFailure.code);
+    }
+    const failure = this.mkdirFailures.get(path);
+    if (failure !== undefined) throw errno(failure);
+    if (this.directories.has(path)) throw errno("EEXIST");
+    this.addDirectory(path, mode);
   }
   realpath(path: string): string {
-    if (!this.directories.has(path) && !this.nonDirectories.has(path)) throw new Error("ENOENT");
+    if (!this.directories.has(path) && !this.nonDirectories.has(path)) throw errno("ENOENT");
     return this.reals.get(path) ?? path;
   }
-  stat(path: string): { isDirectory(): boolean } {
-    if (!this.directories.has(path) && !this.nonDirectories.has(path)) throw new Error("ENOENT");
-    return { isDirectory: () => !this.nonDirectories.has(path) };
+  stat(path: string): { isDirectory(): boolean; mode: number } {
+    const failure = this.statFailures.get(path);
+    if (failure !== undefined) throw errno(failure);
+    if (!this.directories.has(path) && !this.nonDirectories.has(path)) throw errno("ENOENT");
+    return {
+      isDirectory: () => !this.nonDirectories.has(path),
+      mode: this.modes.get(path) ?? 0o100600,
+    };
   }
   removeDirectory(path: string): void {
     const short = path.startsWith(PARENT + "/preflight-") ? path.slice(PARENT.length + 1) : path;
     this.trace.push(`rmdir:${short}`);
-    if (this.failure === "remove" && path === PREFLIGHT) { this.failure = "remove-recovery"; throw new Error("EIO"); }
-    if (this.failure === "attempt-remove-once" && path === ATTEMPT && !this.attemptRemovalFailed) { this.attemptRemovalFailed = true; throw new Error("EIO"); }
+    if (this.failure === "remove" && path === PREFLIGHT) { this.failure = "remove-recovery"; throw errno("EIO"); }
+    if (this.failure === "attempt-remove-once" && path === ATTEMPT && !this.attemptRemovalFailed) { this.attemptRemovalFailed = true; throw errno("EIO"); }
     if (this.failure === "attempt-remove-twice" && path === ATTEMPT) {
       const removals = this.trace.filter((entry) => entry === `rmdir:${ATTEMPT}`).length;
       if (removals === 1) throw errno("EIO");
@@ -490,7 +668,7 @@ function controlledProbe(fs: MemoryCgroupFileSystem, rejectExit = false): ProbeP
   let fail!: (error: Error) => void;
   const exited = new Promise<void>((resolve, reject) => { settle = resolve; fail = reject; });
   const probe = {
-    pid: 4242,
+    pid: processId(4242),
     killed: false,
     released: false,
     release(): void {

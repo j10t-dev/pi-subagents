@@ -6,15 +6,23 @@ import {
   MAX_MAX_DEPTH,
   MAX_TREE_CHILD_PROCESSES,
 } from "./constants.ts";
+import {
+  delegationDepth,
+  processCount,
+  runCapacity,
+  type DelegationDepth,
+  type ProcessCount,
+  type RunCapacity,
+} from "./domain.ts";
 
 export interface DelegationLimits {
-  readonly maxDepth: number;
-  readonly maxConcurrentRuns: number;
+  readonly maxDepth: DelegationDepth;
+  readonly maxConcurrentRuns: RunCapacity;
 }
 
 export type ExtensionLaunchContext =
-  | { readonly kind: "root"; readonly currentDepth: 0 }
-  | { readonly kind: "descendant"; readonly currentDepth: number; readonly limits: DelegationLimits }
+  | { readonly kind: "root"; readonly currentDepth: DelegationDepth }
+  | { readonly kind: "descendant"; readonly currentDepth: DelegationDepth; readonly limits: DelegationLimits }
   | { readonly kind: "legacy-child" }
   | { readonly kind: "invalid"; readonly diagnostic: string };
 
@@ -28,7 +36,7 @@ export function parseExtensionLaunchContext(
   const numericValues = [env[CHILD_DEPTH_ENV], env[CHILD_MAX_DEPTH_ENV], env[CHILD_CAPACITY_ENV]];
   const hasNumericValue = numericValues.some((value) => value !== undefined);
 
-  if (marker === undefined && !hasNumericValue) return { kind: "root", currentDepth: 0 };
+  if (marker === undefined && !hasNumericValue) return { kind: "root", currentDepth: delegationDepth(0) };
   if (marker === "1" && !hasNumericValue) return { kind: "legacy-child" };
   if (marker !== "1" || numericValues.some((value) => value === undefined)) return invalidContext();
 
@@ -39,28 +47,32 @@ export function parseExtensionLaunchContext(
     currentDepth > maxDepth || maxConcurrentRuns < 1
   ) return invalidContext();
 
-  return { kind: "descendant", currentDepth, limits: { maxDepth, maxConcurrentRuns } };
+  return {
+    kind: "descendant",
+    currentDepth: delegationDepth(currentDepth),
+    limits: { maxDepth: delegationDepth(maxDepth), maxConcurrentRuns: runCapacity(maxConcurrentRuns) },
+  };
 }
 
 export function boundedTreeChildCount(
-  capacity: number,
-  maxDepth: number,
-  limit: number = MAX_TREE_CHILD_PROCESSES,
-): number {
-  if (maxDepth <= 0) return 0;
+  capacity: RunCapacity,
+  maxDepth: DelegationDepth,
+  limit: ProcessCount = MAX_TREE_CHILD_PROCESSES,
+): ProcessCount {
+  if (maxDepth <= 0) return processCount(0);
   let total = 0;
-  let generation = capacity;
-  const cap = limit + 1;
+  let generation: number = capacity;
+  const cap = Math.min(Number.MAX_SAFE_INTEGER, limit + 1);
   for (let depth = 0; depth < maxDepth; depth++) {
-    if (generation > cap - total) return cap;
+    if (generation > cap - total) return processCount(cap);
     total += generation;
-    if (depth + 1 < maxDepth && generation > Math.floor(cap / capacity)) return cap;
+    if (depth + 1 < maxDepth && generation > Math.floor(cap / capacity)) return processCount(cap);
     generation *= capacity;
   }
-  return total;
+  return processCount(total);
 }
 
-export function canDelegateFrom(currentDepth: number, maxDepth: number): boolean {
+export function canDelegateFrom(currentDepth: DelegationDepth, maxDepth: DelegationDepth): boolean {
   return currentDepth < maxDepth;
 }
 

@@ -117,8 +117,16 @@ rl.on("line", (line) => {
         if (scenario === "oversized-response-unidentified") process.stdout.write(`${JSON.stringify({ payload: huge })}\n`);
         return;
       }
-      if (command.since === "force-fail") {
+      if (command.since === "ffffffff") {
         respondFailure("get_entries", command.id, `Entry not found: ${command.since}`);
+        return;
+      }
+      if (scenario === "entries-with-leaf") {
+        respond("get_entries", command.id, { data: { entries: [], leafId: "bbbbbbbb" } });
+        return;
+      }
+      if (scenario === "entries-malformed-leaf") {
+        respond("get_entries", command.id, { data: { entries: [], leafId: "not-an-entry" } });
         return;
       }
       const assignment = promptedMessage === undefined

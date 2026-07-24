@@ -16,10 +16,13 @@ import { Value } from "typebox/value";
 
 import {
   AssistantMessageSchema,
+  brandUIDialog,
+  brandUINotification,
   ExtensionUIDialogSchema,
   ExtensionUINotificationSchema,
   literalUnion,
 } from "./schemas.ts";
+import { rpcRequestId, type RpcRequestId } from "./domain.ts";
 import type {
   WireAssistantMessage,
   WireExtensionUIDialog,
@@ -131,8 +134,8 @@ function decode<T extends TSchema>(schema: T, value: unknown): Static<T> | undef
 // --- Public result type -----------------------------------------------------
 
 export type RpcInboundRecord =
-  | { kind: "response"; id: string; command: RecognizedRpcCommand; success: true; data?: unknown }
-  | { kind: "response"; id: string; command: RecognizedRpcCommand; success: false; error: string }
+  | { kind: "response"; id: RpcRequestId; command: RecognizedRpcCommand; success: true; data?: unknown }
+  | { kind: "response"; id: RpcRequestId; command: RecognizedRpcCommand; success: false; error: string }
   | { kind: "message_start"; message: WireAssistantMessage }
   | { kind: "text_delta"; contentIndex: number; delta: string }
   | { kind: "message_update_other" }
@@ -174,8 +177,8 @@ export function classifyInboundRecord(value: unknown): RpcWireResult {
         return { ok: false, reason: "malformed rpc response record" };
       }
       return response.success
-        ? { ok: true, record: { kind: "response", id: response.id, command: response.command, success: true, data: response.data } }
-        : { ok: true, record: { kind: "response", id: response.id, command: response.command, success: false, error: response.error } };
+        ? { ok: true, record: { kind: "response", id: rpcRequestId(response.id), command: response.command, success: true, data: response.data } }
+        : { ok: true, record: { kind: "response", id: rpcRequestId(response.id), command: response.command, success: false, error: response.error } };
     }
     case "message_start": {
       const role = inboundMessageRole(value);
@@ -231,9 +234,9 @@ export function classifyInboundRecord(value: unknown): RpcWireResult {
     }
     case "extension_ui_request": {
       const dialog = decode(ExtensionUIDialogSchema, value);
-      if (dialog !== undefined) return { ok: true, record: { kind: "extension_ui_dialog", request: dialog } };
+      if (dialog !== undefined) return { ok: true, record: { kind: "extension_ui_dialog", request: brandUIDialog(dialog) } };
       const notification = decode(ExtensionUINotificationSchema, value);
-      if (notification !== undefined) return { ok: true, record: { kind: "extension_ui_notification", request: notification } };
+      if (notification !== undefined) return { ok: true, record: { kind: "extension_ui_notification", request: brandUINotification(notification) } };
       return { ok: false, reason: "malformed extension_ui_request record" };
     }
     default:

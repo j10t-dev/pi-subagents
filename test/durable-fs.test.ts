@@ -7,6 +7,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -65,6 +66,7 @@ function retrySyncAdapter(failedParent: string, trace: string[]): DurableFileSys
     rename: renameSync,
     unlink: unlinkSync,
     readFile: readFileSync,
+    realpath: realpathSync,
   };
 }
 
@@ -97,6 +99,7 @@ function adapter(trace: string[] = [], fail?: string, cleanupFail = false): Dura
       unlinkSync(path);
     },
     readFile: readFileSync,
+    realpath: realpathSync,
   };
 }
 

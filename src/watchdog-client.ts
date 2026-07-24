@@ -5,10 +5,35 @@ import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import type { Writable, Readable } from "node:stream";
 
-import type { ContainmentAttempt, ContainmentDescriptor, ContainmentOutcome } from "./containment.ts";
-import { retainUtf8Tail, verifiedContainmentReceiptPath } from "./domain.ts";
-import type { AbsolutePath, ContainmentReceiptPath, RunAttemptId, VerifiedContainmentReceiptPath } from "./domain.ts";
+import type {
+  ContainmentAttempt,
+  ContainmentCandidateDescriptor,
+  ContainmentDescriptor,
+  ContainmentOutcome,
+  RestorationContainmentDescriptor,
+} from "./containment.ts";
+import {
+  milliseconds,
+  observedCgroupScopePath,
+  processGroupId,
+  processId,
+  retainUtf8Tail,
+  utf8Bytes,
+  verifiedContainmentReceiptPath,
+} from "./domain.ts";
+import type {
+  AbsolutePath,
+  ContainmentReceiptPath,
+  Milliseconds,
+  ProcessGroupId,
+  ProcessId,
+  RunAttemptId,
+  Utf8Bytes,
+  VerifiedContainmentReceiptPath,
+} from "./domain.ts";
+import { MAX_STDERR_TAIL_BYTES } from "./constants.ts";
 import type { RpcLaunchSpec } from "./pi-launcher.ts";
+import { absolutePath } from "./paths.ts";
 import type { RpcLaunchTransport } from "./rpc-client.ts";
 
 export interface WatchdogClientOptions {
@@ -17,8 +42,8 @@ export interface WatchdogClientOptions {
   attempt: ContainmentAttempt;
   watchdogPath?: AbsolutePath;
   launcherPath?: AbsolutePath;
-  timeoutMs?: number;
-  maxControlLineBytes?: number;
+  timeoutMs?: Milliseconds;
+  maxControlLineBytes?: Utf8Bytes;
 }
 export interface WatchdogLaunch {
   stdin: Writable;
@@ -28,9 +53,9 @@ export interface WatchdogLaunch {
 }
 type WatchdogProcess = ChildProcess & { stdin: Writable; stdout: Readable; stderr: Readable };
 type ControlMessage =
-  | { type: "ready"; descriptor: ContainmentDescriptor }
+  | { type: "ready"; descriptor: RestorationContainmentDescriptor }
   | { type: "authorised" }
-  | { type: "launched"; pid: number }
+  | { type: "launched"; pid: ProcessId }
   | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
 export type WatchdogLaunchPhase = "attempt_prepared" | "launcher_authorised" | "pi_spawned";
 
@@ -55,14 +80,22 @@ export class WatchdogClient {
   private readonly attemptEpoch = Date.now();
   private controlState: ControlMessage["type"] | "done" = "ready";
   private receiptCleanup: Promise<void> | undefined;
+  private liveDescriptor: ContainmentDescriptor | undefined;
   launchPhase: WatchdogLaunchPhase = "attempt_prepared";
 
   constructor(private readonly options: WatchdogClientOptions) {
     if (options.attempt.attemptId !== options.attemptId) throw new Error("watchdog attempt mismatch");
-    const script = options.watchdogPath ?? join(dirname(fileURLToPath(import.meta.url)), "../watchdog.mjs") as AbsolutePath;
-    const launcher = options.launcherPath ?? join(dirname(fileURLToPath(import.meta.url)), "../launcher.mjs") as AbsolutePath;
-    rmSync(options.receiptPath as string, { force: true });
-    const child = spawn(process.execPath, [script, options.attemptId, options.receiptPath, options.attempt.descriptor.scopePath, options.attempt.parentScope, launcher], {
+    const script = options.watchdogPath ?? absolutePath(join(dirname(fileURLToPath(import.meta.url)), "../watchdog.mjs"));
+    const launcher = options.launcherPath ?? absolutePath(join(dirname(fileURLToPath(import.meta.url)), "../launcher.mjs"));
+    rmSync(options.receiptPath, { force: true });
+    const child = spawn(process.execPath, [
+      script,
+      options.attemptId,
+      options.receiptPath,
+      options.attempt.candidate.scopePath,
+      options.attempt.parentScope,
+      launcher,
+    ], {
       detached: true,
       shell: false,
       env: sanitiseWatchdogEnvironment(process.env),
@@ -85,10 +118,10 @@ export class WatchdogClient {
       if (this.controlState !== "done" && this.protocolError === undefined && this.containment === undefined) this.failProtocol("watchdog control EOF");
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      this.diagnostics = retainUtf8Tail(this.diagnostics + this.diagnosticsDecoder.write(chunk), 50_000);
+      this.diagnostics = retainUtf8Tail(this.diagnostics + this.diagnosticsDecoder.write(chunk), MAX_STDERR_TAIL_BYTES);
     });
     child.stderr.once("end", () => {
-      this.diagnostics = retainUtf8Tail(this.diagnostics + this.diagnosticsDecoder.end(), 50_000);
+      this.diagnostics = retainUtf8Tail(this.diagnostics + this.diagnosticsDecoder.end(), MAX_STDERR_TAIL_BYTES);
     });
     const fail = (label: string) => (error: Error) => this.failProtocol(`${label}: ${errorText(error)}`);
     child.once("error", fail("watchdog process error"));
@@ -104,8 +137,9 @@ export class WatchdogClient {
     try {
       const message = await this.next("ready");
       if (message.type !== "ready") throw new Error("protocol_error: expected ready");
-      if (!sameDescriptor(message.descriptor, this.options.attempt.descriptor)) throw new Error("protocol_error: descriptor mismatch");
-      return message.descriptor;
+      const descriptor = this.options.attempt.proveRuntimeDescriptor(message.descriptor);
+      this.liveDescriptor = descriptor;
+      return descriptor;
     } catch (error) { throw await this.containAndDescribe("readiness", error); }
   }
 
@@ -135,19 +169,29 @@ export class WatchdogClient {
     let error: unknown;
     while (Date.now() < end) {
       try {
-        const receipt = verifyContainmentReceipt(
-          this.options.receiptPath,
-          this.options.attemptId,
-          this.attemptEpoch,
-          this.options.attempt.descriptor,
-        );
+        const receipt = this.liveDescriptor === undefined
+          ? verifyContainmentReceipt(
+            this.options.receiptPath,
+            this.options.attemptId,
+            this.attemptEpoch,
+          )
+          : verifyContainmentReceipt(
+            this.options.receiptPath,
+            this.options.attemptId,
+            this.attemptEpoch,
+            this.liveDescriptor,
+          );
         if (receipt.version !== 2) throw new Error("invalid live containment receipt version");
+        if (this.liveDescriptor === undefined &&
+            !matchesCandidateIdentity(receipt.descriptor, this.options.attempt.candidate)) {
+          throw new Error("containment receipt descriptor mismatch");
+        }
         this.receiptCleanup ??= this.options.attempt.cleanup(receipt.path);
         await this.receiptCleanup;
         return receipt.path;
       } catch (caught) {
         error = caught;
-        await delay(20);
+        await delay(milliseconds(20));
       }
     }
     throw error instanceof Error ? error : new Error("containment receipt timeout");
@@ -157,7 +201,9 @@ export class WatchdogClient {
   async close(): Promise<void> { await this.beginContainment(); }
   getDiagnostics(): string { return this.diagnostics; }
 
-  private get timeout(): number { return Math.min(this.options.timeoutMs ?? 5_000, 20_000); }
+  private get timeout(): Milliseconds {
+    return milliseconds(Math.min(this.options.timeoutMs ?? milliseconds(5_000), 20_000));
+  }
 
   private beginContainment(): Promise<VerifiedContainmentReceiptPath> {
     if (this.containment !== undefined) return this.containment;
@@ -186,9 +232,9 @@ export class WatchdogClient {
   }
 
   private async stopWatchdog(child: WatchdogProcess): Promise<void> {
-    if (await settlesWithin(this.childClosed, 1_000)) return;
+    if (await settlesWithin(this.childClosed, milliseconds(1_000))) return;
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-    if (await settlesWithin(this.childClosed, 1_000)) return;
+    if (await settlesWithin(this.childClosed, milliseconds(1_000))) return;
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await withTimeout(this.childClosed, this.timeout, `watchdog forced exit timeout; stderr=${this.getDiagnostics()}`);
   }
@@ -261,7 +307,7 @@ export class WatchdogClient {
   private consumeControl(chunk: Buffer): void {
     if (this.protocolError !== undefined) return;
     this.controlBuffer = Buffer.concat([this.controlBuffer, chunk]);
-    const maximum = this.options.maxControlLineBytes ?? 64 * 1024;
+    const maximum = this.options.maxControlLineBytes ?? utf8Bytes(64 * 1024);
     if (this.controlBuffer.length > maximum && !this.controlBuffer.includes(0x0a)) { this.failProtocol("oversized control record"); return; }
     for (;;) {
       const newline = this.controlBuffer.indexOf(0x0a);
@@ -282,15 +328,40 @@ export async function launchWatchdogRpcTransport(client: WatchdogClient, spec: R
 }
 
 export type VerifiedContainmentReceipt =
-  | { version: 1; path: VerifiedContainmentReceiptPath; pgid: number | null }
-  | { version: 2; path: VerifiedContainmentReceiptPath; descriptor: ContainmentDescriptor; populated: false };
+  | { version: 1; path: VerifiedContainmentReceiptPath; pgid: ProcessGroupId | null }
+  | {
+      version: 2;
+      path: VerifiedContainmentReceiptPath;
+      descriptor: RestorationContainmentDescriptor;
+      populated: false;
+    };
 
+type VerifiedLiveContainmentReceipt =
+  | Extract<VerifiedContainmentReceipt, { version: 1 }>
+  | {
+      version: 2;
+      path: VerifiedContainmentReceiptPath;
+      descriptor: ContainmentDescriptor;
+      populated: false;
+    };
+
+export function verifyContainmentReceipt(
+  path: ContainmentReceiptPath,
+  attemptId: RunAttemptId,
+  attemptEpoch: number | undefined,
+  expectedDescriptor: ContainmentDescriptor,
+): VerifiedLiveContainmentReceipt;
+export function verifyContainmentReceipt(
+  path: ContainmentReceiptPath,
+  attemptId: RunAttemptId,
+  attemptEpoch?: number,
+): VerifiedContainmentReceipt;
 export function verifyContainmentReceipt(
   path: ContainmentReceiptPath,
   attemptId: RunAttemptId,
   attemptEpoch?: number,
   expectedDescriptor?: ContainmentDescriptor,
-): VerifiedContainmentReceipt {
+): VerifiedContainmentReceipt | VerifiedLiveContainmentReceipt {
   const receiptPath: string = path;
   let value: unknown;
   try { value = JSON.parse(readFileSync(receiptPath, "utf8")); }
@@ -303,9 +374,17 @@ export function verifyContainmentReceipt(
   const pathProof = verifiedContainmentReceiptPath(path);
   if (value.version === 1) {
     if (!hasExactKeys(value, ["attemptId", "outcome", "pgid", "timestamp", "version"])) throw new Error("invalid containment receipt schema");
-    const coherent = value.outcome === "terminated" ? Number.isInteger(value.pgid) && Number(value.pgid) > 0 : value.pgid === null;
-    if (!coherent || !OUTCOMES.has(String(value.outcome))) throw new Error("invalid containment receipt schema");
-    const pgid = value.pgid === null ? null : Number(value.pgid);
+    let pgid: ProcessGroupId | null;
+    if (value.outcome === "terminated") {
+      if (typeof value.pgid !== "number" || !Number.isSafeInteger(value.pgid) || value.pgid <= 0) {
+        throw new Error("invalid containment receipt schema");
+      }
+      pgid = processGroupId(value.pgid);
+    } else {
+      if (value.pgid !== null) throw new Error("invalid containment receipt schema");
+      pgid = null;
+    }
+    if (!OUTCOMES.has(String(value.outcome))) throw new Error("invalid containment receipt schema");
     if (pgid !== null && groupHasLiveMembers(pgid)) throw new Error("containment process group remains alive");
     return { version: 1, path: pathProof, pgid };
   }
@@ -313,8 +392,14 @@ export function verifyContainmentReceipt(
     if (!hasExactKeys(value, ["attemptId", "backend", "outcome", "populated", "scopePath", "timestamp", "version"]) ||
         value.backend !== "cgroup-v2" || typeof value.scopePath !== "string" || !value.scopePath.startsWith("/") || value.scopePath.includes("\0") ||
         value.populated !== false || !OUTCOMES.has(String(value.outcome))) throw new Error("invalid containment receipt schema");
-    const descriptor: ContainmentDescriptor = { backend: "cgroup-v2", scopePath: value.scopePath as AbsolutePath };
-    if (expectedDescriptor !== undefined && !sameDescriptor(descriptor, expectedDescriptor)) throw new Error("containment receipt descriptor mismatch");
+    const descriptor: RestorationContainmentDescriptor = {
+      backend: "cgroup-v2",
+      scopePath: observedCgroupScopePath(absolutePath(value.scopePath)),
+    };
+    if (expectedDescriptor !== undefined) {
+      if (!sameDescriptor(descriptor, expectedDescriptor)) throw new Error("containment receipt descriptor mismatch");
+      return { version: 2, path: pathProof, descriptor: expectedDescriptor, populated: false };
+    }
     return { version: 2, path: pathProof, descriptor, populated: false };
   }
   throw new Error("invalid containment receipt schema");
@@ -323,14 +408,36 @@ export function verifyContainmentReceipt(
 const OUTCOMES = new Set(["no_process", "terminated", "spawn_failed", "invalid_launch"]);
 function decodeControlMessage(value: unknown): ControlMessage {
   if (!isRecord(value) || typeof value.type !== "string") throw new Error("protocol_error: malformed control message");
-  if (value.type === "ready" && hasExactKeys(value, ["descriptor", "type"]) && isDescriptor(value.descriptor)) return { type: "ready", descriptor: value.descriptor };
+  if (value.type === "ready" && hasExactKeys(value, ["descriptor", "type"])) {
+    const descriptor = decodeRestorationDescriptor(value.descriptor);
+    if (descriptor !== undefined) return { type: "ready", descriptor };
+  }
   if (value.type === "authorised" && hasExactKeys(value, ["type"])) return { type: "authorised" };
-  if (value.type === "launched" && hasExactKeys(value, ["pid", "type"]) && Number.isInteger(value.pid) && Number(value.pid) > 0) return { type: "launched", pid: Number(value.pid) };
+  if (value.type === "launched" && hasExactKeys(value, ["pid", "type"]) &&
+      typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0) {
+    return { type: "launched", pid: processId(value.pid) };
+  }
   if (value.type === "exit" && hasExactKeys(value, ["code", "signal", "type"]) && (value.code === null || Number.isInteger(value.code) && Number(value.code) >= 0 && Number(value.code) <= 255) && (value.signal === null || isSignal(value.signal))) return { type: "exit", code: value.code as number | null, signal: value.signal as NodeJS.Signals | null };
   throw new Error(`protocol_error: malformed ${value.type} control message`);
 }
-function isDescriptor(value: unknown): value is ContainmentDescriptor { return isRecord(value) && hasExactKeys(value, ["backend", "scopePath"]) && value.backend === "cgroup-v2" && typeof value.scopePath === "string" && value.scopePath.startsWith("/") && !value.scopePath.includes("\0"); }
-function sameDescriptor(left: ContainmentDescriptor, right: ContainmentDescriptor): boolean { return left.backend === right.backend && left.scopePath === right.scopePath; }
+function decodeRestorationDescriptor(value: unknown): RestorationContainmentDescriptor | undefined {
+  if (!isRecord(value) || !hasExactKeys(value, ["backend", "scopePath"]) ||
+      value.backend !== "cgroup-v2" || typeof value.scopePath !== "string" ||
+      !value.scopePath.startsWith("/") || value.scopePath.includes("\0")) return undefined;
+  return { backend: "cgroup-v2", scopePath: observedCgroupScopePath(absolutePath(value.scopePath)) };
+}
+function sameDescriptor(
+  left: RestorationContainmentDescriptor,
+  right: RestorationContainmentDescriptor,
+): boolean {
+  return left.backend === right.backend && left.scopePath === right.scopePath;
+}
+function matchesCandidateIdentity(
+  evidence: RestorationContainmentDescriptor,
+  candidate: ContainmentCandidateDescriptor,
+): boolean {
+  return evidence.backend === candidate.backend && evidence.scopePath === candidate.scopePath;
+}
 function isSignal(value: unknown): value is NodeJS.Signals { return typeof value === "string" && SIGNALS.has(value as NodeJS.Signals); }
 const SIGNALS = new Set<NodeJS.Signals>(["SIGABRT","SIGALRM","SIGBUS","SIGCHLD","SIGCONT","SIGFPE","SIGHUP","SIGILL","SIGINT","SIGIO","SIGIOT","SIGKILL","SIGPIPE","SIGPOLL","SIGPROF","SIGPWR","SIGQUIT","SIGSEGV","SIGSTKFLT","SIGSTOP","SIGSYS","SIGTERM","SIGTRAP","SIGTSTP","SIGTTIN","SIGTTOU","SIGURG","SIGUSR1","SIGUSR2","SIGVTALRM","SIGWINCH","SIGXCPU","SIGXFSZ"]);
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -341,16 +448,28 @@ function errorText(error: unknown): string { return error instanceof Error ? err
 function sanitiseWatchdogEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !key.startsWith("PI_WATCHDOG_FAKE_")));
 }
-function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
-function writeControl(stream: Writable, value: string, ms: number, message: string): Promise<void> { return withTimeout(new Promise((resolve, reject) => stream.write(value, (error) => error ? reject(error) : resolve())), ms, message); }
-function groupHasLiveMembers(pgid: number): boolean {
-  try { for (const name of readdirSync("/proc")) { if (!/^\d+$/.test(name)) continue; try { const fields = procStatFields(readFileSync(`/proc/${name}/stat`, "utf8")); if (Number(fields[2]) === pgid && fields[0] !== "Z") return true; } catch {} } return false; }
-  catch { try { process.kill(-pgid, 0); return true; } catch (error) { return errorCode(error) !== "ESRCH"; } }
+function delay(ms: Milliseconds): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function writeControl(stream: Writable, value: string, ms: Milliseconds, message: string): Promise<void> { return withTimeout(new Promise((resolve, reject) => stream.write(value, (error) => error ? reject(error) : resolve())), ms, message); }
+function groupHasLiveMembers(pgid: ProcessGroupId): boolean {
+  try {
+    for (const name of readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        const fields = procStatFields(readFileSync(`/proc/${name}/stat`, "utf8"));
+        const memberGroup = processGroupId(Number(fields[2]));
+        if (memberGroup === pgid && fields[0] !== "Z") return true;
+      } catch {}
+    }
+    return false;
+  } catch {
+    try { process.kill(-pgid, 0); return true; }
+    catch (error) { return errorCode(error) !== "ESRCH"; }
+  }
 }
 function errorCode(error: unknown): string | undefined { if (typeof error !== "object" || error === null || !("code" in error)) return undefined; const value = Reflect.get(error, "code"); return typeof value === "string" ? value : undefined; }
 function procStatFields(stat: string): string[] { const end = stat.lastIndexOf(")"); if (end < 0) throw new Error("malformed proc stat"); return stat.slice(end + 2).split(" "); }
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> { return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(message)), ms); promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); }); }); }
-async function settlesWithin(promise: Promise<void>, ms: number): Promise<boolean> { try { await withTimeout(promise, ms, "timeout"); return true; } catch (error) { if (error instanceof Error && error.message === "timeout") return false; throw error; } }
+function withTimeout<T>(promise: Promise<T>, ms: Milliseconds, message: string): Promise<T> { return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(message)), ms); promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); }); }); }
+async function settlesWithin(promise: Promise<void>, ms: Milliseconds): Promise<boolean> { try { await withTimeout(promise, ms, "timeout"); return true; } catch (error) { if (error instanceof Error && error.message === "timeout") return false; throw error; } }
 async function waitForPipeClosure(endpoints: ChildProcess["stdio"]): Promise<void> {
-  while (!endpoints.every((endpoint) => endpoint === null || endpoint === undefined || endpoint.closed)) await delay(10);
+  while (!endpoints.every((endpoint) => endpoint === null || endpoint === undefined || endpoint.closed)) await delay(milliseconds(10));
 }

@@ -11,11 +11,25 @@ import {
   CompletionState,
   agentId,
   assertTransition,
+  createRpcRequestId,
   createRunAttemptId,
+  delegationDepth,
   isLegalTransition,
   milliseconds,
+  nextDelegationDepth,
+  observationRevision,
+  processCount,
+  processGroupId,
+  processId,
+  runCapacity,
+  utf16CodeUnitOffset,
+  modelId,
   modelSpec,
+  modelSpecFrom,
+  modelSpecParts,
+  providerId,
   PublicPreflightError,
+  rpcRequestId,
   runAttemptId,
   runId,
   runIdFromEntry,
@@ -23,9 +37,31 @@ import {
   toAgentError,
   truncateUtf8,
   retainUtf8Tail,
+  toolName,
+  uiRequestId,
   utf8Bytes,
+  type AgentCompletion,
+  type CgroupScopePath,
+  type CommittedOutputPath,
+  type DelegationDepth,
+  type Milliseconds,
+  type ModelId,
+  type ModelSpec,
+  type ObservationRevision,
+  type ObservationSnapshotPath,
+  type OutputPath,
+  type ProcessCount,
+  type ProcessGroupId,
+  type ProcessId,
+  type RunCapacity,
+  type Utf16CodeUnitOffset,
+  type Utf8Bytes,
+  type ProviderId,
+  type RpcRequestId,
+  type ToolName,
+  type UIRequestId,
 } from "../src/domain.ts";
-import { diagnosticsPath } from "../src/paths.ts";
+import { absolutePath, diagnosticsPath, outputPath, sessionPath } from "../src/paths.ts";
 import {
   AgentCompletionSchema,
   AgentErrorSchema,
@@ -47,6 +83,98 @@ import type { Usage } from "../src/domain.ts";
 function stringValues(obj: object): string[] {
   return Object.values(obj) as string[];
 }
+
+const RPC_ID: RpcRequestId = rpcRequestId("rpc-1");
+const UI_ID: UIRequestId = uiRequestId("ui-1");
+// @ts-expect-error RPC and child-originated UI correlation namespaces are distinct.
+const _uiAsRpc: RpcRequestId = UI_ID;
+// @ts-expect-error UI and RPC correlation namespaces are distinct.
+const _rpcAsUi: UIRequestId = RPC_ID;
+void _uiAsRpc;
+void _rpcAsUi;
+
+const CANDIDATE_OUTPUT: OutputPath = outputPath("/tmp", "candidate");
+// @ts-expect-error a contained destination is not yet a durable committed file.
+const _candidateAsCommitted: CommittedOutputPath = CANDIDATE_OUTPUT;
+const _completionWithCandidate: AgentCompletion = {
+  state: "completed",
+  agentId: agentId("agent-a"),
+  runId: runId("deadbeef"),
+  output: truncateUtf8("", utf8Bytes(0)),
+  // @ts-expect-error AgentCompletion cannot expose a merely intended output destination.
+  outputPath: CANDIDATE_OUTPUT,
+  transcriptPath: sessionPath("/tmp", "session.jsonl"),
+};
+void _candidateAsCommitted;
+void _completionWithCandidate;
+
+const PROVIDER_ID: ProviderId = providerId("anthropic");
+const MODEL_ID: ModelId = modelId("claude/sonnet:latest");
+const TOOL_NAME: ToolName = toolName("read");
+const MODEL_SPEC: ModelSpec = modelSpecFrom(PROVIDER_ID, MODEL_ID);
+// @ts-expect-error provider IDs and model IDs are distinct identities.
+const _modelAsProvider: ProviderId = MODEL_ID;
+// @ts-expect-error model IDs and tool names are distinct identities.
+const _toolAsModel: ModelId = TOOL_NAME;
+// @ts-expect-error complete model specs are not provider IDs.
+const _specAsProvider: ProviderId = MODEL_SPEC;
+void _modelAsProvider;
+void _toolAsModel;
+void _specAsProvider;
+
+const DURATION: Milliseconds = milliseconds(10);
+const BYTE_COUNT: Utf8Bytes = utf8Bytes(10);
+const DEPTH: DelegationDepth = delegationDepth(1);
+const CAPACITY: RunCapacity = runCapacity(4);
+const PROCESS_COUNT: ProcessCount = processCount(4);
+const OFFSET: Utf16CodeUnitOffset = utf16CodeUnitOffset(4);
+const PROCESS_ID: ProcessId = processId(42);
+const PROCESS_GROUP_ID: ProcessGroupId = processGroupId(42);
+const OBSERVATION_REVISION: ObservationRevision = observationRevision(0);
+const ABSOLUTE_PATH = absolutePath("/tmp/proof-boundary");
+// @ts-expect-error an arbitrary absolute path has no canonical cgroup-scope proof.
+const _absoluteAsCgroupScope: CgroupScopePath = ABSOLUTE_PATH;
+// @ts-expect-error an arbitrary absolute path has no managed snapshot-path proof.
+const _absoluteAsObservationSnapshot: ObservationSnapshotPath = ABSOLUTE_PATH;
+// @ts-expect-error process IDs and process-group IDs are distinct identities.
+const _processAsGroup: ProcessGroupId = PROCESS_ID;
+// @ts-expect-error process IDs and process counts are distinct numeric domains.
+const _processAsCount: ProcessCount = PROCESS_ID;
+// @ts-expect-error observation revisions are not process IDs.
+const _revisionAsProcess: ProcessId = OBSERVATION_REVISION;
+// @ts-expect-error process-group IDs are not observation revisions.
+const _groupAsRevision: ObservationRevision = PROCESS_GROUP_ID;
+// @ts-expect-error durations and byte counts are distinct units.
+const _durationAsBytes: Utf8Bytes = DURATION;
+// @ts-expect-error capacity and delegation depth are distinct units.
+const _capacityAsDepth: DelegationDepth = CAPACITY;
+// @ts-expect-error process counts and capacities are distinct units.
+const _processCountAsCapacity: RunCapacity = PROCESS_COUNT;
+// @ts-expect-error UTF-16 offsets and UTF-8 byte counts are distinct units.
+const _offsetAsBytes: Utf8Bytes = OFFSET;
+void _absoluteAsCgroupScope;
+void _absoluteAsObservationSnapshot;
+void _processAsGroup;
+void _processAsCount;
+void _revisionAsProcess;
+void _groupAsRevision;
+void _durationAsBytes;
+void _capacityAsDepth;
+void _processCountAsCapacity;
+void _offsetAsBytes;
+
+describe("correlation identities", () => {
+  test("constructs non-empty RPC and UI identities", () => {
+    expect(rpcRequestId("rpc-1") as string).toBe("rpc-1");
+    expect(uiRequestId("ui-1") as string).toBe("ui-1");
+    expect(createRpcRequestId().length).toBeGreaterThan(0);
+  });
+
+  test("rejects empty correlation identities", () => {
+    expect(() => rpcRequestId("")).toThrow("protocol_error:");
+    expect(() => uiRequestId("")).toThrow("protocol_error:");
+  });
+});
 
 describe("agentId", () => {
   test("accepts a valid native session id", () => {
@@ -119,28 +247,100 @@ describe("runAttemptId / createRunAttemptId", () => {
   });
 });
 
-describe("modelSpec", () => {
-  test("accepts a non-empty spec", () => {
-    expect(modelSpec("anthropic/claude:high") as string).toBe("anthropic/claude:high");
+describe("provider/model/tool identities", () => {
+  test("constructs canonical model specs and splits only the first slash", () => {
+    const provider = providerId("gateway");
+    const model = modelId("vendor/special:latest");
+    const spec = modelSpecFrom(provider, model);
+    expect(spec as string).toBe("gateway/vendor/special:latest");
+    expect(modelSpecParts(spec)).toEqual({ provider, modelId: model });
+    expect(modelSpec("gateway/vendor/special:latest") as string).toBe(spec as string);
   });
 
-  test("rejects an empty or blank spec", () => {
-    expect(() => modelSpec("")).toThrow(/invalid_input/);
-    expect(() => modelSpec("   ")).toThrow(/invalid_input/);
+  test.each(["", " ", " anthropic", "anthropic ", "anthropic/api", "bad\0provider", "bad\nprovider", "bad\u007fprovider"])(
+    "rejects invalid provider ID %#",
+    (value) => expect(() => providerId(value)).toThrow(/invalid_input/),
+  );
+
+  test.each(["", " ", " model", "model ", "bad\0model", "bad\nmodel", "bad\u007fmodel"])(
+    "rejects invalid model ID %#",
+    (value) => expect(() => modelId(value)).toThrow(/invalid_input/),
+  );
+
+  test("allows slash and colon inside a model ID", () => {
+    expect(modelId("vendor/model:latest") as string).toBe("vendor/model:latest");
+  });
+
+  test.each(["", "bad\0tool", "bad\ntool", "bad\u007ftool", "£".repeat(129)])(
+    "rejects invalid tool name %#",
+    (value) => expect(() => toolName(value)).toThrow(/invalid_input/),
+  );
+
+  test("accepts a tool name at the 256-byte boundary", () => {
+    expect(toolName("£".repeat(128)) as string).toBe("£".repeat(128));
+  });
+
+  test.each(["", "bare-id", "/model", "provider/", " provider/model", "provider/model "])(
+    "rejects invalid model spec %#",
+    (value) => expect(() => modelSpec(value)).toThrow(/invalid_input/),
+  );
+});
+
+describe("absolutePath", () => {
+  test("rejects NUL before resolving a path", () => {
+    expect(() => absolutePath("safe\0escape")).toThrow(/invalid_input/);
   });
 });
 
-describe("milliseconds / utf8Bytes", () => {
-  test("accepts non-negative integers", () => {
+describe("semantic numeric constructors", () => {
+  test("constructs units, depths and counts", () => {
     expect(milliseconds(0) as number).toBe(0);
-    expect(milliseconds(1000) as number).toBe(1000);
     expect(utf8Bytes(0) as number).toBe(0);
+    expect(utf16CodeUnitOffset(4) as number).toBe(4);
+    expect(delegationDepth(1) as number).toBe(1);
+    expect(nextDelegationDepth(delegationDepth(1)) as number).toBe(2);
+    expect(runCapacity(4) as number).toBe(4);
+    expect(processCount(4) as number).toBe(4);
+    expect(processId(42) as number).toBe(42);
+    expect(processGroupId(43) as number).toBe(43);
+    expect(observationRevision(0) as number).toBe(0);
   });
 
-  test("rejects negative or fractional values", () => {
-    expect(() => milliseconds(-1)).toThrow(/invalid_input/);
-    expect(() => milliseconds(1.5)).toThrow(/invalid_input/);
-    expect(() => utf8Bytes(-1)).toThrow(/invalid_input/);
+  test.each([
+    milliseconds,
+    utf8Bytes,
+    utf16CodeUnitOffset,
+    delegationDepth,
+    processCount,
+  ])("rejects negative, fractional, non-finite and unsafe values", (construct) => {
+    for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => construct(value)).toThrow(/invalid_input/);
+    }
+  });
+
+  test.each([processId, processGroupId])(
+    "process identity rejects zero, negative, fractional, non-finite and unsafe values",
+    (construct) => {
+      for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() => construct(value)).toThrow(/invalid_input/);
+      }
+    },
+  );
+
+  test("observation revision rejects negative, fractional, non-finite and unsafe values", () => {
+    for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => observationRevision(value)).toThrow(/invalid_input/);
+    }
+  });
+
+  test("capacity rejects zero and every invalid safe-integer boundary", () => {
+    for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => runCapacity(value)).toThrow(/invalid_input/);
+    }
+  });
+
+  test("next depth rejects overflow", () => {
+    expect(() => nextDelegationDepth(delegationDepth(Number.MAX_SAFE_INTEGER))).toThrow(/invalid_input/);
   });
 });
 
@@ -227,13 +427,13 @@ describe("assertTransition / isLegalTransition", () => {
 
 describe("truncateUtf8", () => {
   test("retains a UTF-8-safe diagnostic tail at the 50 KB boundary", () => {
-    const tail = retainUtf8Tail(`old${"£".repeat(30_000)}END`, 50_000);
+    const tail = retainUtf8Tail(`old${"£".repeat(30_000)}END`, utf8Bytes(50_000));
     expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(50_000);
     expect(tail.endsWith("END")).toBeTrue();
     expect(tail).not.toContain("�");
   });
   test("returns the original text untruncated when within budget", () => {
-    expect(truncateUtf8("hello", 10) as unknown).toEqual({
+    expect(truncateUtf8("hello", utf8Bytes(10)) as unknown).toEqual({
       text: "hello",
       originalBytes: 5,
       retainedBytes: 5,
@@ -242,7 +442,7 @@ describe("truncateUtf8", () => {
   });
 
   test("truncates to a valid UTF-8 prefix, never splitting a multi-byte character", () => {
-    expect(truncateUtf8("£££", 5) as unknown).toEqual({
+    expect(truncateUtf8("£££", utf8Bytes(5)) as unknown).toEqual({
       text: "££",
       originalBytes: 6,
       retainedBytes: 4,
@@ -251,7 +451,7 @@ describe("truncateUtf8", () => {
   });
 
   test("handles a zero byte budget", () => {
-    expect(truncateUtf8("abc", 0) as unknown).toEqual({
+    expect(truncateUtf8("abc", utf8Bytes(0)) as unknown).toEqual({
       text: "",
       originalBytes: 3,
       retainedBytes: 0,
@@ -260,7 +460,7 @@ describe("truncateUtf8", () => {
   });
 
   test("handles ASCII truncation at an exact boundary", () => {
-    expect(truncateUtf8("abcdef", 3) as unknown).toEqual({
+    expect(truncateUtf8("abcdef", utf8Bytes(3)) as unknown).toEqual({
       text: "abc",
       originalBytes: 6,
       retainedBytes: 3,

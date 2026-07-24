@@ -11,6 +11,9 @@ import type {
 
 /** Brands an already-resolved absolute path. Resolves `value` against `cwd` if relative. */
 export function absolutePath(value: string, cwd = process.cwd()): AbsolutePath {
+  if (value.includes("\0") || cwd.includes("\0")) {
+    throw new Error("invalid_input: absolute path must not contain NUL");
+  }
   const resolved = resolve(cwd, value);
   return resolved as AbsolutePath;
 }
@@ -51,11 +54,34 @@ export function realContainedPath(parent: string, child: string): AbsolutePath {
 }
 
 /** Validates persisted state lexically, then resolves symlinks whenever the target exists. */
-export function restoredStatePath(stateRoot: string, candidate: string): AbsolutePath {
+export function restoredStatePath(stateRoot: AbsolutePath, candidate: string): AbsolutePath {
   const lexical = containedPath(stateRoot, candidate);
   if (!existsSync(lexical)) return lexical;
   const real = realContainedPath(stateRoot, lexical);
   return real;
+}
+
+/** Restores a session path only after proving containment beneath the persisted state root. */
+export function restoredSessionPath(root: AbsolutePath, candidate: string): SessionPath {
+  return restoredStatePath(root, candidate) as SessionPath;
+}
+
+/** Restores an output candidate only after proving containment beneath the persisted state root. */
+export function restoredOutputPath(root: AbsolutePath, candidate: string): OutputPath {
+  return restoredStatePath(root, candidate) as OutputPath;
+}
+
+/** Restores a diagnostics path only after proving containment beneath the persisted state root. */
+export function restoredDiagnosticsPath(root: AbsolutePath, candidate: string): DiagnosticsPath {
+  return restoredStatePath(root, candidate) as DiagnosticsPath;
+}
+
+/** Restores a receipt path only after proving containment beneath the persisted state root. */
+export function restoredContainmentReceiptPath(
+  root: AbsolutePath,
+  candidate: string,
+): ContainmentReceiptPath {
+  return restoredStatePath(root, candidate) as ContainmentReceiptPath;
 }
 
 export function sessionPath(parent: string, child: string): SessionPath {

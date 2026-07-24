@@ -2,11 +2,22 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync, statSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import type { AbsolutePath } from "../src/domain.ts";
+import type {
+  AbsolutePath,
+  ContainmentReceiptPath,
+  DiagnosticsPath,
+  OutputPath,
+  SessionPath,
+} from "../src/domain.ts";
 import {
+  absolutePath,
   containedPath,
   isContainedPath,
   realContainedPath,
+  restoredContainmentReceiptPath,
+  restoredDiagnosticsPath,
+  restoredOutputPath,
+  restoredSessionPath,
   restoredStatePath,
   writeOwnerOnlyFile,
 } from "../src/paths.ts";
@@ -72,10 +83,61 @@ describe("paths", () => {
     const stateRoot = temporaryStateRoot("pi-subagents-restored-paths-");
     try {
       const root: string = stateRoot.path;
-      const state = join(root, "state"); const outside = join(root, "outside");
+      const state = absolutePath(join(root, "state")); const outside = join(root, "outside");
       mkdirSync(state); mkdirSync(outside);
       const escape = join(state, "escape"); symlinkSync(outside, escape);
       expect(() => restoredStatePath(state, escape)).toThrow(/invalid_input/);
+    } finally {
+      stateRoot.cleanup();
+    }
+  });
+
+  test("restored path specialisations return their expected contained types", () => {
+    const stateRoot = temporaryStateRoot("pi-subagents-restored-specialisations-");
+    try {
+      const root = stateRoot.path;
+      const session: SessionPath = restoredSessionPath(root, join(root, "sessions", "a.jsonl"));
+      const output: OutputPath = restoredOutputPath(root, join(root, "output", "a.committed"));
+      const diagnostics: DiagnosticsPath = restoredDiagnosticsPath(root, join(root, "diagnostics", "a.log"));
+      const receipt: ContainmentReceiptPath = restoredContainmentReceiptPath(root, join(root, "receipts", "a.json"));
+      expect(String(session)).toBe(join(root, "sessions", "a.jsonl"));
+      expect(String(output)).toBe(join(root, "output", "a.committed"));
+      expect(String(diagnostics)).toBe(join(root, "diagnostics", "a.log"));
+      expect(String(receipt)).toBe(join(root, "receipts", "a.json"));
+    } finally {
+      stateRoot.cleanup();
+    }
+  });
+
+  test.each([
+    ["session", restoredSessionPath],
+    ["output", restoredOutputPath],
+    ["diagnostics", restoredDiagnosticsPath],
+    ["receipt", restoredContainmentReceiptPath],
+  ] as const)("restored %s paths reject lexical escapes", (_name, restore) => {
+    const stateRoot = temporaryStateRoot("pi-subagents-restored-lexical-");
+    try {
+      expect(() => restore(stateRoot.path, join(stateRoot.path, "..", "outside"))).toThrow(/escapes/);
+    } finally {
+      stateRoot.cleanup();
+    }
+  });
+
+  test.each([
+    ["session", restoredSessionPath],
+    ["output", restoredOutputPath],
+    ["diagnostics", restoredDiagnosticsPath],
+    ["receipt", restoredContainmentReceiptPath],
+  ] as const)("restored %s paths reject realpath escapes", (_name, restore) => {
+    const stateRoot = temporaryStateRoot("pi-subagents-restored-realpath-");
+    try {
+      const root = absolutePath(join(stateRoot.path, "state"));
+      const outside = join(stateRoot.path, "outside");
+      mkdirSync(root);
+      mkdirSync(outside);
+      const escape = join(root, "escape");
+      symlinkSync(outside, escape);
+      expect(() => restore(root, escape)).toThrow(/escapes/);
     } finally {
       stateRoot.cleanup();
     }
@@ -85,7 +147,7 @@ describe("paths", () => {
     const state = temporaryStateRoot("pi-subagents-paths-");
     try {
       const root: string = state.path;
-      const nested = join(root, "state", "child", "file.json") as AbsolutePath;
+      const nested: AbsolutePath = absolutePath(join(root, "state", "child", "file.json"));
 
       writeOwnerOnlyFile(nested, '{"ok":true}');
 

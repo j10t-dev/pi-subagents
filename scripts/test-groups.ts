@@ -13,10 +13,12 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
   unit: new Set([
     "assignment-identity.test.ts",
     "async-primitives.test.ts",
+    "b0-gates.test.ts",
     "child-selection.test.ts",
     "completion-service.test.ts",
     "domain.test.ts",
     "durable-fs.test.ts",
+    "observation-snapshot-path.test.ts",
     "persistence.test.ts",
     "pi-integration-harness.test.ts",
     "paths.test.ts",
@@ -25,6 +27,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "test-runner.test.ts",
   ]),
   transport: new Set([
+    "focus-spike.test.ts",
     "jsonl.test.ts",
     "output-store.test.ts",
     "rpc-client.test.ts",

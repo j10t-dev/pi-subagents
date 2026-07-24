@@ -1,9 +1,10 @@
+import { dirname } from "node:path";
 import { AGENT_EVENT_CUSTOM_TYPE } from "../../src/constants.ts";
 import { AgentEventType, AgentState, CancellationReason, type AgentCompletion, type AgentEventPayloadMap, type PersistedAgentEvent } from "../../src/domain.ts";
-import { AgentEventAppender, type RestoredAgentRecord } from "../../src/persistence.ts";
+import { AgentEventAppender, type FoldedAgentRecord } from "../../src/persistence.ts";
 import type { RestorationPort } from "../../src/controller.ts";
 import { completedCompletion } from "./messages.ts";
-import { testAbsolutePath, testAgentId, testAttemptId, testModelSpec, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./brands.ts";
+import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testContainmentAttempt, testModelId, testProviderId, testReceiptPath, testRunId, testSessionPath, testToolName, testVerifiedReceiptPath } from "./brands.ts";
 
 export function testRestorationPort(overrides: Partial<RestorationPort> = {}): RestorationPort {
   const appender = new AgentEventAppender(() => {});
@@ -12,7 +13,14 @@ export function testRestorationPort(overrides: Partial<RestorationPort> = {}): R
     getBranch: () => [],
     resolveContainment: async () => ({ kind: "contained", receipt: testVerifiedReceiptPath() }),
     firstUserEntryAfter: async () => undefined,
-    finaliseContained: async (_record: RestoredAgentRecord, runId) => completedCompletion({ runId }),
+    finaliseContained: async (_record: FoldedAgentRecord, runId) => completedCompletion({ runId }),
+    restoreCompletion: async (record) => ({
+      ...record.completion.payload,
+      outputPath: testCommittedOutputPath({
+        workDir: testAbsolutePath(dirname(record.completion.payload.outputPath)),
+        runId: record.completion.payload.runId,
+      }),
+    }),
     appender,
     ...overrides,
   };
@@ -26,7 +34,7 @@ const wrap = (data: PersistedAgentEvent): RestorationEventEntry =>
 export function spawnedEntry(overrides: Partial<AgentEventPayloadMap[typeof AgentEventType.Spawned]> = {}, schemaVersion: 1 | 2 = 2): RestorationEventEntry {
   const payload: AgentEventPayloadMap[typeof AgentEventType.Spawned] = {
     agentId: testAgentId(), sessionPath: testSessionPath(), cwd: testAbsolutePath("/tmp/pi-subagents-test"),
-    provider: "mock-provider", modelId: testModelSpec(), thinkingLevel: "high", tools: ["read"], ...overrides,
+    provider: testProviderId(), modelId: testModelId(), thinkingLevel: "high", tools: [testToolName()], ...overrides,
   };
   // Each builder branches on the literal schema version so its object narrows to one union member.
   return wrap(schemaVersion === 1
@@ -37,7 +45,7 @@ export function spawnedEntry(overrides: Partial<AgentEventPayloadMap[typeof Agen
 export function launchEntry(overrides: Partial<AgentEventPayloadMap[typeof AgentEventType.RunLaunchRequested]> = {}, schemaVersion: 1 | 2 = 2): RestorationEventEntry {
   const { containment, ...common } = {
     agentId: testAgentId(), previousLeafId: null, attemptId: testAttemptId(), containmentReceiptPath: testReceiptPath(),
-    containment: { backend: "cgroup-v2" as const, scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    containment: testContainmentAttempt().descriptor,
     ...overrides,
   };
   return wrap(schemaVersion === 1

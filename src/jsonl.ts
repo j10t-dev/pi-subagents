@@ -8,13 +8,15 @@
  * multi-byte UTF-8 sequences never contain that byte, so byte-level scanning is always safe.
  */
 
+import { utf8Bytes, type Utf8Bytes } from "./domain.ts";
+
 export interface BoundedJsonlDecoderOptions {
   /** Maximum bytes retained for one buffered (LF-terminated) record before it is discarded. */
-  maxRecordBytes: number;
+  maxRecordBytes: Utf8Bytes;
   /** Called with the parsed value of each complete, in-bound, valid-UTF-8, valid-JSON record. */
   onRecord: (value: unknown) => void;
   /** Called when a record's buffered size would exceed `maxRecordBytes`; it is discarded through the next LF. */
-  onOversize: (approxBytes: number) => void;
+  onOversize: (approxBytes: Utf8Bytes) => void;
   /** Called at the LF with bounded top-level metadata recovered while discarding an oversized record. */
   onOversizeRecord?: (metadata: OversizedRecordMetadata) => void;
   /** Called with a bounded, non-payload-bearing reason when a record fails to decode or parse. */
@@ -26,19 +28,15 @@ export interface OversizedRecordMetadata { type?: string; id?: string; command?:
 /** Splits input strictly on LF, never retaining more than `maxRecordBytes` per pending record. */
 export class BoundedJsonlDecoder {
   private buffered = new Uint8Array(0);
-  private bufferedBytes = 0;
+  private bufferedBytes = utf8Bytes(0);
   private discarding = false;
   private ended = false;
   private readonly metadata = new TopLevelMetadataScanner();
 
-  constructor(private readonly options: BoundedJsonlDecoderOptions) {
-    if (!Number.isInteger(options.maxRecordBytes) || options.maxRecordBytes <= 0) {
-      throw new RangeError("maxRecordBytes must be a positive integer");
-    }
-  }
+  constructor(private readonly options: BoundedJsonlDecoderOptions) {}
 
   /** Bytes currently buffered for the in-progress (not yet LF-terminated) record. Test/diagnostic use only. */
-  get pendingBytes(): number {
+  get pendingBytes(): Utf8Bytes {
     return this.bufferedBytes;
   }
 
@@ -78,7 +76,7 @@ export class BoundedJsonlDecoder {
       this.finishLine();
     }
     this.buffered = new Uint8Array(0);
-    this.bufferedBytes = 0;
+    this.bufferedBytes = utf8Bytes(0);
     this.discarding = false;
   }
 
@@ -91,13 +89,13 @@ export class BoundedJsonlDecoder {
     const projected = this.bufferedBytes + slice.length;
     if (projected > this.options.maxRecordBytes) {
       this.discarding = true;
-      this.bufferedBytes = 0;
-      this.options.onOversize(projected);
+      this.bufferedBytes = utf8Bytes(0);
+      this.options.onOversize(utf8Bytes(projected));
       return;
     }
     this.ensureCapacity(projected);
     this.buffered.set(slice, this.bufferedBytes);
-    this.bufferedBytes = projected;
+    this.bufferedBytes = utf8Bytes(projected);
   }
 
   private ensureCapacity(required: number): void {
@@ -119,7 +117,7 @@ export class BoundedJsonlDecoder {
       return;
     }
     const lineBytes = this.buffered.subarray(0, this.bufferedBytes);
-    this.bufferedBytes = 0;
+    this.bufferedBytes = utf8Bytes(0);
     this.metadata.reset();
     const trimmed = trimTrailingCr(lineBytes);
     if (trimmed.length === 0) {

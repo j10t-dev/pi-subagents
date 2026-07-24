@@ -1,9 +1,9 @@
-import { AgentState, type AgentId } from "../../src/domain.ts";
+import { AgentState, runCapacity, type AgentId } from "../../src/domain.ts";
 import { RunController, type RunControllerOptions, type RunRecord } from "../../src/run-controller.ts";
 import { testAgentId, testSessionPath } from "./brands.ts";
 
 export function testRunController(options: Partial<RunControllerOptions> = {}): RunController {
-  return new RunController({ capacity: 2, ...options });
+  return new RunController({ capacity: runCapacity(2), ...options });
 }
 
 export async function restoreRuns(controller: RunController, records: Iterable<RunRecord>): Promise<void> {

@@ -7,14 +7,17 @@ import {
   type AgentId,
   type RunId,
 } from "../src/domain.ts";
-import type {
-  RestorationAction,
-  RestoredAgentRecord,
-  RestoredRegistry,
+import {
+  foldAgentEvents,
+  type FoldedAgentRecord,
+  type PendingLaunch,
+  type RestorationAction,
+  type RestoredRegistry,
 } from "../src/persistence.ts";
 import {
   planRestoration,
   type AgentRestorationEvidence,
+  type PlannedAgentRecord,
   type StagedRestorePlan,
 } from "../src/restoration.ts";
 import type { RunRecord, RunRuntime } from "../src/run-controller.ts";
@@ -23,19 +26,33 @@ import {
   testAgentId,
   testAttemptId,
   testEntryId,
-  testModelSpec,
+  testModelId,
+  testObservedCgroupScopePath,
+  testProviderId,
   testReceiptPath,
   testRunId,
   testSessionPath,
+  testToolName,
   testVerifiedReceiptPath,
 } from "./support/brands.ts";
 import { completedCompletion } from "./support/messages.ts";
+import { completedEntry, launchEntry, spawnedEntry, startedEntry } from "./support/restoration.ts";
 
 const AGENT = testAgentId("agent-a");
 const RUN = testRunId("deadbeef");
 const PREVIOUS_RUN = testRunId("cafebabe");
 const ATTEMPT = testAttemptId("attempt-1");
 const REASON = CancellationReason.ParentShutdown;
+const launchFixture: PendingLaunch = {
+  payload: {
+    agentId: AGENT, previousLeafId: testEntryId("aaaaaaaa"), attemptId: ATTEMPT,
+    containmentReceiptPath: testReceiptPath(),
+    containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
+  },
+  eventVersion: 2,
+};
+// @ts-expect-error a Settling planner record requires a native runId
+const _badSettling: PlannedAgentRecord = { ...baseStopped(), state: AgentState.Settling, pendingLaunch: launchFixture };
 
 function runtime(): RunRuntime {
   return {
@@ -44,76 +61,67 @@ function runtime(): RunRuntime {
   };
 }
 
-function baseStopped(agentId: AgentId = AGENT): RestoredAgentRecord {
+function baseStopped(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { state: typeof AgentState.Stopped }> {
   return {
     agentId,
     sessionPath: testSessionPath(`/tmp/pi-subagents-test/sessions/${agentId}.jsonl`),
     cwd: testAbsolutePath("/tmp/pi-subagents-test"),
-    provider: "mock-provider",
-    modelId: testModelSpec(),
+    provider: testProviderId(),
+    modelId: testModelId(),
     thinkingLevel: "high",
-    tools: ["read"],
+    tools: [testToolName()],
     state: AgentState.Stopped,
   };
 }
 
-function completionRecord(agentId: AgentId = AGENT): RestoredAgentRecord {
+function completionRecord(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { state: typeof AgentState.Stopped }> {
   const record = baseStopped(agentId);
   return {
     ...record,
-    latestCompletion: completedCompletion({
-      agentId,
-      runId: RUN,
-      transcriptPath: record.sessionPath,
-    }),
-    latestCompletionReceiptPath: testReceiptPath(),
-    latestCompletionAttemptId: ATTEMPT,
-    latestCompletionContainment: {
-      backend: "cgroup-v2",
-      scopePath: testAbsolutePath("/tmp/cgroup/attempt-1"),
+    completion: {
+      payload: completedCompletion({ agentId, runId: RUN, transcriptPath: record.sessionPath }),
+      receiptPath: testReceiptPath(),
+      attemptId: ATTEMPT,
+      containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
+      eventVersion: 2,
     },
-    latestCompletionEventVersion: 2,
   };
 }
 
-function launchRecord(agentId: AgentId = AGENT): RestoredAgentRecord {
+function launchRecord(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { state: typeof AgentState.Stopped }> {
   const record = completionRecord(agentId);
   return {
     ...record,
     pendingLaunch: {
-      agentId,
-      previousLeafId: testEntryId("aaaaaaaa"),
-      attemptId: ATTEMPT,
-      containmentReceiptPath: testReceiptPath(),
-      containment: {
-        backend: "cgroup-v2",
-        scopePath: testAbsolutePath("/tmp/cgroup/attempt-1"),
+      payload: {
+        agentId, previousLeafId: testEntryId("aaaaaaaa"), attemptId: ATTEMPT,
+        containmentReceiptPath: testReceiptPath(),
+        containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
       },
+      eventVersion: 2,
     },
-    pendingLaunchEventVersion: 2,
   };
 }
 
-function startedRecord(agentId: AgentId = AGENT): RestoredAgentRecord {
+function startedRecord(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { state: typeof AgentState.Running }> {
   return {
     ...baseStopped(agentId),
     state: AgentState.Running,
-    currentRunId: RUN,
-    currentReceiptPath: testReceiptPath(),
-    currentAttemptId: ATTEMPT,
-    currentContainment: {
-      backend: "cgroup-v2",
-      scopePath: testAbsolutePath("/tmp/cgroup/attempt-1"),
+    run: {
+      runId: RUN, receiptPath: testReceiptPath(), attemptId: ATTEMPT,
+      containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
+      eventVersion: 2,
     },
-    currentEventVersion: 2,
   };
 }
 
-function stoppingRecord(agentId: AgentId = AGENT): RestoredAgentRecord {
+function stoppingRecord(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { state: typeof AgentState.Stopping }> {
+  const record = startedRecord(agentId);
   return {
-    ...startedRecord(agentId),
-    state: AgentState.Stopping,
-    pendingStopReason: REASON,
+    agentId: record.agentId, sessionPath: record.sessionPath, cwd: record.cwd,
+    provider: record.provider, modelId: record.modelId, thinkingLevel: record.thinkingLevel, tools: record.tools,
+    state: AgentState.Stopping, run: record.run, stopReason: REASON,
+    ...(record.completion === undefined ? {} : { completion: record.completion }),
   };
 }
 
@@ -124,7 +132,7 @@ function launchAction(agentId: AgentId = AGENT): RestorationAction {
     attemptId: ATTEMPT,
     previousLeafId: testEntryId("aaaaaaaa"),
     containmentReceiptPath: testReceiptPath(),
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }
@@ -136,7 +144,7 @@ function startedAction(agentId: AgentId = AGENT): RestorationAction {
     runId: RUN,
     containmentReceiptPath: testReceiptPath(),
     attemptId: ATTEMPT,
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }
@@ -149,7 +157,7 @@ function stoppingAction(agentId: AgentId = AGENT): RestorationAction {
     reason: REASON,
     containmentReceiptPath: testReceiptPath(),
     attemptId: ATTEMPT,
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }
@@ -160,12 +168,12 @@ function completedAction(agentId: AgentId = AGENT): RestorationAction {
     agentId,
     containmentReceiptPath: testReceiptPath(),
     attemptId: ATTEMPT,
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }
 
-function registry(record: RestoredAgentRecord, action?: RestorationAction): RestoredRegistry {
+function registry(record: FoldedAgentRecord, action?: RestorationAction): RestoredRegistry {
   return {
     agents: new Map([[record.agentId, record]]),
     actions: action === undefined ? [] : [action],
@@ -189,30 +197,43 @@ function historical(runRuntime: RunRuntime): AgentRestorationEvidence {
   return { containment: { kind: "historical-unresolved", runtime: runRuntime }, launchIdentity: { kind: "not-applicable" } };
 }
 
-function withoutCompletion(record: RestoredAgentRecord): RestoredAgentRecord {
-  const {
-    latestCompletion: _completion,
-    latestCompletionReceiptPath: _receipt,
-    latestCompletionAttemptId: _attempt,
-    latestCompletionContainment: _containment,
-    latestCompletionEventVersion: _version,
-    ...rest
-  } = record;
+function withoutCompletion(
+  record: Extract<FoldedAgentRecord, { state: typeof AgentState.Stopped }>,
+): Extract<FoldedAgentRecord, { state: typeof AgentState.Stopped }> {
+  const { completion: _completion, ...rest } = record;
   return rest;
 }
 
-function stopped(record: RestoredAgentRecord): RestoredAgentRecord {
-  const { currentRunId: _run, pendingLaunch: _launch, pendingStopReason: _reason, ...rest } = record;
-  return { ...rest, state: AgentState.Stopped };
+function stopped(record: FoldedAgentRecord): PlannedAgentRecord {
+  return {
+    agentId: record.agentId, sessionPath: record.sessionPath, cwd: record.cwd,
+    provider: record.provider, modelId: record.modelId, thinkingLevel: record.thinkingLevel, tools: record.tools,
+    state: AgentState.Stopped,
+    ...(record.completion === undefined ? {} : { completion: record.completion }),
+  };
 }
 
-function active(record: RestoredAgentRecord, runId: RunId, state: typeof AgentState.Settling | typeof AgentState.Stopping): RestoredAgentRecord {
-  const { latestCompletion: _completion, ...rest } = record;
-  return { ...rest, state, currentRunId: runId };
+function active(record: FoldedAgentRecord, runId: RunId, state: typeof AgentState.Settling | typeof AgentState.Stopping): PlannedAgentRecord {
+  return {
+    agentId: record.agentId, sessionPath: record.sessionPath, cwd: record.cwd,
+    provider: record.provider, modelId: record.modelId, thinkingLevel: record.thinkingLevel, tools: record.tools,
+    state, runId,
+    ...(record.state === AgentState.Stopped && record.pendingLaunch !== undefined ? { pendingLaunch: record.pendingLaunch } : {}),
+  };
+}
+
+function preNative(record: Extract<FoldedAgentRecord, { state: typeof AgentState.Stopped }>, keepCompletion: boolean): PlannedAgentRecord {
+  if (record.pendingLaunch === undefined) throw new Error("launch required");
+  return {
+    agentId: record.agentId, sessionPath: record.sessionPath, cwd: record.cwd,
+    provider: record.provider, modelId: record.modelId, thinkingLevel: record.thinkingLevel, tools: record.tools,
+    state: AgentState.Stopping, pendingLaunch: record.pendingLaunch,
+    ...(keepCompletion && record.completion !== undefined ? { completion: record.completion } : {}),
+  };
 }
 
 function runRecord(
-  record: RestoredAgentRecord,
+  record: PlannedAgentRecord,
   runRuntime?: RunRuntime,
   responsibility?: "pre-native" | "historical-unresolved",
   restoredTerminalObligation?: true,
@@ -221,7 +242,7 @@ function runRecord(
     agentId: record.agentId,
     state: record.state,
     transcriptPath: record.sessionPath,
-    ...(record.currentRunId === undefined ? {} : { runId: record.currentRunId }),
+    ...(record.state === AgentState.Stopped || record.runId === undefined ? {} : { runId: record.runId }),
     ...(runRuntime === undefined ? {} : { runtime: runRuntime }),
     ...(responsibility === undefined ? {} : { containmentResponsibility: responsibility }),
     ...(restoredTerminalObligation === undefined ? {} : { restoredTerminalObligation }),
@@ -236,7 +257,7 @@ function expectPlan(actual: StagedRestorePlan, expected: StagedRestorePlan): voi
   expect(actual.warnings).toEqual(expected.warnings);
 }
 
-function plan(record: RestoredAgentRecord, action: RestorationAction | undefined, evidence?: AgentRestorationEvidence): StagedRestorePlan {
+function plan(record: FoldedAgentRecord, action: RestorationAction | undefined, evidence?: AgentRestorationEvidence): StagedRestorePlan {
   return planRestoration(registry(record, action), evidence === undefined ? new Map() : new Map([[record.agentId, evidence]]));
 }
 
@@ -256,6 +277,28 @@ test("row 1: no action, stopped Spawned remains unchanged without evidence looku
   expectPlan(planRestoration(registry(record), new EvidenceLookupForbidden()), {
     restored: [record], runtimeRecords: [runRecord(record)], durableWrites: [], obligations: new Map(), warnings: [],
   });
+});
+
+test("a crashed relaunch of a completed agent with a failed lookup restores pre-native (delta 6)", () => {
+  const registry = foldAgentEvents([
+    spawnedEntry(),
+    launchEntry(),
+    startedEntry(),
+    completedEntry(),
+    launchEntry({ attemptId: testAttemptId("attempt-2") }),
+  ], testAbsolutePath("/tmp/pi-subagents-test"));
+  const evidence: AgentRestorationEvidence = {
+    containment: { kind: "contained", runtime: runtime() },
+    launchIdentity: { kind: "lookup-failed" },
+  };
+  const staged = planRestoration(registry, new Map([[testAgentId(), evidence]]));
+  expect(staged.restored[0]).toMatchObject({ state: AgentState.Stopping });
+  expect(staged.runtimeRecords[0]).toMatchObject({
+    containmentResponsibility: "pre-native",
+    restoredTerminalObligation: true,
+  });
+  expect(staged.runtimeRecords[0]?.runId).toBeUndefined();
+  expect(staged.warnings).toEqual([testAgentId()]);
 });
 
 test("row 2: ReconcileLaunch + contained/no-run removes pending launch", () => {
@@ -284,7 +327,7 @@ test("row 3: ReconcileLaunch + contained/run-found plans interrupted finalisatio
 test("row 4: ReconcileLaunch + contained/lookup-failed retains pre-native responsibility without RunStarted", () => {
   const record = launchRecord();
   const runRuntime = runtime();
-  const restored = { ...record, state: AgentState.Stopping };
+  const restored = preNative(record, true);
   const settlement = { kind: "interrupted" as const };
   expectPlan(plan(record, launchAction(), containedLaunch(runRuntime, { kind: "lookup-failed" })), {
     restored: [restored],
@@ -298,7 +341,7 @@ test("row 4: ReconcileLaunch + contained/lookup-failed retains pre-native respon
 test("row 5: ReconcileLaunch + uncontained discards completion and retains pre-native responsibility without RunStarted", () => {
   const record = launchRecord();
   const runRuntime = runtime();
-  const restored = { ...withoutCompletion(record), state: AgentState.Stopping };
+  const restored = preNative(withoutCompletion(record), false);
   const settlement = { kind: "interrupted" as const };
   expectPlan(plan(record, launchAction(), uncontained(runRuntime)), {
     restored: [restored],
@@ -312,7 +355,7 @@ test("row 5: ReconcileLaunch + uncontained discards completion and retains pre-n
 test("row 6: ReconcileLaunch + historical-unresolved preserves historical responsibility without RunStarted", () => {
   const record = launchRecord();
   const runRuntime = runtime();
-  const restored = { ...withoutCompletion(record), state: AgentState.Stopping };
+  const restored = preNative(withoutCompletion(record), false);
   const settlement = { kind: "interrupted" as const };
   expectPlan(plan(record, launchAction(), historical(runRuntime)), {
     restored: [restored],
@@ -391,18 +434,19 @@ test("row 12: ReconcileStopping + historical-unresolved adds historical responsi
   });
 });
 
-test("row 13: ValidateCompletedReceipt + contained preserves stopped completion", () => {
+test("row 13: ValidateCompletedReceipt + contained preserves stopped completion and its proof obligation", () => {
   const record = completionRecord();
   const runRuntime = runtime();
   expectPlan(plan(record, completedAction(), contained(runRuntime)), {
-    restored: [record], runtimeRecords: [runRecord(record)], durableWrites: [], obligations: new Map(), warnings: [],
+    restored: [record], runtimeRecords: [runRecord(record)], durableWrites: [],
+    obligations: new Map([[AGENT, { kind: "restore-completion", record }]]), warnings: [],
   });
 });
 
 test("row 14: ValidateCompletedReceipt + uncontained removes completion and retains original retry record", () => {
   const record = completionRecord();
   const runRuntime = runtime();
-  const restored = { ...withoutCompletion(record), state: AgentState.Settling };
+  const restored = active(withoutCompletion(record), RUN, AgentState.Settling);
   expectPlan(plan(record, completedAction(), uncontained(runRuntime)), {
     restored: [restored], runtimeRecords: [runRecord(restored, runRuntime)], durableWrites: [],
     obligations: new Map([[AGENT, { kind: "restore-completion", record }]]), warnings: [AGENT],
@@ -412,7 +456,7 @@ test("row 14: ValidateCompletedReceipt + uncontained removes completion and reta
 test("row 15: ValidateCompletedReceipt + historical-unresolved preserves historical responsibility and original retry record", () => {
   const record = completionRecord();
   const runRuntime = runtime();
-  const restored = { ...withoutCompletion(record), state: AgentState.Settling };
+  const restored = active(withoutCompletion(record), RUN, AgentState.Settling);
   expectPlan(plan(record, completedAction(), historical(runRuntime)), {
     restored: [restored], runtimeRecords: [runRecord(restored, runRuntime, "historical-unresolved")], durableWrites: [],
     obligations: new Map([[AGENT, { kind: "restore-completion", record }]]), warnings: [AGENT],
@@ -452,13 +496,18 @@ test("emits restored and runtime records in registry map order rather than actio
   ]);
   expectPlan(planRestoration(input, evidence), {
     restored: [second, first], runtimeRecords: [runRecord(second), runRecord(first)],
-    durableWrites: [], obligations: new Map(), warnings: [],
+    durableWrites: [],
+    obligations: new Map([
+      [second.agentId, { kind: "restore-completion", record: second }],
+      [first.agentId, { kind: "restore-completion", record: first }],
+    ]),
+    warnings: [],
   });
 });
 
 test("absent evidence synthesises the uncontained pre-native fail-safe plan", async () => {
   const record = launchRecord();
-  const restored = { ...withoutCompletion(record), state: AgentState.Stopping };
+  const restored = preNative(withoutCompletion(record), false);
   const result = plan(record, launchAction());
   expect(result.restored).toEqual([restored]);
   expect(result.runtimeRecords).toEqual([{

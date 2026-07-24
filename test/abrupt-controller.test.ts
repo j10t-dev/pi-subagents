@@ -5,8 +5,13 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { resolveCgroupV2Backend, type CgroupFileSystem } from "../src/cgroup-v2.ts";
-import type { AbsolutePath, ContainmentReceiptPath, RunAttemptId } from "../src/domain.ts";
-import { createRunAttemptId } from "../src/domain.ts";
+import type {
+  AbsolutePath,
+  ContainmentReceiptPath,
+  ObservedCgroupScopePath,
+  RunAttemptId,
+} from "../src/domain.ts";
+import { agentId, createRunAttemptId } from "../src/domain.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
@@ -25,7 +30,7 @@ describe("abrupt controller restoration matrix", () => {
     const state = temporaryStateRoot("abrupt-controller-production-");
     const directory: string = state.path;
     const attemptId = createRunAttemptId();
-    const parentSessionId = `abrupt-production-${process.pid}-${Date.now()}`;
+    const parentSessionId = agentId(`abrupt-production-${process.pid}-${Date.now()}`);
     const receipt = join(directory, "receipt.json") as ContainmentReceiptPath;
     const treePath = join(directory, "tree.jsonl");
     const persistedDescriptorPath = `${receipt}.descriptor.json`;
@@ -55,7 +60,8 @@ describe("abrupt controller restoration matrix", () => {
       if (child.stdout === null) throw new Error("production abrupt-controller fixture stdout unavailable");
       report = await nextJson(child.stdout);
       expect(existsSync(persistedDescriptorPath)).toBeTrue();
-      expect(report.descriptor).toEqual({ backend: "cgroup-v2", scopePath: scope });
+      expect(report.descriptor?.backend).toBe("cgroup-v2");
+      expect(report.descriptor?.scopePath as string).toBe(scope);
       expect(typeof report.launcherPid).toBe("number");
       expect(typeof report.piPid).toBe("number");
       const treePids = await waitForTreePids(treePath);
@@ -73,9 +79,10 @@ describe("abrupt controller restoration matrix", () => {
 
       const descriptor = report.descriptor!;
       const restored = backend.restoreAttempt(attemptId, descriptor);
+      const liveDescriptor = restored.proveRuntimeDescriptor(descriptor);
       const proof = await restored.terminate("terminated");
-      const verified = verifyContainmentReceipt(receipt, attemptId, undefined, descriptor);
-      expect(verified).toEqual({ version: 2, path: proof, descriptor, populated: false });
+      const verified = verifyContainmentReceipt(receipt, attemptId, undefined, liveDescriptor);
+      expect(verified).toEqual({ version: 2, path: proof, descriptor: liveDescriptor, populated: false });
       const receiptValue = JSON.parse(readFileSync(receipt, "utf8")) as Record<string, unknown>;
       expect(receiptValue).toEqual({
         version: 2,
@@ -109,7 +116,7 @@ describe("abrupt controller restoration matrix", () => {
     const state = temporaryStateRoot("abrupt-controller-");
     const directory: string = state.path;
     const attemptId = createRunAttemptId();
-    const parentSessionId = "abrupt-parent";
+    const parentSessionId = agentId("abrupt-parent");
     const root = join(directory, "root");
     const parent = join(root, createHash("sha256").update(parentSessionId).digest("hex"));
     const scope = join(parent, createHash("sha256").update(attemptId).digest("hex")) as AbsolutePath;
@@ -141,7 +148,8 @@ describe("abrupt controller restoration matrix", () => {
       else {
         const descriptor = report.descriptor;
         if (descriptor === undefined) throw new Error("post-descriptor phase omitted descriptor");
-        expect(descriptor).toEqual({ backend: "cgroup-v2", scopePath: scope });
+        expect(descriptor.backend).toBe("cgroup-v2");
+        expect(descriptor.scopePath as string).toBe(scope);
         if (phase === "after-launcher-membership-before-pi-spawn" || phase === "after-pi-spawn-with-descendants") {
           expect(report.launcherPid).toEqual(expect.any(Number));
         }
@@ -156,8 +164,9 @@ describe("abrupt controller restoration matrix", () => {
           receiptPathFor: () => receipt,
         });
         const restored = backend.restoreAttempt(attemptId, descriptor);
+        const liveDescriptor = restored.proveRuntimeDescriptor(descriptor);
         const proof = await restored.terminate("terminated");
-        expect(verifyContainmentReceipt(receipt, attemptId, undefined, descriptor)).toMatchObject({ version: 2, populated: false });
+        expect(verifyContainmentReceipt(receipt, attemptId, undefined, liveDescriptor)).toMatchObject({ version: 2, populated: false });
         await restored.cleanup(proof);
       }
     } finally {
@@ -176,7 +185,7 @@ interface AbruptReport {
   readonly watchdogPid: number;
   readonly launcherPid: number | null;
   readonly piPid: number | null;
-  readonly descriptor?: { readonly backend: "cgroup-v2"; readonly scopePath: AbsolutePath };
+  readonly descriptor?: { readonly backend: "cgroup-v2"; readonly scopePath: ObservedCgroupScopePath };
 }
 
 function nextJson(stream: NodeJS.ReadableStream): Promise<AbruptReport> {
@@ -285,7 +294,8 @@ function isAbruptReport(value: unknown): value is AbruptReport {
   if (report.descriptor === undefined) return true;
   if (typeof report.descriptor !== "object" || report.descriptor === null) return false;
   const descriptor = report.descriptor as Record<string, unknown>;
-  return descriptor.backend === "cgroup-v2" && typeof descriptor.scopePath === "string" && descriptor.scopePath.startsWith("/");
+  return descriptor.backend === "cgroup-v2" && typeof descriptor.scopePath === "string" &&
+    descriptor.scopePath.startsWith("/") && !descriptor.scopePath.includes("\0");
 }
 
 class RestorationFs implements CgroupFileSystem {
@@ -298,8 +308,14 @@ class RestorationFs implements CgroupFileSystem {
     if (path.endsWith("/cgroup.kill")) this.files.set(path.replace("cgroup.kill", "cgroup.events"), "populated 0\n");
   }
   mkdir(path: string): void { this.add(path); }
-  realpath(path: string): string { if (!this.directories.has(path)) throw new Error("ENOENT"); return path; }
-  stat(path: string): { isDirectory(): boolean } { if (!this.directories.has(path)) throw new Error("ENOENT"); return { isDirectory: () => true }; }
+  realpath(path: string): string {
+    if (!this.directories.has(path)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return path;
+  }
+  stat(path: string): { isDirectory(): boolean; mode: number } {
+    if (!this.directories.has(path)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return { isDirectory: () => true, mode: 0o700 };
+  }
   removeDirectory(path: string): void { this.directories.delete(path); }
   list(): readonly string[] { return []; }
   private add(path: string): void {

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { resolveCgroupV2Backend } from "../../src/cgroup-v2.ts";
-import { createRunAttemptId, retainUtf8Tail } from "../../src/domain.ts";
+import { agentId, createRunAttemptId, retainUtf8Tail, utf8Bytes } from "../../src/domain.ts";
 import { publishCommittedSync } from "../../src/durable-fs.ts";
 import { containmentReceiptPath } from "../../src/paths.ts";
 import { WatchdogClient } from "../../src/watchdog-client.ts";
@@ -22,7 +22,7 @@ if (stateDir === undefined || readyPath === undefined) {
 
 try {
   const backend = resolveCgroupV2Backend({
-    parentSessionId: `nested-controller-${process.pid}`,
+    parentSessionId: agentId(`nested-controller-${process.pid}`),
     receiptPathFor: (attemptId) => containmentReceiptPath(stateDir, `nested-${attemptId}.json`),
   });
   await backend.preflight();
@@ -33,7 +33,7 @@ try {
     receiptPath: containmentReceiptPath(stateDir, `nested-${attemptId}.json`),
     attempt,
   });
-  await client.ready();
+  const descriptor = await client.ready();
   await client.launch({
     command: testAbsolutePath(process.execPath),
     args: ["-e", "setInterval(() => {}, 1000)"],
@@ -41,7 +41,7 @@ try {
     env: process.env,
     shell: false,
   });
-  const grandchildPids = readFileSync(join(attempt.descriptor.scopePath, "cgroup.procs"), "utf8")
+  const grandchildPids = readFileSync(join(descriptor.scopePath, "cgroup.procs"), "utf8")
     .split("\n")
     .filter((line) => line.length > 0)
     .map(Number);
@@ -49,13 +49,13 @@ try {
   const record: NestedCgroupReady = {
     controllerPid: process.pid,
     nestedRoot: backend.root,
-    nestedScope: attempt.descriptor.scopePath,
+    nestedScope: descriptor.scopePath,
     grandchildPids,
   };
   publishCommittedSync({ destination: readyPath, data: JSON.stringify(record) });
   await new Promise<never>(() => {});
 } catch (error) {
-  const message = retainUtf8Tail(error instanceof Error ? error.message : String(error), 500);
+  const message = retainUtf8Tail(error instanceof Error ? error.message : String(error), utf8Bytes(500));
   publishCommittedSync({ destination: `${readyPath}.error`, data: message });
   process.exitCode = 1;
 }

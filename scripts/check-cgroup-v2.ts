@@ -3,17 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { resolveCgroupV2Backend } from "../src/cgroup-v2.ts";
-import { containmentReceiptPath } from "../src/paths.ts";
+import { agentId, processId } from "../src/domain.ts";
+import { absolutePath, containmentReceiptPath } from "../src/paths.ts";
 
-const state = mkdtempSync(join(tmpdir(), "pi-subagents-cgroup-check-"));
+const state = absolutePath(mkdtempSync(join(tmpdir(), "pi-subagents-cgroup-check-")));
 let root: string | undefined;
 
 try {
   const backend = resolveCgroupV2Backend({
-    parentSessionId: `cgroup-check-${process.pid}-${Date.now()}`,
+    parentSessionId: agentId(`cgroup-check-${processId(process.pid)}-${Date.now()}`),
     ...(process.env.PI_SUBAGENTS_CGROUP_ROOT === undefined
       ? {}
-      : { configuredRoot: process.env.PI_SUBAGENTS_CGROUP_ROOT }),
+      : { configuredRoot: absolutePath(process.env.PI_SUBAGENTS_CGROUP_ROOT) }),
     receiptPathFor: (attemptId) => containmentReceiptPath(state, `${attemptId}.json`),
   });
   root = backend.root;

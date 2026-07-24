@@ -1,12 +1,24 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { ContainmentAttempt, ContainmentOutcome } from "../src/containment.ts";
-import { createRunAttemptId, verifiedContainmentReceiptPath } from "../src/domain.ts";
-import type { AbsolutePath, ContainmentReceiptPath, RunAttemptId, VerifiedContainmentReceiptPath } from "../src/domain.ts";
+import type {
+  ContainmentAttempt,
+  ContainmentDescriptor,
+  ContainmentOutcome,
+  RestorationContainmentDescriptor,
+} from "../src/containment.ts";
+import { createRunAttemptId, milliseconds, verifiedContainmentReceiptPath } from "../src/domain.ts";
+import type {
+  AbsolutePath,
+  CgroupScopePath,
+  ContainmentReceiptPath,
+  ProcessGroupId,
+  RunAttemptId,
+  VerifiedContainmentReceiptPath,
+} from "../src/domain.ts";
 import { WatchdogClient, verifyContainmentReceipt } from "../src/watchdog-client.ts";
+import { testContainmentAttempt } from "./support/brands.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
 const clients: WatchdogClient[] = [];
@@ -38,7 +50,7 @@ describe("cgroup-v2 watchdog", () => {
       receiptPath: fixture.receipt,
       attempt: fixture.attempt,
       launcherPath: join(import.meta.dir, "../launcher.mjs") as AbsolutePath,
-      timeoutMs: 1_000,
+      timeoutMs: milliseconds(1_000),
     }, { testEnvironment: { PI_WATCHDOG_FAKE_CGROUP: "1" } }));
     clients.push(client);
 
@@ -52,8 +64,8 @@ describe("cgroup-v2 watchdog", () => {
     await expect(fixture.client.ready()).rejects.toThrow();
   });
 
-  test("rejects a canonical parent whose basename is not a lowercase SHA-256 digest", async () => {
-    const fixture = watchdogFixture({ parentBasename: "not-a-sha-256-digest" });
+  test("rejects a canonical parent wire value whose basename is not a lowercase SHA-256 digest", async () => {
+    const fixture = watchdogFixture({ parentWireBasename: "not-a-sha-256-digest" });
 
     await expect(fixture.client.ready()).rejects.toThrow();
   });
@@ -61,7 +73,11 @@ describe("cgroup-v2 watchdog", () => {
   test("creates the attempt scope and reports the exact descriptor before launch", async () => {
     const fixture = watchdogFixture();
 
-    await expect(fixture.client.ready()).resolves.toEqual(fixture.attempt.descriptor);
+    const descriptor: ContainmentDescriptor = await fixture.client.ready();
+    const scope: CgroupScopePath = descriptor.scopePath;
+    expect(scope).toBe(fixture.attempt.descriptor.scopePath);
+    expect(descriptor).toEqual(fixture.attempt.descriptor);
+    expect(fixture.attempt.proofCalls).toBe(1);
 
     expect(existsSync(fixture.scope)).toBeTrue();
     expect(readFileSync(fixture.trace, "utf8").trim().split("\n")).toEqual(["watchdog:attempt-create"]);
@@ -195,6 +211,79 @@ describe("verifyContainmentReceipt", () => {
     expect(verifyContainmentReceipt(receipt, attemptId)).toMatchObject({ version: 1, pgid: null });
   });
 
+  test("returns restoration-only v2 evidence unless an expected live descriptor is supplied", () => {
+    const fixture = watchdogFixture();
+    writeFileSync(fixture.receipt, JSON.stringify({
+      version: 2,
+      attemptId: fixture.attemptId,
+      backend: "cgroup-v2",
+      scopePath: fixture.scope,
+      outcome: "no_process",
+      populated: false,
+      timestamp: new Date().toISOString(),
+    }));
+
+    const restoration = verifyContainmentReceipt(fixture.receipt, fixture.attemptId);
+    if (restoration.version !== 2) throw new Error("expected v2 receipt");
+    const stored: RestorationContainmentDescriptor = restoration.descriptor;
+    // @ts-expect-error receipt JSON alone cannot prove a live canonical cgroup scope.
+    const _liveWithoutExpected: ContainmentDescriptor = restoration.descriptor;
+    void _liveWithoutExpected;
+
+    const live = verifyContainmentReceipt(
+      fixture.receipt,
+      fixture.attemptId,
+      undefined,
+      fixture.attempt.descriptor,
+    );
+    if (live.version !== 2) throw new Error("expected v2 receipt");
+    const proven: ContainmentDescriptor = live.descriptor;
+    expect(proven).toBe(fixture.attempt.descriptor);
+    expect(stored).toEqual(proven);
+  });
+
+  test("brands a validated historical process group and rejects invalid numeric identities", () => {
+    const directory = temporaryDirectory("receipt-v1-pgid-");
+    const receipt = join(directory, "receipt.json") as ContainmentReceiptPath;
+    const attemptId = createRunAttemptId();
+    writeFileSync(receipt, JSON.stringify({ version: 1, attemptId, outcome: "terminated", pgid: 99_999_999,
+      timestamp: new Date().toISOString() }));
+    const verified = verifyContainmentReceipt(receipt, attemptId);
+    if (verified.version !== 1 || verified.pgid === null) throw new Error("expected v1 process group");
+    const group: ProcessGroupId = verified.pgid;
+    expect(Number(group)).toBe(99_999_999);
+
+    for (const pgid of [0, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      writeFileSync(receipt, JSON.stringify({ version: 1, attemptId, outcome: "terminated", pgid,
+        timestamp: new Date().toISOString() }));
+      expect(() => verifyContainmentReceipt(receipt, attemptId)).toThrow("invalid containment receipt schema");
+    }
+  });
+
+  test.each([0, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects malformed launched process id %p with the existing protocol error",
+    async (pid) => {
+      const previous = process.env.MALFORMED_WATCHDOG_CASE;
+      process.env.MALFORMED_WATCHDOG_CASE = `invalid-launched:${pid}`;
+      const fixture = watchdogFixture({
+        watchdogPath: join(import.meta.dir, "fixtures/malformed-watchdog.mjs") as AbsolutePath,
+      });
+      try {
+        await fixture.client.ready();
+        await expect(fixture.client.launch({
+          command: process.execPath as AbsolutePath,
+          args: ["-e", "process.exit(0)"],
+          cwd: fixture.directory as AbsolutePath,
+          env: process.env,
+          shell: false,
+        })).rejects.toThrow("protocol_error: malformed launched control message");
+      } finally {
+        if (previous === undefined) delete process.env.MALFORMED_WATCHDOG_CASE;
+        else process.env.MALFORMED_WATCHDOG_CASE = previous;
+      }
+    },
+  );
+
   test.each([
     { extra: true },
     { populated: true },
@@ -214,22 +303,33 @@ describe("verifyContainmentReceipt", () => {
 class FakeAttempt implements ContainmentAttempt {
   terminateCalls = 0;
   cleanupCalls = 0;
+  proofCalls = 0;
+  readonly candidate;
   readonly descriptor;
 
   constructor(
-    readonly attemptId: RunAttemptId,
+    private readonly proofAttempt: ContainmentAttempt & { readonly descriptor: ContainmentDescriptor },
     readonly receipt: ContainmentReceiptPath,
-    scope: AbsolutePath,
     readonly parentScope: AbsolutePath,
     private readonly terminateFailure = false,
   ) {
-    this.descriptor = { backend: "cgroup-v2" as const, scopePath: scope };
+    this.candidate = proofAttempt.candidate;
+    this.descriptor = proofAttempt.descriptor;
+  }
+
+  get attemptId(): RunAttemptId { return this.proofAttempt.attemptId; }
+
+  proveRuntimeDescriptor(evidence: RestorationContainmentDescriptor): ContainmentDescriptor {
+    this.proofCalls++;
+    return this.proofAttempt.proveRuntimeDescriptor(evidence);
   }
 
   async terminate(outcome: ContainmentOutcome): Promise<VerifiedContainmentReceiptPath> {
     this.terminateCalls++;
     if (this.terminateFailure) throw new Error("parent cgroup kill failed");
-    if (existsSync(this.descriptor.scopePath)) writeFileSync(join(this.descriptor.scopePath, "cgroup.events"), "populated 0\n");
+    if (existsSync(this.descriptor.scopePath)) {
+      writeFileSync(join(this.descriptor.scopePath, "cgroup.events"), "populated 0\n");
+    }
     writeFileSync(this.receipt, `${JSON.stringify({ version: 2, attemptId: this.attemptId, backend: "cgroup-v2",
       scopePath: this.descriptor.scopePath, outcome, populated: false, timestamp: new Date().toISOString() })}\n`, { mode: 0o600 });
     return verifiedContainmentReceiptPath(this.receipt);
@@ -239,25 +339,32 @@ class FakeAttempt implements ContainmentAttempt {
   async cleanup(): Promise<void> { this.cleanupCalls++; }
 }
 
-function watchdogFixture(options: { blockEmpty?: boolean; killFailure?: boolean; watchdogPath?: AbsolutePath; failure?: string; fake?: boolean; expectedParent?: string; parentBasename?: string; createClient?: boolean } = {}) {
+function watchdogFixture(options: { blockEmpty?: boolean; killFailure?: boolean; watchdogPath?: AbsolutePath; failure?: string; fake?: boolean; expectedParent?: string; parentWireBasename?: string; createClient?: boolean } = {}) {
   const directory = temporaryDirectory("cgroup-watchdog-");
   const attemptId = createRunAttemptId();
-  const parent = join(directory, options.parentBasename ?? createHash("sha256").update("parent").digest("hex"));
-  mkdirSync(parent, { mode: 0o700 });
+  const proven = testContainmentAttempt(attemptId, directory as AbsolutePath);
+  const parent: string = proven.parentScope;
+  const descriptor = proven.descriptor;
+  const parentScopeWire: string | undefined = options.parentWireBasename === undefined
+    ? undefined
+    : join(directory, options.parentWireBasename);
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  if (parentScopeWire !== undefined) mkdirSync(parentScopeWire, { recursive: true, mode: 0o700 });
   const expectedParent = options.expectedParent === undefined
-    ? parent as AbsolutePath
-    : join(directory, createHash("sha256").update(options.expectedParent).digest("hex")) as AbsolutePath;
-  if (expectedParent !== parent) mkdirSync(expectedParent, { mode: 0o700 });
-  const scope = join(parent, createHash("sha256").update(attemptId).digest("hex")) as AbsolutePath;
+    ? proven.parentScope
+    : testContainmentAttempt(attemptId, directory as AbsolutePath, options.expectedParent).parentScope;
+  if (expectedParent !== parent) mkdirSync(expectedParent, { recursive: true, mode: 0o700 });
+  const scope = descriptor.scopePath;
   const receipt = join(directory, "receipt.json") as ContainmentReceiptPath;
   const trace = join(directory, "trace");
-  const attempt = new FakeAttempt(attemptId, receipt, scope, expectedParent, options.killFailure);
+  const attempt = new FakeAttempt(proven, receipt, expectedParent, options.killFailure);
   const useFakeHarness = options.fake !== false && options.watchdogPath === undefined;
   if (useFakeHarness) writeFileSync(`${receipt}.fake-config.json`, JSON.stringify({
     trace,
     blockEmpty: options.blockEmpty === true,
     killFailure: options.killFailure === true,
     ...(options.failure === undefined ? {} : { failure: options.failure }),
+    ...(parentScopeWire === undefined ? {} : { parentScopeWire }),
   }));
   const client = options.createClient === false ? undefined : new WatchdogClient({
     attemptId,
@@ -267,7 +374,7 @@ function watchdogFixture(options: { blockEmpty?: boolean; killFailure?: boolean;
       ? join(import.meta.dir, "fixtures/fake-watchdog.mjs") as AbsolutePath
       : join(import.meta.dir, "../watchdog.mjs") as AbsolutePath),
     launcherPath: join(import.meta.dir, "../launcher.mjs") as AbsolutePath,
-    timeoutMs: 1_000,
+    timeoutMs: milliseconds(1_000),
   });
   if (client !== undefined) clients.push(client);
   return { client: client as WatchdogClient, attempt, attemptId, directory, scope, receipt, trace };

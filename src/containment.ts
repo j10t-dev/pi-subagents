@@ -1,12 +1,24 @@
 import type {
   AbsolutePath,
+  CgroupScopePath,
+  ObservedCgroupScopePath,
   RunAttemptId,
   VerifiedContainmentReceiptPath,
 } from "./domain.ts";
 
-export interface ContainmentDescriptor {
+export interface ContainmentCandidateDescriptor {
   readonly backend: "cgroup-v2";
   readonly scopePath: AbsolutePath;
+}
+
+export interface RestorationContainmentDescriptor {
+  readonly backend: "cgroup-v2";
+  readonly scopePath: ObservedCgroupScopePath;
+}
+
+export interface ContainmentDescriptor {
+  readonly backend: "cgroup-v2";
+  readonly scopePath: CgroupScopePath;
 }
 
 export type ContainmentOutcome =
@@ -19,7 +31,10 @@ export interface ContainmentAttempt {
   readonly attemptId: RunAttemptId;
   /** Canonical parent scope resolved by the containment backend. */
   readonly parentScope: AbsolutePath;
-  readonly descriptor: ContainmentDescriptor;
+  /** Deterministic lexical preparation; this does not claim that the scope exists. */
+  readonly candidate: ContainmentCandidateDescriptor;
+  /** Promotes matching runtime evidence only after canonical scope containment is proven. */
+  proveRuntimeDescriptor(evidence: RestorationContainmentDescriptor): ContainmentDescriptor;
   terminate(outcome: ContainmentOutcome): Promise<VerifiedContainmentReceiptPath>;
   verifyEmpty(): Promise<void>;
   cleanup(proof?: VerifiedContainmentReceiptPath): Promise<void>;
@@ -30,6 +45,9 @@ export interface ContainmentBackend {
   readonly parentScope: AbsolutePath;
   preflight(): Promise<void>;
   prepareAttempt(attemptId: RunAttemptId): ContainmentAttempt;
-  restoreAttempt(attemptId: RunAttemptId, descriptor: ContainmentDescriptor): ContainmentAttempt;
+  restoreAttempt(
+    attemptId: RunAttemptId,
+    descriptor: RestorationContainmentDescriptor,
+  ): ContainmentAttempt;
   shutdown(): Promise<void>;
 }

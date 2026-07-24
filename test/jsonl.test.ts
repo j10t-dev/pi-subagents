@@ -1,10 +1,20 @@
 import { describe, expect, test } from "bun:test";
 
+import { milliseconds, utf8Bytes, type Utf8Bytes } from "../src/domain.ts";
 import { BoundedJsonlDecoder, serializeJsonlRecord } from "../src/jsonl.ts";
 
-const MAX_RECORD_BYTES = 16 * 1024 * 1024;
+const MAX_RECORD_BYTES = utf8Bytes(16 * 1024 * 1024);
 
-function collect(maxRecordBytes = MAX_RECORD_BYTES) {
+const _decoderWithDuration = new BoundedJsonlDecoder({
+  // @ts-expect-error duration values cannot be JSONL byte bounds.
+  maxRecordBytes: milliseconds(10),
+  onRecord: () => {},
+  onOversize: () => {},
+  onDecodeError: () => {},
+});
+void _decoderWithDuration;
+
+function collect(maxRecordBytes: Utf8Bytes = MAX_RECORD_BYTES) {
   const records: unknown[] = [];
   const oversized: number[] = [];
   const decodeErrors: string[] = [];
@@ -20,9 +30,6 @@ function collect(maxRecordBytes = MAX_RECORD_BYTES) {
 }
 
 describe("BoundedJsonlDecoder", () => {
-  test.each([0, -1, 1.5])("rejects invalid maxRecordBytes %p", (maxRecordBytes) => {
-    expect(() => collect(maxRecordBytes)).toThrow("maxRecordBytes must be a positive integer");
-  });
 
   test("decodes a record fed byte-by-byte", () => {
     const { decoder, records } = collect();
@@ -64,7 +71,7 @@ describe("BoundedJsonlDecoder", () => {
   });
 
   test("discards an oversized unterminated final record", () => {
-    const { decoder, records, oversized } = collect(8);
+    const { decoder, records, oversized } = collect(utf8Bytes(8));
     decoder.push(new TextEncoder().encode('{"value":"too large"}'));
     decoder.end();
     expect(records).toEqual([]);
@@ -87,7 +94,7 @@ describe("BoundedJsonlDecoder", () => {
   });
 
   test("discards an oversized record through the next LF and recovers on the following record", () => {
-    const { decoder, records, oversized } = collect(64);
+    const { decoder, records, oversized } = collect(utf8Bytes(64));
     const bigValue = "x".repeat(200);
     const bigLine = `${JSON.stringify({ type: "big", value: bigValue })}\n`;
     const smallLine = `${JSON.stringify({ type: "agent_settled" })}\n`;
@@ -108,7 +115,7 @@ describe("BoundedJsonlDecoder", () => {
   });
 
   test("never retains more than maxRecordBytes plus one UTF-8 decoder carry while buffering", () => {
-    const { decoder } = collect(1024);
+    const { decoder } = collect(utf8Bytes(1024));
     const chunk = new Uint8Array(512).fill(0x61);
     decoder.push(chunk);
     expect(decoder.pendingBytes).toBeLessThanOrEqual(1024);
@@ -116,7 +123,7 @@ describe("BoundedJsonlDecoder", () => {
     expect(decoder.pendingBytes).toBeLessThanOrEqual(1024);
     // Crossing the bound discards rather than growing further.
     decoder.push(chunk);
-    expect(decoder.pendingBytes).toBe(0);
+    expect(decoder.pendingBytes).toBe(utf8Bytes(0));
   });
 
   test("retained fragments do not pin an arbitrarily large caller chunk", () => {
@@ -152,7 +159,7 @@ describe("BoundedJsonlDecoder", () => {
   });
 
   test("recovers reordered top-level metadata after an arbitrarily large leading field", () => {
-    const { decoder, metadata } = collect(64);
+    const { decoder, metadata } = collect(utf8Bytes(64));
     const line = `{"payload":"${"x".repeat(20_000)}","command":"get_entries","id":"request-1","type":"response"}\n`;
     for (const byte of new TextEncoder().encode(line)) decoder.push(Uint8Array.of(byte));
     expect(metadata).toEqual([{ type: "response", id: "request-1", command: "get_entries" }]);
@@ -160,7 +167,7 @@ describe("BoundedJsonlDecoder", () => {
   });
 
   test("does not mistake nested discriminants or escaped string content for top-level metadata", () => {
-    const { decoder, metadata } = collect(80);
+    const { decoder, metadata } = collect(utf8Bytes(80));
     decoder.push(new TextEncoder().encode(`${JSON.stringify({ huge: "x".repeat(1000), nested: { type: "response" }, note: "\\\"type\\\":\\\"response\\\"", type: "ordinary" })}\n`));
     expect(metadata).toEqual([{ type: "ordinary" }]);
   });

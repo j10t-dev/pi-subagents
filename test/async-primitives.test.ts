@@ -9,7 +9,12 @@ import {
   delayWithAbort,
   waitWithAbort,
 } from "../src/async-primitives.ts";
+import { delegationDepth, milliseconds, runCapacity } from "../src/domain.ts";
 import { testBarrier } from "./support/barriers.ts";
+
+// @ts-expect-error semaphore capacity cannot be a delegation depth.
+const _semaphoreWithDepth = new RunSemaphore(delegationDepth(1));
+void _semaphoreWithDepth;
 
 describe("Mutex", () => {
   test("grants the lock in FIFO order", async () => {
@@ -64,7 +69,7 @@ describe("Mutex", () => {
 
 describe("RunSemaphore", () => {
   test("caps concurrent tryAcquire() at capacity", () => {
-    const semaphore = new RunSemaphore(4);
+    const semaphore = new RunSemaphore(runCapacity(4));
     const reservations = [
       semaphore.tryAcquire(),
       semaphore.tryAcquire(),
@@ -76,7 +81,7 @@ describe("RunSemaphore", () => {
   });
 
   test("release is one-time; a second release does not free an extra slot", () => {
-    const semaphore = new RunSemaphore(1);
+    const semaphore = new RunSemaphore(runCapacity(1));
     const reservation = semaphore.tryAcquire();
     expect(reservation).toBeDefined();
     reservation?.release();
@@ -89,7 +94,7 @@ describe("RunSemaphore", () => {
   });
 
   test("releasing frees a slot for a subsequent tryAcquire()", () => {
-    const semaphore = new RunSemaphore(1);
+    const semaphore = new RunSemaphore(runCapacity(1));
     const first = semaphore.tryAcquire();
     expect(semaphore.tryAcquire()).toBeUndefined();
     first?.release();
@@ -97,9 +102,9 @@ describe("RunSemaphore", () => {
   });
 
   test("rejects a non-positive-integer capacity", () => {
-    expect(() => new RunSemaphore(0)).toThrow(/invalid_input/);
-    expect(() => new RunSemaphore(-1)).toThrow(/invalid_input/);
-    expect(() => new RunSemaphore(1.5)).toThrow(/invalid_input/);
+    expect(() => runCapacity(0)).toThrow(/invalid_input/);
+    expect(() => runCapacity(-1)).toThrow(/invalid_input/);
+    expect(() => runCapacity(1.5)).toThrow(/invalid_input/);
   });
 });
 
@@ -157,6 +162,6 @@ describe("waitWithAbort", () => {
   test("delayWithAbort rejects immediately when the launch deadline aborts", async () => {
     const controller = new AbortController();
     controller.abort();
-    await expect(delayWithAbort(25, controller.signal)).rejects.toBeInstanceOf(AbortError);
+    await expect(delayWithAbort(milliseconds(25), controller.signal)).rejects.toBeInstanceOf(AbortError);
   });
 });

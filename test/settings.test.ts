@@ -1,7 +1,18 @@
 import { describe, expect, test } from "bun:test";
 
 import { loadSubagentSettings, readGlobalMaxDepth, readSubagentSettingsFiles } from "../src/settings.ts";
-import { boundedTreeChildCount } from "../src/delegation-policy.ts";
+import { boundedTreeChildCount, canDelegateFrom } from "../src/delegation-policy.ts";
+import { delegationDepth, processCount, runCapacity, type AbsolutePath } from "../src/domain.ts";
+
+const DEPTH = delegationDepth(1);
+const CAPACITY = runCapacity(4);
+// @ts-expect-error delegation APIs reject run capacities where a depth is required.
+const _delegateWithCapacity = () => canDelegateFrom(CAPACITY, DEPTH);
+// @ts-expect-error bounded tree capacity rejects delegation depth.
+const _treeWithDepthCapacity = () => boundedTreeChildCount(DEPTH, DEPTH);
+void _delegateWithCapacity;
+void _treeWithDepthCapacity;
+import { testAbsolutePath } from "./support/brands.ts";
 
 describe("readSubagentSettingsFiles", () => {
   test("reads the global and trusted custom project settings paths exactly", () => {
@@ -17,8 +28,8 @@ describe("readSubagentSettingsFiles", () => {
     };
 
     expect(readSubagentSettingsFiles({
-      agentDir: "/agent",
-      cwd: "/project",
+      agentDir: testAbsolutePath("/agent"),
+      cwd: testAbsolutePath("/project"),
       projectTrusted: true,
       configDirName: ".brand",
       readOptional,
@@ -30,8 +41,8 @@ describe("readSubagentSettingsFiles", () => {
 
     reads.length = 0;
     expect(readSubagentSettingsFiles({
-      agentDir: "/agent",
-      cwd: "/project",
+      agentDir: testAbsolutePath("/agent"),
+      cwd: testAbsolutePath("/project"),
       projectTrusted: false,
       configDirName: ".brand",
       readOptional,
@@ -40,15 +51,15 @@ describe("readSubagentSettingsFiles", () => {
 
     const loaded = loadSubagentSettings({
       ...readSubagentSettingsFiles({
-        agentDir: "/agent",
-        cwd: "/project",
+        agentDir: testAbsolutePath("/agent"),
+        cwd: testAbsolutePath("/project"),
         projectTrusted: true,
         configDirName: ".brand",
         readOptional,
       }),
       projectTrusted: true,
     });
-    expect(loaded.value.maxConcurrentRuns).toBe(7);
+    expect(loaded.value.maxConcurrentRuns).toBe(runCapacity(7));
   });
 });
 
@@ -59,7 +70,7 @@ describe("loadSubagentSettings", () => {
       projectText: '{"subagents":{"maxConcurrentRuns":6}}',
       projectTrusted: true,
     });
-    expect(result.value.maxConcurrentRuns).toBe(6);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(6));
     expect(result.diagnostics).toEqual([]);
   });
 
@@ -69,7 +80,7 @@ describe("loadSubagentSettings", () => {
       projectText: '{"subagents":{"maxConcurrentRuns":6}}',
       projectTrusted: false,
     });
-    expect(result.value.maxConcurrentRuns).toBe(3);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(3));
   });
 
   test("an untrusted project's settings text is never read", () => {
@@ -86,12 +97,12 @@ describe("loadSubagentSettings", () => {
     const result = loadSubagentSettings(options);
 
     expect(accessed).toBe(false);
-    expect(result.value.maxConcurrentRuns).toBe(3);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(3));
   });
 
   test("falls back to the default when no settings files exist", () => {
     const result = loadSubagentSettings({ projectTrusted: false });
-    expect(result.value.maxConcurrentRuns).toBe(4);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(4));
   });
 
   test("malformed global JSON falls back to the default and emits a diagnostic", () => {
@@ -99,7 +110,7 @@ describe("loadSubagentSettings", () => {
       globalText: "{not valid json",
       projectTrusted: false,
     });
-    expect(result.value.maxConcurrentRuns).toBe(4);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(4));
     expect(result.diagnostics.length).toBe(1);
   });
 
@@ -108,7 +119,7 @@ describe("loadSubagentSettings", () => {
       globalText: '{"subagents":{"maxConcurrentRuns":0}}',
       projectTrusted: false,
     });
-    expect(result.value.maxConcurrentRuns).toBe(4);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(4));
     expect(result.diagnostics.length).toBe(1);
   });
 
@@ -117,7 +128,7 @@ describe("loadSubagentSettings", () => {
       globalText: '{"subagents":{"maxConcurrentRuns":2.5}}',
       projectTrusted: false,
     });
-    expect(result.value.maxConcurrentRuns).toBe(4);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(4));
     expect(result.diagnostics.length).toBe(1);
   });
 
@@ -127,7 +138,7 @@ describe("loadSubagentSettings", () => {
       projectText: '{"subagents":{"maxConcurrentRuns":-1}}',
       projectTrusted: true,
     });
-    expect(result.value.maxConcurrentRuns).toBe(3);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(3));
     expect(result.diagnostics.length).toBe(1);
   });
 
@@ -137,10 +148,12 @@ describe("loadSubagentSettings", () => {
       projectText: JSON.stringify({ subagents: { maxConcurrentRuns: 1, cgroupRoot: "/sys/fs/cgroup/project" } }),
       projectTrusted: true,
     });
+    const cgroupRoot: AbsolutePath | undefined = configured.value.cgroupRoot;
+    expect(String(cgroupRoot)).toBe("/sys/fs/cgroup/delegated");
     expect(configured.value).toEqual({
-      maxConcurrentRuns: 1,
-      maxDepth: 1,
-      cgroupRoot: "/sys/fs/cgroup/delegated",
+      maxConcurrentRuns: runCapacity(1),
+      maxDepth: delegationDepth(1),
+      cgroupRoot: testAbsolutePath("/sys/fs/cgroup/delegated"),
     });
     expect(configured.diagnostics).toContain(
       "project subagents.cgroupRoot is global-only; ignoring",
@@ -154,17 +167,17 @@ describe("loadSubagentSettings", () => {
     });
     expect(loadSubagentSettings({
       globalText: '{"subagents":{"maxDepth":0}}', projectTrusted: false,
-    }).value.maxDepth).toBe(0);
+    }).value.maxDepth).toBe(delegationDepth(0));
     expect(loadSubagentSettings({
       globalText: '{"subagents":{"maxConcurrentRuns":1,"maxDepth":8}}', projectTrusted: false,
-    }).value.maxDepth).toBe(8);
+    }).value.maxDepth).toBe(delegationDepth(8));
   });
 
   test.each([-1, 9, 20, 1.5, "2"])("rejects invalid depth %p", (maxDepth) => {
     const result = loadSubagentSettings({
       globalText: JSON.stringify({ subagents: { maxDepth } }), projectTrusted: false,
     });
-    expect(result.value.maxDepth).toBe(1);
+    expect(result.value.maxDepth).toBe(delegationDepth(1));
     expect(result.diagnostics).toContain(
       "global subagents.maxDepth must be an integer from 0 through 8; ignoring",
     );
@@ -175,7 +188,7 @@ describe("loadSubagentSettings", () => {
       globalText: JSON.stringify({ subagents: { maxConcurrentRuns: Number.MAX_SAFE_INTEGER + 1 } }),
       projectTrusted: false,
     });
-    expect(result.value.maxConcurrentRuns).toBe(4);
+    expect(result.value.maxConcurrentRuns).toBe(runCapacity(4));
     expect(result.diagnostics).toContain(
       "global subagents.maxConcurrentRuns must be a positive safe integer; ignoring",
     );
@@ -220,23 +233,23 @@ describe("loadSubagentSettings", () => {
       globalText: '{"subagents":{"maxConcurrentRuns":9,"maxDepth":3}}',
       projectText: '{"subagents":{"maxConcurrentRuns":8,"maxDepth":4}}',
       projectTrusted: true,
-      inheritedLimits: { maxConcurrentRuns: 2, maxDepth: 2 },
+      inheritedLimits: { maxConcurrentRuns: runCapacity(2), maxDepth: delegationDepth(2) },
     });
     expect(result.value).toMatchObject({ maxConcurrentRuns: 2, maxDepth: 2 });
     expect(result.diagnostics).toContain("project subagents.maxDepth is global-only; ignoring");
   });
 
   test("counts bounded recursive capacity without overflow and preserves depth-one capacity", () => {
-    expect(boundedTreeChildCount(100, 1)).toBe(100);
-    expect(boundedTreeChildCount(101, 1)).toBe(101);
-    expect(boundedTreeChildCount(Number.MAX_SAFE_INTEGER, 2)).toBe(101);
-    expect(boundedTreeChildCount(Number.MAX_SAFE_INTEGER, 1)).toBe(101);
+    expect(boundedTreeChildCount(runCapacity(100), delegationDepth(1))).toBe(processCount(100));
+    expect(boundedTreeChildCount(runCapacity(101), delegationDepth(1))).toBe(processCount(101));
+    expect(boundedTreeChildCount(runCapacity(Number.MAX_SAFE_INTEGER), delegationDepth(2))).toBe(processCount(101));
+    expect(boundedTreeChildCount(runCapacity(Number.MAX_SAFE_INTEGER), delegationDepth(1))).toBe(processCount(101));
     expect(loadSubagentSettings({
       globalText: JSON.stringify({ subagents: { maxConcurrentRuns: Number.MAX_SAFE_INTEGER, maxDepth: 1 } }),
       projectTrusted: false,
     }).value).toMatchObject({ maxConcurrentRuns: Number.MAX_SAFE_INTEGER, maxDepth: 1 });
-    expect(readGlobalMaxDepth('{"subagents":{"maxDepth":2}}')).toBe(2);
-    expect(readGlobalMaxDepth("not JSON")).toBe(1);
+    expect(readGlobalMaxDepth('{"subagents":{"maxDepth":2}}')).toBe(delegationDepth(2));
+    expect(readGlobalMaxDepth("not JSON")).toBe(delegationDepth(1));
   });
 
   test("rejects invalid global cgroup roots and never supplies a project root", () => {
@@ -246,7 +259,7 @@ describe("loadSubagentSettings", () => {
         projectText: JSON.stringify({ subagents: { cgroupRoot: "/sys/fs/cgroup/project" } }),
         projectTrusted: true,
       });
-      expect(result.value).toEqual({ maxConcurrentRuns: 4, maxDepth: 1 });
+      expect(result.value).toEqual({ maxConcurrentRuns: runCapacity(4), maxDepth: delegationDepth(1) });
       expect(result.diagnostics).toContain(
         "global subagents.cgroupRoot must be an absolute path; ignoring",
       );

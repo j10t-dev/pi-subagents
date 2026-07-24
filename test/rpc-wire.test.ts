@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { Usage } from "../src/domain.ts";
+import type { RpcRequestId, UIRequestId, Usage } from "../src/domain.ts";
 import type {
   RpcExtensionUIRequest,
   RpcExtensionUIResponse,
@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { assistantMessage as buildAssistantMessage } from "./support/messages.ts";
+import { testUIRequestId } from "./support/brands.ts";
 import { classifyInboundRecord } from "../src/rpc-wire.ts";
 import type { WireExtensionUINotification } from "../src/schemas.ts";
 
@@ -35,6 +36,9 @@ function assistantMessage(text = "hello", overrides: Record<string, unknown> = {
   };
 }
 
+function requireRpcId(value: RpcRequestId): string { return value; }
+function requireUIId(value: UIRequestId): string { return value; }
+
 describe("classifyInboundRecord", () => {
   test.each(invalidUsageCases)("rejects shared invalid usage: %s", (_label, mutate) => {
     expect(classifyInboundRecord({ type: "message_end", message: assistantMessage("hello", { usage: mutate(validUsage) }) }).ok).toBe(false);
@@ -55,6 +59,28 @@ describe("classifyInboundRecord", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.record.kind).toBe("response");
+    }
+  });
+
+  test("brands validated response correlation IDs", () => {
+    const result = classifyInboundRecord({
+      id: "req-1", type: "response", command: "get_entries", success: true,
+      data: { entries: [], leafId: null },
+    });
+    expect(result.ok).toBeTrue();
+    if (result.ok && result.record.kind === "response") {
+      expect(requireRpcId(result.record.id)).toBe("req-1");
+    }
+  });
+
+  test("brands validated extension UI correlation IDs", () => {
+    const result = classifyInboundRecord({
+      type: "extension_ui_request", id: "ui-1", method: "confirm",
+      title: "Confirm", message: "Proceed?",
+    });
+    expect(result.ok).toBeTrue();
+    if (result.ok && result.record.kind === "extension_ui_dialog") {
+      expect(requireUIId(result.record.request.id)).toBe("ui-1");
     }
   });
 
@@ -252,6 +278,8 @@ describe("classifyInboundRecord", () => {
       { type: "extension_ui_request", id: "confirm", method: "confirm", title: "t", message: 1 },
       { type: "extension_ui_request", id: "input", method: "input", title: 1 },
       { type: "extension_ui_request", id: "editor", method: "editor", title: 1 },
+      { type: "extension_ui_request", id: "timeout", method: "confirm", title: "t", message: "m", timeout: 1.5 },
+      { type: "extension_ui_request", id: "unsafe-timeout", method: "confirm", title: "t", message: "m", timeout: Number.MAX_SAFE_INTEGER + 1 },
     ];
     for (const request of malformed) expect(classifyInboundRecord(request).ok).toBeFalse();
   });
@@ -345,7 +373,7 @@ void _widgetRequestFixture;
 
 const _wireNotifyFixture = {
   type: "extension_ui_request",
-  id: "notify-1",
+  id: testUIRequestId("notify-1"),
   method: "notify",
   message: "done",
   notifyType: "warning",
@@ -354,7 +382,7 @@ void _wireNotifyFixture;
 
 const _wireWidgetFixture = {
   type: "extension_ui_request",
-  id: "widget-1",
+  id: testUIRequestId("widget-1"),
   method: "setWidget",
   widgetKey: "jobs",
   widgetPlacement: "belowEditor",

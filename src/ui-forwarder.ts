@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import type { AgentId } from "./domain.ts";
+import type { AgentId, Milliseconds, UIRequestId } from "./domain.ts";
 import type {
   WireExtensionUIDialog,
   WireExtensionUINotification,
@@ -8,7 +8,7 @@ import type {
 
 export interface ExtensionUIDialogOptionsLike {
   signal?: AbortSignal;
-  timeout?: number;
+  timeout?: Milliseconds;
 }
 
 export interface ExtensionUIContextLike {
@@ -43,9 +43,9 @@ export interface UIForwarderContext {
 }
 
 export type UIForwardOutcome =
-  | { type: "extension_ui_response"; id: string; value: string }
-  | { type: "extension_ui_response"; id: string; confirmed: boolean }
-  | { type: "extension_ui_response"; id: string; cancelled: true };
+  | { type: "extension_ui_response"; id: UIRequestId; value: string }
+  | { type: "extension_ui_response"; id: UIRequestId; confirmed: boolean }
+  | { type: "extension_ui_response"; id: UIRequestId; cancelled: true };
 
 interface QueuedDialog {
   readonly agentId: AgentId;
@@ -290,7 +290,7 @@ export class UIForwarder {
   }
 }
 
-function cancelled(id: string): UIForwardOutcome {
+function cancelled(id: UIRequestId): UIForwardOutcome {
   return { type: "extension_ui_response", id, cancelled: true };
 }
 

@@ -1,4 +1,4 @@
-import { AgentState, AgentErrorCode, CancellationReason, CompletionState, truncateUtf8, type AgentCompletion, type Usage } from "../../src/domain.ts";
+import { AgentState, AgentErrorCode, CancellationReason, CompletionState, truncateUtf8, utf8Bytes, type AgentCompletion, type Usage } from "../../src/domain.ts";
 import type { AgentSummary } from "../../src/completion-service.ts";
 import type { WireAssistantMessage } from "../../src/schemas.ts";
 import { testAgentId, testCommittedOutputPath, testRunId, testSessionPath } from "./brands.ts";
@@ -21,7 +21,7 @@ export const completedCompletion = (
   overrides: Partial<Extract<AgentCompletion, { state: "completed" }>> = {},
 ): Extract<AgentCompletion, { state: "completed" }> => ({
   agentId: testAgentId(), runId: testRunId(), state: CompletionState.Completed,
-  output: truncateUtf8("done", 50_000),
+  output: truncateUtf8("done", utf8Bytes(50_000)),
   outputPath: testCommittedOutputPath(), transcriptPath: testSessionPath(),
   ...overrides,
 });

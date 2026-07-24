@@ -8,8 +8,10 @@ import {
   CancellationReason,
   CompletionState,
   THINKING_LEVELS,
+  milliseconds,
+  uiRequestId,
 } from "./domain.ts";
-import type { ThinkingLevel, Usage } from "./domain.ts";
+import type { Milliseconds, ThinkingLevel, UIRequestId, Usage } from "./domain.ts";
 import { MAX_COMPLETION_OUTPUT_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_MAX_DEPTH } from "./constants.ts";
 
 type LiteralSchemas<T extends readonly string[]> = {
@@ -85,21 +87,22 @@ export const AssistantMessageSchema = Type.Object({
 export type WireAssistantMessage = Static<typeof AssistantMessageSchema>;
 
 const CorrelationIdSchema = Type.String({ minLength: 1 });
+const MillisecondsDtoSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 
 const SelectUIRequestSchema = Type.Object({
   type: Type.Literal("extension_ui_request"), id: CorrelationIdSchema,
   method: Type.Literal("select"), title: Type.String(),
-  options: Type.Array(Type.String()), timeout: Type.Optional(Type.Number()),
+  options: Type.Array(Type.String()), timeout: Type.Optional(MillisecondsDtoSchema),
 });
 const ConfirmUIRequestSchema = Type.Object({
   type: Type.Literal("extension_ui_request"), id: CorrelationIdSchema,
   method: Type.Literal("confirm"), title: Type.String(), message: Type.String(),
-  timeout: Type.Optional(Type.Number()),
+  timeout: Type.Optional(MillisecondsDtoSchema),
 });
 const InputUIRequestSchema = Type.Object({
   type: Type.Literal("extension_ui_request"), id: CorrelationIdSchema,
   method: Type.Literal("input"), title: Type.String(),
-  placeholder: Type.Optional(Type.String()), timeout: Type.Optional(Type.Number()),
+  placeholder: Type.Optional(Type.String()), timeout: Type.Optional(MillisecondsDtoSchema),
 });
 const EditorUIRequestSchema = Type.Object({
   type: Type.Literal("extension_ui_request"), id: CorrelationIdSchema,
@@ -109,7 +112,6 @@ const EditorUIRequestSchema = Type.Object({
 export const ExtensionUIDialogSchema = Type.Union([
   SelectUIRequestSchema, ConfirmUIRequestSchema, InputUIRequestSchema, EditorUIRequestSchema,
 ]);
-export type WireExtensionUIDialog = Static<typeof ExtensionUIDialogSchema>;
 
 const NotifyUIRequestSchema = Type.Object({
   type: Type.Literal("extension_ui_request"), id: CorrelationIdSchema,
@@ -139,7 +141,49 @@ export const ExtensionUINotificationSchema = Type.Union([
   NotifyUIRequestSchema, SetStatusUIRequestSchema, SetWidgetUIRequestSchema,
   SetTitleUIRequestSchema, SetEditorTextUIRequestSchema,
 ]);
-export type WireExtensionUINotification = Static<typeof ExtensionUINotificationSchema>;
+
+type WithUIRequestId<T extends { id: string }> = T extends T
+  ? Omit<T, "id" | "timeout"> & { readonly id: UIRequestId } &
+      (T extends { timeout?: number } ? { readonly timeout?: Milliseconds } : object)
+  : never;
+
+type ExtensionUIDialogDto = Static<typeof ExtensionUIDialogSchema>;
+type ExtensionUINotificationDto = Static<typeof ExtensionUINotificationSchema>;
+
+export type WireExtensionUIDialog = WithUIRequestId<ExtensionUIDialogDto>;
+export type WireExtensionUINotification = WithUIRequestId<ExtensionUINotificationDto>;
+
+export function brandUIDialog(value: ExtensionUIDialogDto): WireExtensionUIDialog {
+  const id = uiRequestId(value.id);
+  switch (value.method) {
+    case "select": {
+      const { timeout, ...dialog } = value;
+      return { ...dialog, id, ...(timeout === undefined ? {} : { timeout: milliseconds(timeout) }) };
+    }
+    case "confirm": {
+      const { timeout, ...dialog } = value;
+      return { ...dialog, id, ...(timeout === undefined ? {} : { timeout: milliseconds(timeout) }) };
+    }
+    case "input": {
+      const { timeout, ...dialog } = value;
+      return { ...dialog, id, ...(timeout === undefined ? {} : { timeout: milliseconds(timeout) }) };
+    }
+    case "editor": return { ...value, id };
+  }
+}
+
+export function brandUINotification(
+  value: ExtensionUINotificationDto,
+): WireExtensionUINotification {
+  const id = uiRequestId(value.id);
+  switch (value.method) {
+    case "notify": return { ...value, id };
+    case "setStatus": return { ...value, id };
+    case "setWidget": return { ...value, id };
+    case "setTitle": return { ...value, id };
+    case "set_editor_text": return { ...value, id };
+  }
+}
 
 // Compile-time tripwire: breaks `bun tsc --noEmit` if `UsageSchema` ever drifts
 // from Pi's real `Usage` shape (imported into domain.ts as the source of truth).

@@ -13,7 +13,7 @@ import {
   type SpawnPreparation,
   type SurrenderContainment,
 } from "./controller.ts";
-import { AgentEventAppender, foldAgentEvents, type RestoredAgentRecord } from "./persistence.ts";
+import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord } from "./persistence.ts";
 import { buildRpcLaunchSpec, resolvePiInvocation, type BuildRpcLaunchOptions, type RpcLaunchSpec } from "./pi-launcher.ts";
 import { isLocalOutputPublicationError, RpcRunClient } from "./rpc-client.ts";
 import { OutputStore } from "./output-store.ts";
@@ -21,13 +21,16 @@ import { UIForwarder, type UIForwarderContext } from "./ui-forwarder.ts";
 import { WatchdogClient, WatchdogContainmentUnresolvedError, verifyContainmentReceipt } from "./watchdog-client.ts";
 import {
   AgentErrorCode,
+  AgentState,
   CancellationReason,
   CodedError,
   CompletionState,
   PublicPreflightError,
   agentId,
   createRunAttemptId,
-  modelSpec,
+  modelSpecFrom,
+  nextDelegationDepth,
+  modelSpecParts,
   runIdFromEntry,
   sessionEntryId,
   toAgentError,
@@ -37,16 +40,20 @@ import {
   type AgentCompletion,
   type AgentId,
   type ContainmentReceiptPath,
+  type DelegationDepth,
   type ModelSpec,
+  type RunCapacity,
   type RunAttemptId,
   type RunId,
   type SessionEntryId,
   type ThinkingLevel,
+  type ToolName,
 } from "./domain.ts";
 import { absolutePath, containmentReceiptPath, diagnosticsPath, sessionPath, writeOwnerOnlyFile } from "./paths.ts";
 import type { RunRecord, RunRuntime, Settlement } from "./run-controller.ts";
 import { filterLifecycleTools, resolveChildSelection, type ModelCatalogue } from "./child-selection.ts";
 import { canDelegateFrom } from "./delegation-policy.ts";
+import { MAX_STDERR_TAIL_BYTES } from "./constants.ts";
 import { ensureDurableDirectorySync } from "./durable-fs.ts";
 import { createContainmentProvider, type ContainmentProvider } from "./cgroup-v2.ts";
 import type { ContainmentAttempt, ContainmentBackend } from "./containment.ts";
@@ -65,17 +72,17 @@ interface ChildRecord {
   readonly cwd: AbsolutePath;
   readonly model: ModelSpec;
   readonly thinking: ThinkingLevel;
-  readonly tools: readonly string[];
+  readonly tools: readonly ToolName[];
   outputStore?: OutputStore;
   client?: RpcRunClient;
 }
 
 export interface ProductionControllerOptions {
-  capacity: number;
-  currentDepth: number;
-  maxDepth: number;
-  stateRoot: string;
-  cgroupRoot?: string;
+  capacity: RunCapacity;
+  currentDepth: DelegationDepth;
+  maxDepth: DelegationDepth;
+  stateRoot: AbsolutePath;
+  cgroupRoot?: AbsolutePath;
   onStatusChange?: () => void;
 }
 
@@ -126,11 +133,12 @@ export function createProductionController(
   dependencies: ProductionControllerDependencies = PRODUCTION_CONTROLLER_DEPENDENCIES,
 ): SubagentController {
   const parentId = agentId(context.sessionManager.getSessionId());
+  const contextCwd = absolutePath(context.cwd);
   const root = absolutePath(join(options.stateRoot, parentId));
   ensureDurableDirectorySync(root);
   const appender = new AgentEventAppender((customType, data) => pi.appendEntry(customType, data));
   const containment = dependencies.createContainmentProvider({
-    parentSessionId: context.sessionManager.getSessionId(),
+    parentSessionId: parentId,
     ...(options.currentDepth === 0 && options.cgroupRoot !== undefined
       ? { configuredRoot: options.cgroupRoot }
       : {}),
@@ -208,6 +216,12 @@ export function createProductionController(
         return firstUserEntryAfterCursor(entries, cursor);
       },
       finaliseContained: (record, nativeRunId, settlement) => restoredCompletion(record, nativeRunId, settlement),
+      restoreCompletion: async (record) => {
+        const store = new OutputStore({
+          workDir: absolutePath(join(root, "output", record.agentId)),
+        });
+        return store.restoreCompletion(record.completion.payload, record.sessionPath);
+      },
       appender,
     },
     parent: {
@@ -228,12 +242,14 @@ export function createProductionController(
         const value = SessionManager.open(record.sessionPath).getLeafId();
         leaf = value === null ? null : sessionEntryId(value);
       } catch { /* restoration will retain unavailable sessions as non-resumable */ }
-      const attemptId = record.pendingLaunch?.attemptId ?? record.currentAttemptId ?? record.latestCompletionAttemptId ?? createRunAttemptId();
-      const receipt = record.pendingLaunch?.containmentReceiptPath ?? record.currentReceiptPath ?? record.latestCompletionReceiptPath ?? receiptFor(root, attemptId);
+      const fromRun = record.state === AgentState.Stopped ? undefined : record.run;
+      const pending = record.state === AgentState.Stopped ? record.pendingLaunch : undefined;
+      const attemptId = pending?.payload.attemptId ?? fromRun?.attemptId ?? record.completion?.attemptId ?? createRunAttemptId();
+      const receipt = pending?.payload.containmentReceiptPath ?? fromRun?.receiptPath ?? record.completion?.receiptPath ?? receiptFor(root, attemptId);
       children.set(record.agentId, {
         session: { agentId: record.agentId, transcriptPath: record.sessionPath, previousLeafId: leaf, attemptId, containmentReceiptPath: receipt },
         cwd: record.cwd,
-        model: modelSpec(`${record.provider}/${record.modelId}`),
+        model: modelSpecFrom(record.provider, record.modelId),
         thinking: record.thinkingLevel,
         tools: record.tools,
       });
@@ -241,11 +257,13 @@ export function createProductionController(
   }
 
   async function restoredCompletion(
-    record: RestoredAgentRecord,
+    record: FoldedAgentRecord,
     nativeRunId: AgentCompletion["runId"],
     settlement: { kind: "interrupted" } | { kind: "cancelled"; reason: CancellationReason },
   ): Promise<AgentCompletion> {
-    const store = new OutputStore({ workDir: join(root, "output", record.agentId) });
+    const store = new OutputStore({
+      workDir: absolutePath(join(root, "output", record.agentId)),
+    });
     store.restoreRun(nativeRunId);
     const durable = store.ensureDurable(nativeRunId, record.sessionPath);
     const base = { agentId: record.agentId, runId: nativeRunId, output: durable.output,
@@ -256,14 +274,14 @@ export function createProductionController(
   }
 
   async function prepareSpawn(input: SpawnAgentRequest): Promise<SpawnPreparation> {
-    const cwd = absolutePath(input.cwd ?? context.cwd);
+    const cwd = absolutePath(input.cwd ?? contextCwd);
     const selection = resolveChildSelection({
       ...(input.model === undefined ? {} : { requestedModel: input.model }),
       ...(input.tools === undefined ? {} : { requestedTools: input.tools }),
       parentModel: requireParentModel(context.model),
       parentThinking: pi.getThinkingLevel(),
       parentActiveTools: pi.getActiveTools(),
-      allowLifecycleTools: canDelegateFrom(options.currentDepth + 1, options.maxDepth),
+      allowLifecycleTools: canDelegateFrom(nextDelegationDepth(options.currentDepth), options.maxDepth),
       modelRegistry: context.modelRegistry,
     });
     return withProductionContainmentPreflight(containment, async (backend) => {
@@ -292,8 +310,9 @@ export function createProductionController(
       },
       persistSpawned: async (session) => {
         const record = child ?? requireChild(children, session.agentId);
+        const parts = modelSpecParts(record.model);
         await appender.appendSpawned({ agentId: session.agentId, sessionPath: session.transcriptPath, cwd,
-          provider: modelProvider(record.model), modelId: modelId(record.model), thinkingLevel: record.thinking, tools: record.tools });
+          provider: parts.provider, modelId: parts.modelId, thinkingLevel: record.thinking, tools: record.tools });
       },
       createLaunch: async (session, surrender) => createLaunch(
         requireChild(children, session.agentId),
@@ -332,7 +351,7 @@ export function createProductionController(
     child: ChildRecord,
     backend: ContainmentBackend,
     surrender: SurrenderContainment,
-    effectiveTools: readonly string[],
+    effectiveTools: readonly ToolName[],
   ): Promise<LaunchTransport> {
     const attempt = backend.prepareAttempt(child.session.attemptId);
     const outputDir = absolutePath(join(root, "output", child.session.agentId));
@@ -370,9 +389,9 @@ export function createProductionController(
     const spec = launchAfterSurrender(runtime, surrender, () => dependencies.buildRpcLaunchSpec({
       invocation: resolvePiInvocation(), cwd: child.cwd, childSessionDir: absolutePath(join(root, "sessions")),
       existingSession: child.session.transcriptPath, effectiveTools, effectiveModel: child.model,
-      effectiveThinking: child.thinking, childDepth: options.currentDepth + 1,
+      effectiveThinking: child.thinking, childDepth: nextDelegationDepth(options.currentDepth),
       maxDepth: options.maxDepth, maxConcurrentRuns: options.capacity,
-      ...(context.isProjectTrusted() ? { trustedRoot: absolutePath(context.cwd) } : {}),
+      ...(context.isProjectTrusted() ? { trustedRoot: contextCwd } : {}),
     }));
     if (dependencies.createPreparedLaunch !== undefined) {
       return dependencies.createPreparedLaunch({ attempt, spec, runtime });
@@ -401,14 +420,19 @@ export function createProductionController(
     child.outputStore = outputStore;
     child.client = client;
     return {
-      containment: attempt.descriptor,
       runtime,
-      ready: async () => { await watchdog!.ready(); },
-      persistLaunchRequested: () => appender.appendRunLaunchRequested({
-        agentId: child.session.agentId, previousLeafId: child.session.previousLeafId,
-        attemptId: child.session.attemptId, containmentReceiptPath: child.session.containmentReceiptPath,
-        containment: attempt.descriptor,
-      }),
+      ready: async () => watchdog!.ready(),
+      persistLaunchRequested: async () => {
+        const liveContainment = child.session.containment;
+        if (liveContainment === undefined) throw new Error("invalid_state: containment is not ready");
+        await appender.appendRunLaunchRequested({
+          agentId: child.session.agentId,
+          previousLeafId: child.session.previousLeafId,
+          attemptId: child.session.attemptId,
+          containmentReceiptPath: child.session.containmentReceiptPath,
+          containment: liveContainment,
+        });
+      },
       persistRunStarted: (runId) => appender.appendRunStarted({ agentId: child.session.agentId, runId, attemptId: child.session.attemptId }),
       start: () => client!.start(),
       getEntries: (since) => client!.getEntries(since),
@@ -444,7 +468,7 @@ export function createProductionController(
     else {
       const failure = "cause" in settlement ? settlement.cause : undefined;
       if (failure === undefined) throw new Error("invalid_state: failed settlement has no cause");
-      const diagnostic = retainUtf8Tail(store.getDiagnosticsTail() + store.getStderrTail(), 50_000);
+      const diagnostic = retainUtf8Tail(store.getDiagnosticsTail() + store.getStderrTail(), MAX_STDERR_TAIL_BYTES);
       const path = diagnosticsPath(join(root, "diagnostics", record.agentId), `${record.runId}.log`);
       if (diagnostic.length > 0) writeOwnerOnlyFile(path, diagnostic);
       completion = { ...base, state: CompletionState.Failed,
@@ -456,13 +480,13 @@ export function createProductionController(
 }
 
 export function effectiveToolsForRelaunch(
-  persistedTools: readonly string[],
-  currentDepth: number,
-  maxDepth: number,
-): readonly string[] {
+  persistedTools: readonly ToolName[],
+  currentDepth: DelegationDepth,
+  maxDepth: DelegationDepth,
+): readonly ToolName[] {
   return filterLifecycleTools(
     persistedTools,
-    canDelegateFrom(currentDepth + 1, maxDepth),
+    canDelegateFrom(nextDelegationDepth(currentDepth), maxDepth),
   );
 }
 
@@ -490,7 +514,7 @@ export function launchAfterSurrender<T>(
 function restoredCgroupRuntime(
   provider: ContainmentProvider,
   attemptId: RunAttemptId,
-  descriptor: import("./containment.ts").ContainmentDescriptor | undefined,
+  descriptor: import("./containment.ts").RestorationContainmentDescriptor | undefined,
 ): RunRuntime {
   if (provider.kind !== "available" || descriptor === undefined) {
     return {
@@ -528,8 +552,6 @@ function requireParentModel(value: ResolveCliModelResult["model"]): NonNullable<
   return value;
 }
 
-function modelProvider(model: ModelSpec): string { return model.slice(0, model.indexOf("/")); }
-function modelId(model: ModelSpec): ModelSpec { return modelSpec(model.slice(model.indexOf("/") + 1)); }
 function receiptFor(root: AbsolutePath, attempt: RunAttemptId): ContainmentReceiptPath {
   return containmentReceiptPath(join(root, "receipts"), `${attempt}.json`);
 }

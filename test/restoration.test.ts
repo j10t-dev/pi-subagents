@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { AgentEventAppender, foldAgentEvents } from "../src/persistence.ts";
+import {
+  AgentEventAppender,
+  decodeAgentEvent,
+  foldAgentEvents,
+  type FoldedAgentRecord,
+} from "../src/persistence.ts";
 import {
   RestorationApplicationError,
   applyRestoration,
@@ -11,19 +18,37 @@ import {
 import type { RestoreAdmission } from "../src/run-controller.ts";
 import { firstUserEntryAfterCursor } from "../src/pi-composition.ts";
 import { SubagentController, type RestorationPort } from "../src/controller.ts";
-import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testMilliseconds, testModelSpec, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
+import { MAX_COMPLETION_OUTPUT_BYTES } from "../src/constants.ts";
+import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-fs.ts";
+import { OutputStore } from "../src/output-store.ts";
+import { outputPath, sessionPath } from "../src/paths.ts";
+import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testContainmentAttempt, testMilliseconds, testModelId, testProviderId, testReceiptPath, testRunId, testSessionPath, testVerifiedReceiptPath } from "./support/brands.ts";
 import { testBarrier } from "./support/barriers.ts";
 import { testRuntime } from "./support/launches.ts";
 import { completedEntry, launchEntry, spawnedEntry, startedEntry, stoppingEntry, testRestorationPort, type RestorationEventEntry } from "./support/restoration.ts";
 import { completedCompletion } from "./support/messages.ts";
-import { AgentEventType, AgentState, CancellationReason, CompletionState, agentRunKey, truncateUtf8 } from "../src/domain.ts";
+import {
+  AgentEventType,
+  AgentState,
+  CancellationReason,
+  CompletionState,
+  agentRunKey,
+  runCapacity,
+  truncateUtf8,
+  utf8Bytes,
+  type AgentCompletion,
+  type RestorableAgentCompletion,
+} from "../src/domain.ts";
+import { temporaryStateRoot } from "./support/temp-state.ts";
+
+const TEST_STATE_ROOT = testAbsolutePath("/tmp");
 
 describe("restoration evidence collection", () => {
   test("a stopped agent without an action performs no containment or session lookup", async () => {
     let resolutions = 0;
     let lookups = 0;
     const evidence = await collectRestorationEvidence(
-      foldAgentEvents([spawned()], "/tmp"),
+      foldAgentEvents([spawned()], TEST_STATE_ROOT),
       testRestorationPort({
         resolveContainment: async () => { resolutions++; throw new Error("must not resolve"); },
         firstUserEntryAfter: async () => { lookups++; throw new Error("must not look up"); },
@@ -36,7 +61,7 @@ describe("restoration evidence collection", () => {
   });
 
   test("identical actions share one complete containment decision", async () => {
-    const registry = foldAgentEvents([spawned(), launch()], "/tmp");
+    const registry = foldAgentEvents([spawned(), launch()], TEST_STATE_ROOT);
     const action = registry.actions[0]!;
     const secondAgent = testAgentId("agent-b");
     const secondRecord = { ...registry.agents.get(action.agentId)!, agentId: secondAgent };
@@ -60,7 +85,7 @@ describe("restoration evidence collection", () => {
   });
 
   test("requires-containment contains once and preserves its runtime after success", async () => {
-    const registry = foldAgentEvents([spawned(), launch(), started()], "/tmp");
+    const registry = foldAgentEvents([spawned(), launch(), started()], TEST_STATE_ROOT);
     let containments = 0;
     const runtime = testRuntime({ contain: async () => {
       containments++;
@@ -75,7 +100,7 @@ describe("restoration evidence collection", () => {
   });
 
   test("resolver and containment errors become uncontained evidence", async () => {
-    const registry = foldAgentEvents([spawned(), launch(), started()], "/tmp");
+    const registry = foldAgentEvents([spawned(), launch(), started()], TEST_STATE_ROOT);
     const action = registry.actions[0]!;
     const secondAgent = testAgentId("agent-b");
     registry.agents.set(secondAgent, { ...registry.agents.get(action.agentId)!, agentId: secondAgent });
@@ -91,7 +116,7 @@ describe("restoration evidence collection", () => {
   });
 
   test("historical decisions stay distinct without containment", async () => {
-    const registry = foldAgentEvents([spawned(), launch(), started()], "/tmp");
+    const registry = foldAgentEvents([spawned(), launch(), started()], TEST_STATE_ROOT);
     let containments = 0;
     const runtime = testRuntime({ contain: async () => { containments++; return testVerifiedReceiptPath(); } });
     const evidence = await collectRestorationEvidence(registry, testRestorationPort({
@@ -103,7 +128,7 @@ describe("restoration evidence collection", () => {
   });
 
   test("completed-receipt failure uses completed runtime for retry", async () => {
-    const registry = foldAgentEvents([spawned(), launch(), started(), completed()], "/tmp");
+    const registry = foldAgentEvents([spawned(), launch(), started(), completed()], TEST_STATE_ROOT);
     const retryRuntime = testRuntime();
     let completedInputs = 0;
     const evidence = await collectRestorationEvidence(registry, testRestorationPort({
@@ -115,7 +140,7 @@ describe("restoration evidence collection", () => {
   });
 
   test("historically unresolved completed receipts use the re-resolving completed runtime", async () => {
-    const registry = foldAgentEvents([spawned(), launch(), started(), completed()], "/tmp");
+    const registry = foldAgentEvents([spawned(), launch(), started(), completed()], TEST_STATE_ROOT);
     const retryRuntime = testRuntime();
     const evidence = await collectRestorationEvidence(registry, testRestorationPort({
       resolveContainment: async () => ({ kind: "unresolved-historical", runtime: testRuntime() }),
@@ -125,7 +150,7 @@ describe("restoration evidence collection", () => {
   });
 
   test("only contained launches look up their cursor and convert lookup outcomes", async () => {
-    const registry = foldAgentEvents([spawned(), launch()], "/tmp");
+    const registry = foldAgentEvents([spawned(), launch()], TEST_STATE_ROOT);
     const action = registry.actions[0]!;
     if (action.type !== "reconcile_launch") throw new Error("expected launch action");
     const noRunAgent = testAgentId("agent-b");
@@ -160,7 +185,382 @@ describe("restoration evidence collection", () => {
   });
 });
 
+describe("completed output restoration", () => {
+  test.each([1, 2] as const)(
+    "schema v%s completion beneath a symlinked state root restores its canonical output",
+    (schemaVersion) => {
+      const state = temporaryStateRoot("restored-completion-symlink-root-");
+      try {
+        const physicalRoot = join(state.path, "physical-state");
+        const logicalRoot = testAbsolutePath(join(state.path, "state"));
+        const workDir = testAbsolutePath(join(logicalRoot, "output", "agent-a"));
+        const destination = join(workDir, `${testRunId()}.committed`);
+        const transcript = join(logicalRoot, "session.jsonl");
+        const text = "persisted output";
+        mkdirSync(join(physicalRoot, "output", "agent-a"), { recursive: true, mode: 0o700 });
+        symlinkSync(physicalRoot, logicalRoot, "dir");
+        writeFileSync(destination, text, { mode: 0o600 });
+        writeTranscript(transcript, testRunId(), text);
+        const decoded = decodeAgentEvent({
+          schemaVersion,
+          eventType: AgentEventType.RunCompleted,
+          payload: {
+            agentId: testAgentId(),
+            runId: testRunId(),
+            state: CompletionState.Completed,
+            output: truncateUtf8(text, MAX_COMPLETION_OUTPUT_BYTES),
+            outputPath: destination,
+            transcriptPath: transcript,
+          },
+        }, logicalRoot);
+        if (decoded.eventType !== AgentEventType.RunCompleted) throw new Error("expected completion");
+        const trace: string[] = [];
+
+        const restored = new OutputStore({ workDir, durableFileSystem: tracedDurableFileSystem(trace) })
+          .restoreCompletion(decoded.payload, decoded.payload.transcriptPath);
+
+        expect(String(restored.outputPath)).toBe(destination);
+        expect(restored.output).toEqual(decoded.payload.output);
+        expect(trace).toContain("output:file-sync");
+        expect(trace).toContain("output:directory-sync");
+        expect(trace).not.toContain("output:write");
+        expect(trace).not.toContain("output:rename");
+      } finally {
+        state.cleanup();
+      }
+    },
+  );
+
+  test("matching managed output is synchronised and promoted without rewriting", () => {
+    const state = temporaryStateRoot("restored-completion-match-");
+    try {
+      const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+      const transcript = sessionPath(state.path, "session.jsonl");
+      const text = "persisted output";
+      const candidate = restorableCompletion(workDir, transcript, text);
+      writeFileSync(candidate.outputPath, text, { mode: 0o600 });
+      writeTranscript(transcript, candidate.runId, text);
+      const trace: string[] = [];
+      const store = new OutputStore({ workDir, durableFileSystem: tracedDurableFileSystem(trace) });
+
+      const restored: AgentCompletion = store.restoreCompletion(candidate, transcript);
+
+      expect(restored.output).toEqual(candidate.output);
+      expect(String(restored.outputPath)).toBe(String(candidate.outputPath));
+      expect(trace).toContain("output:file-sync");
+      expect(trace).toContain("output:directory-sync");
+      expect(trace).not.toContain("output:write");
+      expect(trace).not.toContain("output:rename");
+    } finally {
+      state.cleanup();
+    }
+  });
+
+  test("canonicalises restored output destinations through the injected filesystem", () => {
+    const state = temporaryStateRoot("restored-completion-injected-realpath-");
+    try {
+      const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+      const transcript = sessionPath(state.path, "session.jsonl");
+      const candidate = restorableCompletion(workDir, transcript, "persisted output");
+      writeFileSync(candidate.outputPath, "persisted output", { mode: 0o600 });
+      writeTranscript(transcript, candidate.runId, "persisted output");
+      const trace: string[] = [];
+      const durableFileSystem = {
+        ...tracedDurableFileSystem(trace),
+        realpath(path: string) {
+          trace.push(`realpath:${path}`);
+          return systemDurableFileSystem.realpath(path);
+        },
+      };
+
+      new OutputStore({ workDir, durableFileSystem }).restoreCompletion(candidate, transcript);
+
+      expect(trace.filter((entry) => entry.startsWith("realpath:"))).toHaveLength(2);
+    } finally {
+      state.cleanup();
+    }
+  });
+
+  test.each([
+    ["missing", "persisted candidate", undefined],
+    ["original-byte-mismatching", "persisted candidate", "different visible bytes"],
+    ["metadata-mismatching", "persisted candidate", "persisted candidatf"],
+    ["invalid-UTF-8", "x", Buffer.from([0xff])],
+  ] as const)("%s managed output is reconstructed from the authoritative transcript", (_case, persisted, visible) => {
+    const state = temporaryStateRoot("restored-completion-reconstruct-");
+    try {
+      const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+      const transcript = sessionPath(state.path, "session.jsonl");
+      const authoritative = "authoritative transcript output";
+      const candidate = restorableCompletion(workDir, transcript, persisted);
+      if (visible !== undefined) writeFileSync(candidate.outputPath, visible, { mode: 0o600 });
+      writeTranscript(transcript, candidate.runId, authoritative);
+      const trace: string[] = [];
+      const store = new OutputStore({ workDir, durableFileSystem: tracedDurableFileSystem(trace) });
+
+      const restored: AgentCompletion = store.restoreCompletion(candidate, transcript);
+
+      expect(restored.output).toEqual(truncateUtf8(authoritative, MAX_COMPLETION_OUTPUT_BYTES));
+      expect(String(restored.outputPath)).toBe(String(candidate.outputPath));
+      expect(readFileSync(restored.outputPath, "utf8")).toBe(authoritative);
+      expect(trace).toContain("output:write");
+      expect(trace).toContain("output:rename");
+    } finally {
+      state.cleanup();
+    }
+  });
+
+  test("historical full sidecars compare against bounded persisted output metadata", () => {
+    const state = temporaryStateRoot("restored-completion-long-");
+    try {
+      const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+      const transcript = sessionPath(state.path, "session.jsonl");
+      const text = "x".repeat(MAX_COMPLETION_OUTPUT_BYTES + 1_000);
+      const candidate = restorableCompletion(workDir, transcript, text);
+      writeFileSync(candidate.outputPath, text, { mode: 0o600 });
+      writeTranscript(transcript, candidate.runId, text);
+      const trace: string[] = [];
+
+      const restored = new OutputStore({ workDir, durableFileSystem: tracedDurableFileSystem(trace) })
+        .restoreCompletion(candidate, transcript);
+
+      expect(restored.output).toEqual(truncateUtf8(text, MAX_COMPLETION_OUTPUT_BYTES));
+      expect(trace).not.toContain("output:write");
+      expect(trace).not.toContain("output:rename");
+    } finally {
+      state.cleanup();
+    }
+  });
+
+  test.each([CompletionState.Failed, CompletionState.Cancelled] as const)(
+    "authoritative reconstruction preserves %s completion state metadata",
+    (completionState) => {
+      const state = temporaryStateRoot("restored-completion-state-");
+      try {
+        const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+        const transcript = sessionPath(state.path, "session.jsonl");
+        const base = restorableCompletion(workDir, transcript, "persisted");
+        const usage = {
+          turns: 1,
+          usage: {
+            input: 1,
+            output: 2,
+            cacheRead: 3,
+            cacheWrite: 4,
+            totalTokens: 10,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
+        const candidate: RestorableAgentCompletion = completionState === CompletionState.Failed
+          ? {
+              ...base,
+              state: CompletionState.Failed,
+              error: { code: "process_exited", message: "child process exited unexpectedly" },
+              usage,
+            }
+          : {
+              ...base,
+              state: CompletionState.Cancelled,
+              reason: CancellationReason.ParentShutdown,
+              usage,
+            };
+        writeTranscript(transcript, candidate.runId, "authoritative");
+
+        const restored = new OutputStore({ workDir }).restoreCompletion(candidate, transcript);
+
+        expect(restored.state).toBe(completionState);
+        expect(restored.usage).toEqual(usage);
+        if (restored.state === CompletionState.Failed) {
+          if (candidate.state !== CompletionState.Failed) throw new Error("expected failed candidate");
+          expect(restored.error).toEqual(candidate.error);
+        }
+        if (restored.state === CompletionState.Cancelled) {
+          expect(restored.reason).toBe(CancellationReason.ParentShutdown);
+        }
+      } finally {
+        state.cleanup();
+      }
+    },
+  );
+
+  test("a candidate destination outside the managed output root is rejected", () => {
+    const state = temporaryStateRoot("restored-completion-escape-");
+    try {
+      const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+      const transcript = sessionPath(state.path, "session.jsonl");
+      const candidate = {
+        ...restorableCompletion(workDir, transcript, "persisted"),
+        outputPath: outputPath(state.path, "outside.committed"),
+      };
+      writeTranscript(transcript, candidate.runId, "authoritative");
+
+      expect(() => new OutputStore({ workDir }).restoreCompletion(candidate, transcript)).toThrow(/output_error/);
+    } finally {
+      state.cleanup();
+    }
+  });
+
+  test.each(["matching", "reconstructed"] as const)(
+    "%s completion stays unproved when output synchronisation fails",
+    (mode) => {
+      const state = temporaryStateRoot("restored-completion-sync-failure-");
+      try {
+        const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+        const transcript = sessionPath(state.path, "session.jsonl");
+        const candidate = restorableCompletion(workDir, transcript, "persisted");
+        if (mode === "matching") writeFileSync(candidate.outputPath, "persisted", { mode: 0o600 });
+        writeTranscript(transcript, candidate.runId, mode === "matching" ? "persisted" : "authoritative");
+        const failed = tracedDurableFileSystem([], "output:file-sync");
+
+        expect(() => new OutputStore({ workDir, durableFileSystem: failed }).restoreCompletion(candidate, transcript))
+          .toThrow(/output_error/);
+      } finally {
+        state.cleanup();
+      }
+    },
+  );
+
+  test("application reproves a cached historical completion after its destination changes", async () => {
+    const state = temporaryStateRoot("restored-completion-cached-history-");
+    try {
+      const runId = testRunId();
+      const agentId = testAgentId();
+      const transcript = sessionPath(state.path, "session.jsonl");
+      const workDir = testAbsolutePath(join(state.path, "output", agentId));
+      const committed = testCommittedOutputPath({ workDir: testAbsolutePath(workDir), runId });
+      const candidateOutput = truncateUtf8("", MAX_COMPLETION_OUTPUT_BYTES);
+      const registry = foldAgentEvents([
+        spawnedEntry({ agentId, sessionPath: transcript, cwd: state.path }, 1),
+        launchEntry({ agentId }, 1),
+        startedEntry({ agentId, runId }, 1),
+        completedEntry({
+          agentId,
+          runId,
+          output: candidateOutput,
+          outputPath: committed,
+          transcriptPath: transcript,
+        }, 1),
+      ], TEST_STATE_ROOT);
+      const trace: string[] = [];
+      let restorationProofs = 0;
+      const port = testRestorationPort({
+        restoreCompletion: async (record) => {
+          restorationProofs++;
+          return new OutputStore({ workDir, durableFileSystem: tracedDurableFileSystem(trace) })
+            .restoreCompletion(record.completion.payload, record.sessionPath);
+        },
+      });
+      const evidence = await collectRestorationEvidence(registry, port, () => testRuntime());
+      const plan = planRestoration(registry, evidence);
+      const application = applicationState();
+      application.durableCompletions.set(agentRunKey(agentId, runId), completedCompletion({
+        agentId,
+        runId,
+        output: candidateOutput,
+        outputPath: committed,
+        transcriptPath: transcript,
+      }));
+      const authoritative = "reconstructed after cache preload";
+      writeFileSync(committed, "changed after cache preload", { mode: 0o600 });
+      writeTranscript(transcript, runId, authoritative);
+
+      const restored = await applyRestoration(plan, tracedAdmission([]), port, application);
+
+      expect(restorationProofs).toBe(1);
+      expect(restored[0]?.completion?.payload.output).toEqual(
+        truncateUtf8(authoritative, MAX_COMPLETION_OUTPUT_BYTES),
+      );
+      expect(readFileSync(committed, "utf8")).toBe(authoritative);
+      expect(trace).toContain("output:write");
+      expect(trace).toContain("output:rename");
+    } finally {
+      state.cleanup();
+    }
+  });
+
+  test("application verifies a contained completion before admission and hides it on proof failure", async () => {
+    const trace: string[] = [];
+    const registry = foldAgentEvents([spawned(), launch(), started(), completed()], TEST_STATE_ROOT);
+    const basePort = testRestorationPort({
+      resolveContainment: async () => {
+        trace.push("containment:verified");
+        return { kind: "contained", receipt: testVerifiedReceiptPath() };
+      },
+    });
+    const proofPort = Object.assign(basePort, {
+      restoreCompletion: async (record: FoldedAgentRecord & { completion: NonNullable<FoldedAgentRecord["completion"]> }) => {
+        trace.push("completion:verify-or-reconstruct", "output:file-sync", "output:directory-sync");
+        return completedCompletion({
+          agentId: record.agentId,
+          runId: record.completion.payload.runId,
+          transcriptPath: record.sessionPath,
+        });
+      },
+    });
+    const evidence = await collectRestorationEvidence(registry, proofPort, () => testRuntime());
+    const plan = planRestoration(registry, evidence);
+    const admission: RestoreAdmission = {
+      reserve: () => {},
+      replace: () => {},
+      commit: () => { trace.push("admission:commit"); },
+      release: () => {},
+    };
+
+    const restored = await applyRestoration(plan, admission, proofPort, applicationState());
+
+    expect(restored[0]?.completion?.payload.outputPath).toBeDefined();
+    expect(trace).toEqual([
+      "containment:verified",
+      "completion:verify-or-reconstruct",
+      "output:file-sync",
+      "output:directory-sync",
+      "admission:commit",
+    ]);
+
+    const failedPort = Object.assign(testRestorationPort(), {
+      restoreCompletion: async () => { throw new Error("output sync failed"); },
+    });
+    const failedState = applicationState();
+    const failed = await applyRestoration(plan, tracedAdmission([]), failedPort, failedState);
+    expect(failed[0]?.completion).toBeUndefined();
+    expect([...failedState.restoredRecords.keys()]).toEqual([testAgentId()]);
+  });
+});
+
 describe("restoration application", () => {
+  test("isolates an unreadable restored completion and retains only its retry obligation", async () => {
+    const agentB = testAgentId("agent-b");
+    const runB = testRunId("feedface");
+    const registry = foldAgentEvents([
+      spawned(), launch(), started(), completed(),
+      spawnedFor("agent-b", "b.jsonl"), launchFor("agent-b", "attempt-b"),
+      startedFor("agent-b", "feedface", "attempt-b"), completedFor("agent-b", "feedface", "b.jsonl"),
+    ], TEST_STATE_ROOT);
+    const basePort = testRestorationPort();
+    const evidence = await collectRestorationEvidence(registry, basePort, () => testRuntime());
+    const plan = planRestoration(registry, evidence);
+    const attempts: string[] = [];
+    const port = testRestorationPort({
+      restoreCompletion: async (record) => {
+        attempts.push(record.agentId);
+        if (record.agentId === testAgentId()) throw new Error("output unreadable");
+        return completedCompletion({
+          agentId: record.agentId,
+          runId: record.completion.payload.runId,
+          transcriptPath: record.sessionPath,
+        });
+      },
+    });
+    const state = applicationState();
+
+    const restored = await applyRestoration(plan, tracedAdmission([]), port, state);
+
+    expect(attempts).toEqual([testAgentId(), agentB]);
+    expect(restored.find((record) => record.agentId === testAgentId())?.completion).toBeUndefined();
+    expect(restored.find((record) => record.agentId === agentB)?.completion?.payload.runId).toBe(runB);
+    expect([...state.restoredRecords.keys()]).toEqual([testAgentId()]);
+  });
+
   test("applies durable work in transactional order before committing stopped records", async () => {
     const trace: string[] = [];
     const { plan, port: basePort } = await applicationFixture();
@@ -187,7 +587,7 @@ describe("restoration application", () => {
       "replace:stopped",
       "commit",
     ]);
-    expect(restored).toMatchObject([{ state: AgentState.Stopped, latestCompletion: { runId: testRunId("cafebabe") } }]);
+    expect(restored).toMatchObject([{ state: AgentState.Stopped, completion: { payload: { runId: testRunId("cafebabe") } } }]);
     expect(state.durableCompletions.has(agentRunKey(testAgentId(), testRunId("cafebabe")))).toBeTrue();
     expect(state.restoredRecords.size).toBe(0);
   });
@@ -260,7 +660,9 @@ describe("restoration application", () => {
 
     expect(error).toBeInstanceOf(RestorationApplicationError);
     expect((error as RestorationApplicationError).cause).toBe(failure);
-    expect((error as RestorationApplicationError).restored).toBe(plan.restored);
+    expect((error as RestorationApplicationError).restored).not.toBe(plan.restored);
+    expect((error as RestorationApplicationError).restored.every((record) => record.completion === undefined))
+      .toBeTrue();
     expect(trace).toEqual(["reserve", "append:run-started", "finalise:output", "commit"]);
     expect([...state.restoredRecords.keys()]).toEqual([...plan.obligations.keys()]);
   });
@@ -572,7 +974,7 @@ describe("branch restoration", () => {
   test("receipt-gates interrupted runs, persists one failure, and reconstructs capacity", async () => {
     const writes: unknown[] = [];
     const branch = [spawned(), launch(), started()];
-    const c = new SubagentController({ capacity: 1, restoration: port(branch, true, writes) });
+    const c = new SubagentController({ capacity: runCapacity(1), restoration: port(branch, true, writes) });
     await c.restore();
     expect(c.runs.activeCount()).toBe(0);
     const received = await c.receive();
@@ -615,7 +1017,7 @@ describe("branch restoration", () => {
       if (++attempts === 1) throw new Error("publication failed");
       return finalise(...args);
     };
-    const c = new SubagentController({ capacity: 1, restoration });
+    const c = new SubagentController({ capacity: runCapacity(1), restoration });
 
     await expect(c.restore()).rejects.toThrow("publication failed");
     expect(c.runs.snapshot(testAgentId("agent-a"))?.state).toBe("settling");
@@ -635,7 +1037,7 @@ describe("branch restoration", () => {
     const restoration = port([spawned(), launch()], false, []);
     restoration.firstUserEntryAfter = async () => { identityLookups++; return testRunId("cafebabe"); };
     const c = new SubagentController({
-      capacity: 1,
+      capacity: runCapacity(1),
       restoration,
       parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) },
     });
@@ -659,7 +1061,9 @@ describe("branch restoration", () => {
     restoration.resolveContainment = async (input) => {
       expect(input.eventVersion).toBe(2);
       expect(input.descriptor?.backend).toBe("cgroup-v2");
-      expect(input.descriptor?.scopePath as string | undefined).toBe("/tmp/cgroups/agent-a/attempt");
+      expect(String(input.descriptor?.scopePath)).toBe(
+        String(testContainmentAttempt(testAttemptId("attempt")).descriptor.scopePath),
+      );
       return {
         kind: "requires-containment",
         runtime: {
@@ -672,7 +1076,7 @@ describe("branch restoration", () => {
         },
       };
     };
-    const c = new SubagentController({ capacity: 1, restoration });
+    const c = new SubagentController({ capacity: runCapacity(1), restoration });
 
     await c.restore();
     expect(containmentAttempts).toBe(1);
@@ -687,7 +1091,7 @@ describe("branch restoration", () => {
 
   test("missing receipt retains non-resumable state and capacity without completion", async () => {
     const writes: unknown[] = [];
-    const c = new SubagentController({ capacity: 1, restoration: port([spawned(), launch(), started()], false, writes) });
+    const c = new SubagentController({ capacity: runCapacity(1), restoration: port([spawned(), launch(), started()], false, writes) });
     await c.restore();
     expect(c.runs.activeCount()).toBe(1);
     expect(c.runs.snapshots()[0]?.state).toBe("settling");
@@ -736,7 +1140,7 @@ describe("branch restoration", () => {
 
   test("invalid latest-completion receipt retains capacity and does not expose completion", async () => {
     const warnings: string[] = [];
-    const c = new SubagentController({ capacity: 1, restoration: port([spawned(), launch(), started(), completed()], false, []), parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
+    const c = new SubagentController({ capacity: runCapacity(1), restoration: port([spawned(), launch(), started(), completed()], false, []), parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
     await c.restore();
     expect(c.runs.activeCount()).toBe(1);
     expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
@@ -756,6 +1160,7 @@ describe("branch restoration", () => {
     let resolutions = 0;
     let failedContainments = 0;
     let finalisations = 0;
+    let completionRestorations = 0;
     let releases = 0;
     restoration.resolveContainment = async (input) => {
       resolutions++;
@@ -774,8 +1179,13 @@ describe("branch restoration", () => {
       finalisations++;
       throw new Error("must not fabricate an already-durable completion");
     };
+    const restoreCompletion = restoration.restoreCompletion;
+    restoration.restoreCompletion = async (...args) => {
+      completionRestorations++;
+      return restoreCompletion(...args);
+    };
     const c = new SubagentController({
-      capacity: 1,
+      capacity: runCapacity(1),
       restoration,
       onStatusChange: () => { releases++; },
     });
@@ -801,6 +1211,7 @@ describe("branch restoration", () => {
     expect(resolutions).toBe(2);
     expect(failedContainments).toBe(version === 2 ? 1 : 0);
     expect(finalisations).toBe(0);
+    expect(completionRestorations).toBe(1);
     expect(writes).toEqual([]);
     expect(releases).toBe(1);
     expect(c.runs.activeCount()).toBe(0);
@@ -829,7 +1240,7 @@ describe("branch restoration", () => {
     let valid = false;
     const restoration = port([spawned(), launch()], false, writes);
     restoration.validateReceipt = async () => valid;
-    const c = new SubagentController({ capacity: 1, restoration });
+    const c = new SubagentController({ capacity: runCapacity(1), restoration });
     await c.restore();
     expect(await c.stop(testAgentId("agent-a"))).toMatchObject({ state: "failed", agentState: "stopping" });
     valid = true;
@@ -858,7 +1269,7 @@ describe("branch restoration", () => {
       restoredFinalisations++;
       return finaliseContained(...args);
     };
-    const c = new SubagentController({ capacity: 1, restoration, composition: {
+    const c = new SubagentController({ capacity: runCapacity(1), restoration, composition: {
       prepareSpawn: async () => { throw new Error("unused"); },
       prepareSend: async () => { throw new Error("unused"); },
       finaliseRun: async () => { liveFinalisations++; throw new Error("must not use live finalisation"); },
@@ -889,7 +1300,7 @@ describe("branch restoration", () => {
     let valid = false;
     const restoration = port([spawned(), launch(), started()], false, writes);
     restoration.validateReceipt = async () => valid;
-    const c = new SubagentController({ capacity: 1, restoration });
+    const c = new SubagentController({ capacity: runCapacity(1), restoration });
     await c.restore();
     expect(await c.stop(testAgentId("agent-a"))).toMatchObject({ state: "failed", agentState: "settling", error: { code: "containment_failed" } });
     expect(writes).toHaveLength(0);
@@ -964,7 +1375,10 @@ describe("branch restoration", () => {
       completedEntry({
         agentId: testAgentId("agent-b"), runId: testRunId("feedface"),
         transcriptPath: testSessionPath("/tmp/pi-subagents-test/b.jsonl"),
-        outputPath: testCommittedOutputPath("/tmp/pi-subagents-test/feedface.md"), output: truncateUtf8("ready", 50_000),
+        outputPath: testCommittedOutputPath({
+          workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-b"),
+          runId: testRunId("feedface"),
+        }), output: truncateUtf8("ready", utf8Bytes(50_000)),
       }, 1),
     ], true, writes, testRunId("cafebabe"));
     const appendCompleted = restoration.appender.appendRunCompleted.bind(restoration.appender);
@@ -972,7 +1386,7 @@ describe("branch restoration", () => {
       if (++completionAttempts === 1) throw new Error("disk unavailable");
       return appendCompleted(completion);
     };
-    const c = new SubagentController({ capacity: 1, restoration, parent: {
+    const c = new SubagentController({ capacity: runCapacity(1), restoration, parent: {
       isBusy: () => false,
       sendMessage: async (_text, options) => { pings.push(options); },
     } });
@@ -1050,7 +1464,7 @@ describe("branch restoration", () => {
         if (++completionAttempts === 1) throw new Error("disk unavailable");
         return appendCompleted(completion);
       };
-      const c = new SubagentController({ capacity: 1, restoration });
+      const c = new SubagentController({ capacity: runCapacity(1), restoration });
 
       if (decisions[0]) {
         await expect(c.restore()).rejects.toThrow("disk unavailable");
@@ -1075,7 +1489,7 @@ describe("branch restoration", () => {
     ];
     const restoration = port(branch, false, writes);
     restoration.validateReceipt = async () => valid;
-    const c = new SubagentController({ capacity: 1, restoration, parent: {
+    const c = new SubagentController({ capacity: runCapacity(1), restoration, parent: {
       isBusy: () => false,
       sendMessage: async (_text, options) => { pings.push(options); },
     } });
@@ -1105,7 +1519,7 @@ describe("branch restoration", () => {
     ];
     const restoration = port(branch, false, writes);
     restoration.validateReceipt = async (_path, attemptId) => attemptId === "attempt-a" || secondContained;
-    const c = new SubagentController({ capacity: 1, restoration, parent: {
+    const c = new SubagentController({ capacity: runCapacity(1), restoration, parent: {
       isBusy: () => false,
       sendMessage: async (_text, options) => { pings.push(options); },
     } });
@@ -1129,7 +1543,7 @@ describe("branch restoration", () => {
       let calls = 0;
       const restoration = port([spawned(), launch(), started(), completed()], false, []);
       restoration.validateReceipt = async () => decisions[calls++]!;
-      const c = new SubagentController({ capacity: 1, restoration });
+      const c = new SubagentController({ capacity: runCapacity(1), restoration });
 
       await c.restore();
 
@@ -1146,7 +1560,7 @@ describe("branch restoration", () => {
 });
 
 async function applicationFixture() {
-  const registry = foldAgentEvents([spawned(), launch()], "/tmp");
+  const registry = foldAgentEvents([spawned(), launch()], TEST_STATE_ROOT);
   const port = testRestorationPort({ firstUserEntryAfter: async () => testRunId("cafebabe") });
   const evidence = await collectRestorationEvidence(registry, port, () => testRuntime());
   return { plan: planRestoration(registry, evidence), port };
@@ -1158,7 +1572,7 @@ async function multiApplicationFixture() {
     launch(),
     spawnedFor("agent-b", "b.jsonl"),
     launchFor("agent-b", "attempt-b"),
-  ], "/tmp");
+  ], TEST_STATE_ROOT);
   const port = testRestorationPort({
     firstUserEntryAfter: async (path) => String(path).endsWith("b.jsonl") ? testRunId("feedface") : testRunId("cafebabe"),
   });
@@ -1179,10 +1593,10 @@ function tracedAdmission(trace: string[]): RestoreAdmission {
   };
 }
 
-function spawned() { return spawnedEntry({ agentId: testAgentId(), sessionPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), cwd: testAbsolutePath("/tmp"), provider: "p", modelId: testModelSpec("m"), tools: [] }, 1); }
-function spawnedFor(id: string, path: string) { return spawnedEntry({ agentId: testAgentId(id), sessionPath: testSessionPath(`/tmp/pi-subagents-test/${path.split("/").at(-1)!}`), cwd: testAbsolutePath("/tmp"), provider: "p", modelId: testModelSpec("m"), tools: [] }, 1); }
+function spawned() { return spawnedEntry({ agentId: testAgentId(), sessionPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), cwd: testAbsolutePath("/tmp"), provider: testProviderId("p"), modelId: testModelId("m"), tools: [] }, 1); }
+function spawnedFor(id: string, path: string) { return spawnedEntry({ agentId: testAgentId(id), sessionPath: testSessionPath(`/tmp/pi-subagents-test/${path.split("/").at(-1)!}`), cwd: testAbsolutePath("/tmp"), provider: testProviderId("p"), modelId: testModelId("m"), tools: [] }, 1); }
 function launch(attemptId = "attempt") { return launchEntry({ agentId: testAgentId(), attemptId: testAttemptId(attemptId), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${attemptId}.receipt`) }, 1); }
-function launchV2(attemptId = "attempt") { return launchEntry({ agentId: testAgentId(), attemptId: testAttemptId(attemptId), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${attemptId}.receipt`), containment: { backend: "cgroup-v2", scopePath: testAbsolutePath(`/tmp/cgroups/agent-a/${attemptId}`) } }, 2); }
+function launchV2(attemptId = "attempt") { return launchEntry({ agentId: testAgentId(), attemptId: testAttemptId(attemptId), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${attemptId}.receipt`), containment: testContainmentAttempt(testAttemptId(attemptId)).descriptor }, 2); }
 function launchFor(id: string, attemptId: string) { return launchEntry({ agentId: testAgentId(id), attemptId: testAttemptId(attemptId), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${attemptId}.receipt`) }, 1); }
 function started(id = "deadbeef", attemptId = "attempt") { return startedEntry({ agentId: testAgentId(), runId: testRunId(id), attemptId: testAttemptId(attemptId) }, 1); }
 function startedV2(id = "deadbeef", attemptId = "attempt") { return startedEntry({ agentId: testAgentId(), runId: testRunId(id), attemptId: testAttemptId(attemptId) }, 2); }
@@ -1191,14 +1605,89 @@ function stopping(reason: CancellationReason) { return stoppingEntry({ reason, c
 function completed(id = "deadbeef") {
   return completedEntry({
     runId: testRunId(id), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"),
-    outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${id}.md`), output: truncateUtf8("", 50_000),
+    outputPath: testCommittedOutputPath({
+      workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"),
+      runId: testRunId(id),
+    }), output: truncateUtf8("", utf8Bytes(50_000)),
+  }, 1);
+}
+function completedFor(agent: string, id: string, transcript: string) {
+  return completedEntry({
+    agentId: testAgentId(agent),
+    runId: testRunId(id),
+    transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${transcript}`),
+    outputPath: testCommittedOutputPath({
+      workDir: testAbsolutePath(`/tmp/pi-subagents-test/output/${agent}`),
+      runId: testRunId(id),
+    }),
+    output: truncateUtf8("", utf8Bytes(50_000)),
   }, 1);
 }
 function completedV2(id = "deadbeef") {
   return completedEntry({
     runId: testRunId(id), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"),
-    outputPath: testCommittedOutputPath(`/tmp/pi-subagents-test/${id}.md`), output: truncateUtf8("", 50_000),
+    outputPath: testCommittedOutputPath({
+      workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"),
+      runId: testRunId(id),
+    }), output: truncateUtf8("", utf8Bytes(50_000)),
   }, 2);
+}
+
+function restorableCompletion(
+  workDir: string,
+  transcriptPath: ReturnType<typeof sessionPath>,
+  text: string,
+): RestorableAgentCompletion {
+  mkdirSync(workDir, { recursive: true, mode: 0o700 });
+  return {
+    agentId: testAgentId(),
+    runId: testRunId(),
+    state: CompletionState.Completed,
+    output: truncateUtf8(text, MAX_COMPLETION_OUTPUT_BYTES),
+    outputPath: outputPath(workDir, `${testRunId()}.committed`),
+    transcriptPath,
+  };
+}
+
+function writeTranscript(path: string, runId: string, text: string): void {
+  const entries = [
+    { type: "message", id: runId, message: { role: "user", content: "task" } },
+    { type: "message", id: "aaaaaaaa", message: { role: "assistant", content: [{ type: "text", text }] } },
+  ];
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 });
+}
+
+function tracedDurableFileSystem(trace: string[], failOperation?: string): DurableFileSystem {
+  const directories = new Set<number>();
+  const record = (operation: string): void => {
+    trace.push(operation);
+    if (operation === failOperation) throw new Error(`injected ${operation} failure`);
+  };
+  return {
+    ...systemDurableFileSystem,
+    open(path, flags, mode) {
+      const directory = existsSync(path) && statSync(path).isDirectory();
+      const fd = systemDurableFileSystem.open(path, flags, mode);
+      if (directory) directories.add(fd);
+      return fd;
+    },
+    write(fd, data) {
+      record("output:write");
+      systemDurableFileSystem.write(fd, data);
+    },
+    sync(fd) {
+      record(directories.has(fd) ? "output:directory-sync" : "output:file-sync");
+      systemDurableFileSystem.sync(fd);
+    },
+    close(fd) {
+      directories.delete(fd);
+      systemDurableFileSystem.close(fd);
+    },
+    rename(source, destination) {
+      record("output:rename");
+      systemDurableFileSystem.rename(source, destination);
+    },
+  };
 }
 
 type TestRestorationPort = RestorationPort & {

@@ -8,7 +8,11 @@ import {
   CompletionState,
   agentId,
   milliseconds,
+  modelSpec,
+  toolName,
   toAgentError,
+  utf16CodeUnitOffset,
+  utf8Bytes,
   codedErrorToAgentError,
   truncateUtf8,
   isPublicPreflightError,
@@ -16,8 +20,9 @@ import {
   type AgentError,
   type AgentId,
   type AgentUsage,
-  type DiagnosticsPath,
   type RunId,
+  type Utf16CodeUnitOffset,
+  type Utf8Bytes,
 } from "./domain.ts";
 import { AbortError } from "./async-primitives.ts";
 import { MAX_AGGREGATE_RECEIVE_BYTES, MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
@@ -48,7 +53,7 @@ export const sendInputSchema = Type.Object({
 export type SendInputInput = Static<typeof sendInputSchema>;
 
 export const receiveAgentSchema = Type.Object({
-  timeoutMs: Type.Optional(Type.Integer({ minimum: 0 })),
+  timeoutMs: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
 }, { additionalProperties: false });
 export type ReceiveAgentInput = Static<typeof receiveAgentSchema>;
 
@@ -65,22 +70,22 @@ export const subagentToolSchemas = {
 } as const;
 
 export interface FairPrefix {
-  readonly endOffset: number;
-  readonly retainedBytes: number;
-  readonly serialisedDeltaBytes: number;
+  readonly endOffset: Utf16CodeUnitOffset;
+  readonly retainedBytes: Utf8Bytes;
+  readonly serialisedDeltaBytes: Utf8Bytes;
 }
 
 export interface FairOutputTable {
   readonly text: string;
-  readonly originalRetainedBytes: number;
+  readonly originalRetainedBytes: Utf8Bytes;
   readonly previouslyTruncated: boolean;
   readonly prefixes: readonly FairPrefix[];
 }
 
 export interface FairAllocation {
   readonly prefixIndices: readonly number[];
-  readonly retainedBytes: readonly number[];
-  readonly serialisedBytes: number;
+  readonly retainedBytes: readonly Utf8Bytes[];
+  readonly serialisedBytes: Utf8Bytes;
 }
 
 export interface FairAllocationStats {
@@ -95,13 +100,17 @@ export interface FairAllocationStats {
  */
 export function buildFairOutputTable(
   text: string,
-  retainedBytes: number,
+  retainedBytes: Utf8Bytes,
   previouslyTruncated: boolean,
 ): FairOutputTable {
   const encoder = new TextEncoder();
   const originalRetainedBytes = retainedBytes;
   const zeroTruncated = previouslyTruncated || 0 < originalRetainedBytes;
-  const prefixes: FairPrefix[] = [{ endOffset: 0, retainedBytes: 0, serialisedDeltaBytes: 0 }];
+  const prefixes: FairPrefix[] = [{
+    endOffset: utf16CodeUnitOffset(0),
+    retainedBytes: utf8Bytes(0),
+    serialisedDeltaBytes: utf8Bytes(0),
+  }];
   let endOffset = 0;
   let prefixRetainedBytes = 0;
   let serialisedPayloadBytes = 0;
@@ -114,7 +123,11 @@ export function buildFairOutputTable(
     const serialisedDeltaBytes = serialisedPayloadBytes
       + String(prefixRetainedBytes).length - 1
       + String(truncated).length - String(zeroTruncated).length;
-    prefixes.push({ endOffset, retainedBytes: prefixRetainedBytes, serialisedDeltaBytes });
+    prefixes.push({
+      endOffset: utf16CodeUnitOffset(endOffset),
+      retainedBytes: utf8Bytes(prefixRetainedBytes),
+      serialisedDeltaBytes: utf8Bytes(serialisedDeltaBytes),
+    });
   }
 
   if (prefixRetainedBytes !== originalRetainedBytes) throw new CodedError(AgentErrorCode.InternalError);
@@ -124,8 +137,8 @@ export function buildFairOutputTable(
 /** Allocates provider-visible serialised bytes by nominal max-min shares. */
 export function allocateFairOutputs(
   tables: readonly FairOutputTable[],
-  zeroTextSerialisedBytes: number,
-  cap: number,
+  zeroTextSerialisedBytes: Utf8Bytes,
+  cap: Utf8Bytes,
   stats?: FairAllocationStats,
 ): FairAllocation {
   if (zeroTextSerialisedBytes > cap) throw new CodedError(AgentErrorCode.InternalError);
@@ -157,7 +170,7 @@ export function allocateFairOutputs(
       const tableIndex = active[position]!;
       prefixIndices[tableIndex] = fairPrefixAtMost(
         tables[tableIndex]!.prefixes,
-        share + (position < remainder ? 1 : 0),
+        utf8Bytes(share + (position < remainder ? 1 : 0)),
       );
       if (stats !== undefined) stats.prefixSearches++;
     }
@@ -188,10 +201,10 @@ export function allocateFairOutputs(
 
   const retainedBytes = prefixIndices.map((prefixIndex, index) =>
     tables[index]!.prefixes[prefixIndex]!.retainedBytes);
-  return { prefixIndices, retainedBytes, serialisedBytes: cap - slack };
+  return { prefixIndices, retainedBytes, serialisedBytes: utf8Bytes(cap - slack) };
 }
 
-function fairPrefixAtMost(prefixes: readonly FairPrefix[], allowance: number): number {
+function fairPrefixAtMost(prefixes: readonly FairPrefix[], allowance: Utf8Bytes): number {
   let low = 0;
   let high = prefixes.length - 1;
   while (low < high) {
@@ -391,7 +404,7 @@ function boundReceiveContent(value: object): object {
     const output = requiredRecord(requiredRecord(value).output);
     return buildFairOutputTable(
       requiredString(output, "text"),
-      requiredNonnegativeInteger(output, "retainedBytes"),
+      requiredUtf8Bytes(output, "retainedBytes"),
       requiredBoolean(output, "truncated"),
     );
   });
@@ -433,18 +446,18 @@ function materialiseReceive(
   const boundedCompletions = completions.map((value, index) => {
     const completion = requiredRecord(value);
     const output = requiredRecord(completion.output);
-    const inputRetainedBytes = requiredNonnegativeInteger(output, "retainedBytes");
+    const inputRetainedBytes = requiredUtf8Bytes(output, "retainedBytes");
     const previouslyTruncated = requiredBoolean(output, "truncated");
     const prefixIndex = prefixIndices[index];
     if (prefixIndex === undefined) throw invalidPublicResult();
     const prefix = tables?.[index]?.prefixes[prefixIndex];
     const text = prefix === undefined ? "" : tables![index]!.text.slice(0, prefix.endOffset);
-    const retainedBytes = prefix?.retainedBytes ?? 0;
+    const retainedBytes = prefix?.retainedBytes ?? utf8Bytes(0);
     return {
       ...completion,
       output: {
         text,
-        originalBytes: requiredNonnegativeInteger(output, "originalBytes"),
+        originalBytes: requiredUtf8Bytes(output, "originalBytes"),
         retainedBytes,
         truncated: previouslyTruncated || retainedBytes < inputRetainedBytes,
       },
@@ -453,8 +466,8 @@ function materialiseReceive(
   return { ...source, completions: boundedCompletions };
 }
 
-function jsonBytes(value: object): number {
-  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+function jsonBytes(value: object): Utf8Bytes {
+  return utf8Bytes(new TextEncoder().encode(JSON.stringify(value)).byteLength);
 }
 
 function projectStop(value: { outcomes: ToolStopOutcome[] }): object {
@@ -502,10 +515,10 @@ function projectAgentSummary(summary: AgentSummary): object {
 function projectOutput(value: unknown): object {
   const output = requiredRecord(value);
   const text = requiredString(output, "text");
-  const originalBytes = requiredNonnegativeInteger(output, "originalBytes");
-  const retainedBytes = requiredNonnegativeInteger(output, "retainedBytes");
+  const originalBytes = requiredUtf8Bytes(output, "originalBytes");
+  const retainedBytes = requiredUtf8Bytes(output, "retainedBytes");
   const truncated = requiredBoolean(output, "truncated");
-  const actualBytes = new TextEncoder().encode(text).byteLength;
+  const actualBytes = utf8Bytes(new TextEncoder().encode(text).byteLength);
   if (retainedBytes !== actualBytes || originalBytes < retainedBytes || truncated !== (retainedBytes < originalBytes)) throw invalidPublicResult();
   return { text, originalBytes, retainedBytes, truncated };
 }
@@ -546,10 +559,9 @@ function projectAgentUsage(agentUsage: AgentUsage): object {
 }
 
 function projectError(error: AgentError): object {
-  const diagnosticsPath = error.diagnosticsPath === undefined
-    ? undefined
-    : requiredPath({ diagnosticsPath: error.diagnosticsPath }, "diagnosticsPath") as DiagnosticsPath;
-  return toAgentError(error.code, diagnosticsPath);
+  if (error.diagnosticsPath === undefined) return toAgentError(error.code);
+  requiredPath({ diagnosticsPath: error.diagnosticsPath }, "diagnosticsPath");
+  return toAgentError(error.code, error.diagnosticsPath);
 }
 
 function requiredRecord(value: unknown): Record<string, unknown> {
@@ -570,20 +582,18 @@ function requiredString(value: Record<string, unknown>, key: string): string {
 }
 
 function requiredCanonicalModelReference(value: Record<string, unknown>, key: string): string {
-  const item = requiredBoundedString(value, key, 1_024);
-  const separator = item.indexOf("/");
-  if (separator <= 0 || separator === item.length - 1 || item !== item.trim() || /[\u0000-\u001f\u007f]/u.test(item)) throw invalidPublicResult();
-  return item;
+  const item = requiredBoundedString(value, key, utf8Bytes(1_024));
+  try { return modelSpec(item); }
+  catch { throw invalidPublicResult(); }
 }
 
 function requiredToolArray(value: Record<string, unknown>, key: string): string[] {
   const items = requiredArray(value, key);
   if (items.length > 1_024) throw invalidPublicResult();
   return items.map((item) => {
-    if (typeof item !== "string" || item.length === 0 || new TextEncoder().encode(item).byteLength > 256 || /[\u0000-\u001f\u007f]/u.test(item)) {
-      throw invalidPublicResult();
-    }
-    return item;
+    if (typeof item !== "string") throw invalidPublicResult();
+    try { return toolName(item); }
+    catch { throw invalidPublicResult(); }
   });
 }
 
@@ -599,19 +609,23 @@ function requiredNonnegativeInteger(value: Record<string, unknown>, key: string)
   return item;
 }
 
+function requiredUtf8Bytes(value: Record<string, unknown>, key: string): Utf8Bytes {
+  return utf8Bytes(requiredNonnegativeInteger(value, key));
+}
+
 function requiredBoolean(value: Record<string, unknown>, key: string): boolean {
   const item = value[key];
   if (typeof item !== "boolean") throw invalidPublicResult();
   return item;
 }
 
-function requiredBoundedString(value: Record<string, unknown>, key: string, maxBytes: number): string {
+function requiredBoundedString(value: Record<string, unknown>, key: string, maxBytes: Utf8Bytes): string {
   const item = requiredString(value, key);
   if (item.length === 0 || new TextEncoder().encode(item).byteLength > maxBytes) throw invalidPublicResult();
   return item;
 }
 
-const MAX_PUBLIC_PATH_BYTES = 4_096;
+const MAX_PUBLIC_PATH_BYTES = utf8Bytes(4_096);
 
 function requiredPath(value: Record<string, unknown>, key: string): string {
   const item = requiredString(value, key);
@@ -685,7 +699,7 @@ function stableErrorCode(error: unknown): AgentErrorCode | undefined {
   } catch { return undefined; }
 }
 
-const MAX_RENDER_BYTES = 8_192;
+const MAX_RENDER_BYTES = utf8Bytes(8_192);
 
 function modelIdForDisplay(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
