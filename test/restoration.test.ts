@@ -17,6 +17,7 @@ import {
 } from "../src/restoration.ts";
 import type { RestoreAdmission } from "../src/run-controller.ts";
 import { firstUserEntryAfterCursor } from "../src/pi-composition.ts";
+import { AgentObservationStore } from "../src/agent-observation-store.ts";
 import { SubagentController, type RestorationPort } from "../src/controller.ts";
 import { MAX_COMPLETION_OUTPUT_BYTES } from "../src/constants.ts";
 import { systemDurableFileSystem, type DurableFileSystem } from "../src/durable-fs.ts";
@@ -1140,6 +1141,24 @@ describe("branch restoration", () => {
     await c.restore();
     expect(completionArray(await c.awaitReady()).map((value) => value.runId as string)).toEqual(["feedface"]);
     expect(pings).toEqual([]);
+  });
+
+  test("a restored completion retry republishes the observation outcome and delivery state", async () => {
+    const restoration = port([spawned(), launch(), started(), completed()], true, []);
+    const restoreCompletion = restoration.restoreCompletion.bind(restoration);
+    let attempts = 0;
+    restoration.restoreCompletion = async (record) => {
+      if (++attempts === 1) throw new Error("output temporarily unreadable");
+      return restoreCompletion(record);
+    };
+    const observation = new AgentObservationStore();
+    const c = new SubagentController({ restoration, observation, observationPort: observation });
+
+    await c.restore();
+    expect(observation.observation(testAgentId())).toMatchObject({ ordinal: "A1", displayState: "stopped", completionPendingDelivery: false });
+    await c.restore();
+
+    expect(observation.observation(testAgentId())).toMatchObject({ ordinal: "A1", displayState: "completed", completionPendingDelivery: true });
   });
 
   test("invalid latest-completion receipt retains capacity and does not expose completion", async () => {

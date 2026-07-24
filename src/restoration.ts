@@ -72,6 +72,8 @@ export interface RestorationPort {
   readonly folded: RestoredRegistry;
   resolveContainment(input: RestorationContainmentInput): Promise<RestorationContainmentDecision>;
   firstUserEntryAfter(sessionPath: SessionPath, cursor: SessionEntryId | null): Promise<RunId | undefined>;
+  /** Reads only the user assignment whose contained session-entry ID exactly matches runId. */
+  readAssignment?(sessionPath: SessionPath, runId: RunId): Promise<string | undefined>;
   finaliseContained(record: FoldedAgentRecord, runId: RunId, settlement: RestoredSettlement): Promise<AgentCompletion>;
   restoreCompletion(
     record: FoldedAgentRecord & { readonly completion: CompletedRunCandidate },

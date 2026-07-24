@@ -1028,7 +1028,7 @@ describe("parent lifecycle wiring", () => {
       "reserve", "create-session", "persist:spawned", "watchdog:ready",
       "persist:run_launch_requested:v2", "watchdog:launch_request", "watchdog:launch_ack_with_pgid",
       "rpc:get_entries_before", "rpc:prompt:literal assignment", "rpc:agent_start", "rpc:get_entries_after",
-      "output:bind_run", "persist:run_started", "return:running",
+      "persist:run_started", "output:bind_run", "return:running",
     ]);
     expect(await Promise.race([statusRefresh.then(() => true), Bun.sleep(100).then(() => false)])).toBeTrue();
     expect(c.status()).toBe("agents: 0 running, 0 results ready");
@@ -1074,7 +1074,7 @@ describe("parent lifecycle wiring", () => {
     expect(trace).toEqual(["prompt", "barrier", "delay"]);
     delay.resolve();
     await expect(spawning).resolves.toMatchObject({ runId: runId("deadbeef"), state: AgentState.Running });
-    expect(trace).toEqual(["prompt", "barrier", "delay", "bind", "started"]);
+    expect(trace).toEqual(["prompt", "barrier", "delay", "started", "bind"]);
   });
 
   test("fails closed without adopting identity when a post-barrier snapshot is ambiguous", async () => {
@@ -1461,7 +1461,7 @@ describe("parent lifecycle wiring", () => {
         if (contender === "stop") await expect(competing).resolves.toMatchObject({ agentId: id, state: "already_stopped" });
         else await expect(competing).resolves.toBeUndefined();
         expect(trace).toEqual(seam === "bindRun"
-          ? ["contain", "started", "completed:failed"]
+          ? ["started", "contain", "completed:failed"]
           : seam === "persistRunStarted"
             ? ["started", "contain", "started", "completed:failed"]
             : ["started", "contain", "completed:failed"]);

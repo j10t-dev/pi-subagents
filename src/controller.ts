@@ -1,5 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { dirname } from "node:path";
 import { CompletionService, type AwaitOptions, type CompletionAwaitResult } from "./completion-service.ts";
+import type { AgentObservationMutationPort } from "./agent-observation-store.ts";
+import type {
+  ObservationAgentAuthority,
+  ObservationReconciliationSnapshot,
+  ObservationSensitiveValues,
+  SubagentObservationPort,
+} from "./agent-observation.ts";
 import {
   AgentErrorCode,
   agentRunKey,
@@ -18,6 +26,12 @@ import {
   type SessionPath,
   type ContainmentReceiptPath,
   type RunAttemptId,
+  type AbsolutePath,
+  type ModelSpec,
+  type ThinkingLevel,
+  directAgentOrdinal,
+  agentObservationRevision,
+  modelSpecFrom,
   verifiedContainmentReceiptPath,
   isPublicPreflightError,
   truncateUtf8,
@@ -25,6 +39,7 @@ import {
 import type { EffectiveChildSelection } from "./child-selection.ts";
 import { RunController, classifyTerminal, type RunRecord, type RunRuntime, type Settlement, type StopResult } from "./run-controller.ts";
 import type { RpcRunClient } from "./rpc-client.ts";
+import { absolutePath } from "./paths.ts";
 import { classifyAssignmentEntries } from "./assignment-identity.ts";
 import { delayWithAbort, waitWithAbort } from "./async-primitives.ts";
 import {
@@ -52,6 +67,10 @@ export interface SpawnAgentRequest { task: string; model?: string; cwd?: string;
 export interface LaunchSession {
   agentId: AgentId;
   transcriptPath: SessionPath;
+  /** Authoritative composition metadata used only by the observation projection. */
+  cwd?: AbsolutePath;
+  model?: ModelSpec;
+  thinkingLevel?: ThinkingLevel;
   previousLeafId: SessionEntryId | null;
   attemptId: RunAttemptId;
   containmentReceiptPath: ContainmentReceiptPath;
@@ -138,6 +157,8 @@ export interface ParentLifecyclePort {
 
 export interface SubagentControllerOptions {
   capacity?: RunCapacity;
+  observation?: AgentObservationMutationPort;
+  observationPort?: SubagentObservationPort;
   completions?: CompletionService;
   composition?: PiControllerComposition;
   parent?: ParentLifecyclePort;
@@ -179,6 +200,13 @@ export class SubagentController {
   private readonly identityDeadline: () => AbortSignal;
   private readonly identityDelay: (milliseconds: Milliseconds, signal: AbortSignal) => Promise<void>;
   private readonly onCompletionDelivered: (key: ReturnType<typeof agentRunKey>) => void;
+  private readonly observation: AgentObservationMutationPort;
+  private readonly observationReadPort: SubagentObservationPort;
+  private readonly observationAgents = new Map<AgentId, ObservationAgentAuthority>();
+  private readonly acceptedAssignments = new Map<ReturnType<typeof agentRunKey>, string>();
+  private readonly observationSpawnSequence: AgentId[] = [];
+  private readonly acceptedRunIds = new Set<RunId>();
+  private observationReconciliationScheduled = false;
 
   constructor(options: SubagentControllerOptions = {}) {
     this.completions = options.completions ?? new CompletionService();
@@ -189,9 +217,16 @@ export class SubagentController {
     this.identityDeadline = options.identityDeadline ?? (() => AbortSignal.timeout(Number(ASSIGNMENT_IDENTITY_TIMEOUT_MS)));
     this.identityDelay = options.identityDelay ?? delayWithAbort;
     this.onCompletionDelivered = options.onCompletionDelivered ?? (() => {});
+    this.observationReadPort = options.observationPort ?? unavailableObservationPort();
+    this.observation = totalObservationAdapter(options.observation ?? inertObservation(), () => this.observationReconciliationSnapshot(), () => {
+      if (this.observationReconciliationScheduled) return false;
+      this.observationReconciliationScheduled = true;
+      return true;
+    }, () => { this.observationReconciliationScheduled = false; });
     this.runs = new RunController({
       capacity: options.capacity ?? DEFAULT_MAX_CONCURRENT_RUNS,
       onReserve: () => this.trace?.("reserve"),
+      observation: { afterMutation: (record) => this.observation.updateLifecycle(record) },
       onStopping: (record, reason) => this.composition?.persistStopping?.(record, reason),
       onTerminal: async (record, settlement) => {
         if (this.restoredRecords.has(record.agentId)) {
@@ -233,6 +268,7 @@ export class SubagentController {
         const session = await prepared.createSession();
         register(session);
         await prepared.persistSpawned(session);
+        this.observeSpawned(session, prepared, input.task);
         const created = await this.createLaunchContained((surrender) => prepared.createLaunch(session, surrender));
         if (created.status === "failed") return { status: "failed", agentId: session.agentId, transcriptPath: session.transcriptPath };
         if (created.status === "containment_failed") {
@@ -294,7 +330,9 @@ export class SubagentController {
   async awaitReady(options?: AwaitOptions): Promise<CompletionAwaitResult> {
     const result = await this.completions.awaitReady(options);
     if (result.completion !== undefined) {
-      try { this.onCompletionDelivered(agentRunKey(result.completion.agentId, result.completion.runId)); }
+      const key = agentRunKey(result.completion.agentId, result.completion.runId);
+      this.observation.acknowledgeDelivered([key]);
+      try { this.onCompletionDelivered(key); }
       catch { /* observation acknowledgement cannot affect lifecycle delivery */ }
     }
     if (result.remainingCompletions > 0 && !this.suppressPings) {
@@ -312,7 +350,9 @@ export class SubagentController {
 
   async publish(completion: AgentCompletion): Promise<void> {
     const key = agentRunKey(completion.agentId, completion.runId);
+    this.durableCompletions.set(key, completion);
     const result = await this.completions.publish(completion);
+    this.observation.publishCompletion(completion);
     if (result.shouldNotify) this.pendingNotifications.add(key);
     if (!this.pendingNotifications.has(key) || this.suppressPings) return;
     // A failed ping keeps the key pending: the queue entry is already durable and visible to the
@@ -397,6 +437,8 @@ export class SubagentController {
       }
 
       this.completions.restore(restored.map(completionInventory));
+      await this.restoreObservationAuthority(restored);
+      this.observation.reconcile(this.observationReconciliationSnapshot());
       this.restorationApplied = true;
       this.stagedRestorePlan = undefined;
       this.restored = ![...this.restoredRecords.values()].some(
@@ -421,6 +463,7 @@ export class SubagentController {
       });
       this.durableCompletions.set(agentRunKey(completion.agentId, completion.runId), completion);
       await this.completions.publish(completion);
+      this.observation.publishCompletion(completion);
       this.restoredRecords.delete(agentIdValue);
     }
   }
@@ -474,6 +517,7 @@ export class SubagentController {
       const retained = outcomes.filter((result) => result === undefined || result.status === "containment_failed");
       if (retained.length === 0 && this.runs.activeCount() === 0) {
         await this.composition?.shutdownComplete?.();
+        this.observation.dispose();
         return;
       }
       const containedButUnrecorded = retained.length > 0 && retained.every((result) =>
@@ -617,8 +661,16 @@ export class SubagentController {
       const matchedRunId = nativeRunId;
       if (matchedRunId === undefined) throw new CodedError(AgentErrorCode.SpawnFailed);
       adoptIdentity(matchedRunId, runtime, ensureRunStarted);
-      transport.bindRun(matchedRunId);
       await ensureRunStarted();
+      this.acceptedAssignments.set(agentRunKey(session.agentId, matchedRunId), literalPrompt);
+      this.acceptedRunIds.add(matchedRunId);
+      this.observation.acceptRun({
+        agentId: session.agentId,
+        runId: matchedRunId,
+        attemptId: session.attemptId,
+        assignment: literalPrompt,
+      });
+      transport.bindRun(matchedRunId);
       const settled = transport.waitSettled();
       return {
         status: "accepted", agentId: session.agentId, transcriptPath: session.transcriptPath, runId: matchedRunId,
@@ -643,6 +695,84 @@ export class SubagentController {
         return { status: "containment_failed", agentId: session.agentId, transcriptPath: session.transcriptPath, runtime };
       }
     }
+  }
+
+  observationPort(): SubagentObservationPort { return this.observationReadPort; }
+
+  private observeSpawned(session: LaunchSession, prepared: SpawnPreparation, assignment: string): void {
+    const authority: ObservationAgentAuthority = {
+      agentId: session.agentId,
+      sessionPath: session.transcriptPath,
+      cwd: session.cwd ?? absolutePath(dirname(session.transcriptPath)),
+      model: prepared.selection.model,
+      thinkingLevel: prepared.selection.thinkingLevel,
+    };
+    this.observationAgents.set(session.agentId, authority);
+    if (!this.observationSpawnSequence.includes(session.agentId)) this.observationSpawnSequence.push(session.agentId);
+    this.observation.registerSensitiveValues(this.sensitiveValues());
+    this.observation.registerSpawned({
+      ...authority,
+      ordinal: directAgentOrdinal(this.observationSpawnSequence.indexOf(session.agentId) + 1),
+      assignment,
+    });
+  }
+
+  private async restoreObservationAuthority(records: readonly AppliedAgentRecord[]): Promise<void> {
+    this.observationSpawnSequence.splice(0, this.observationSpawnSequence.length, ...(this.restoration?.folded.spawnSequence ?? []));
+    for (const record of records) {
+      this.observationAgents.set(record.agentId, {
+        agentId: record.agentId,
+        sessionPath: record.sessionPath,
+        cwd: record.cwd,
+        model: modelSpecFrom(record.provider, record.modelId),
+        thinkingLevel: record.thinkingLevel,
+      });
+      const runId = record.state === AgentState.Stopped ? record.completion?.payload.runId : record.runId;
+      if (runId !== undefined) {
+        let assignment: string | undefined;
+        try { assignment = await this.restoration?.readAssignment?.(record.sessionPath, runId); }
+        catch { /* unavailable restoration labels use the safe fallback */ }
+        this.acceptedAssignments.set(agentRunKey(record.agentId, runId), assignment ?? "Delegated task");
+        this.acceptedRunIds.add(runId);
+      }
+    }
+  }
+
+  /** Authoritative ledger snapshot used only by total observation reconciliation adapters. */
+  observationReconciliationSnapshot(): ObservationReconciliationSnapshot {
+    const completionAuthority = this.completions.authoritySnapshot();
+    return {
+      spawnSequence: Object.freeze([...this.observationSpawnSequence]),
+      agents: Object.freeze([...this.observationAgents.values()].map((agent) => Object.freeze({ ...agent }))),
+      runs: Object.freeze(this.runs.snapshots().map((record) => Object.freeze({
+        agentId: record.agentId,
+        state: record.state,
+        ...(record.runId === undefined ? {} : { runId: record.runId }),
+      }))),
+      completions: Object.freeze([...this.durableCompletions.values()]),
+      pendingDelivery: completionAuthority.pendingDelivery,
+      acceptedAssignments: new Map(this.acceptedAssignments),
+      sensitiveValues: this.sensitiveValues(),
+    };
+  }
+
+  private sensitiveValues(): ObservationSensitiveValues {
+    const internalPaths = new Set<AbsolutePath>();
+    if (this.restoration !== undefined) internalPaths.add(this.restoration.stateRoot);
+    for (const agent of this.observationAgents.values()) {
+      internalPaths.add(agent.sessionPath);
+      internalPaths.add(agent.cwd);
+    }
+    for (const completion of this.durableCompletions.values()) {
+      internalPaths.add(completion.outputPath);
+      internalPaths.add(completion.transcriptPath);
+      if (completion.state === "failed" && completion.error.diagnosticsPath !== undefined) internalPaths.add(completion.error.diagnosticsPath);
+    }
+    return {
+      agentIds: new Set(this.observationSpawnSequence),
+      runIds: new Set(this.acceptedRunIds),
+      internalPaths,
+    };
   }
 
   private warnReplacement(kind: string): boolean {
@@ -722,6 +852,57 @@ export class SubagentController {
     this.restoredRecords.delete(record.agentId);
     return nativeRunId;
   }
+}
+
+function inertObservation(): AgentObservationMutationPort {
+  return {
+    registerSpawned: () => {}, acceptRun: () => {}, updateLifecycle: () => {}, publishCompletion: () => {},
+    registerSensitiveValues: () => {}, acknowledgeDelivered: () => {}, reconcile: () => {}, dispose: () => {},
+  };
+}
+
+function unavailableObservationPort(): SubagentObservationPort {
+  return {
+    observation: () => undefined,
+    directSnapshot: () => ({ kind: "unavailable", finalRevision: agentObservationRevision(0) }),
+    transcriptSource: () => undefined,
+    subscribe: () => () => {},
+  };
+}
+
+function totalObservationAdapter(
+  port: AgentObservationMutationPort,
+  authority: () => ObservationReconciliationSnapshot,
+  claimReconciliation: () => boolean,
+  releaseReconciliation: () => void,
+): AgentObservationMutationPort {
+  let reconciliationFailed = false;
+  const schedule = (): void => {
+    if (!claimReconciliation()) return;
+    queueMicrotask(() => {
+      try {
+        port.reconcile(authority());
+        reconciliationFailed = false;
+      } catch { reconciliationFailed = true; }
+      finally { releaseReconciliation(); }
+    });
+  };
+  const invoke = <T extends readonly unknown[]>(operation: (...args: T) => void) => (...args: T): void => {
+    const retry = reconciliationFailed;
+    try { operation(...args); }
+    catch { schedule(); return; }
+    if (retry) { reconciliationFailed = false; schedule(); }
+  };
+  return {
+    registerSpawned: invoke(port.registerSpawned.bind(port)),
+    acceptRun: invoke(port.acceptRun.bind(port)),
+    updateLifecycle: invoke(port.updateLifecycle.bind(port)),
+    publishCompletion: invoke(port.publishCompletion.bind(port)),
+    registerSensitiveValues: invoke(port.registerSensitiveValues.bind(port)),
+    acknowledgeDelivered: invoke(port.acknowledgeDelivered.bind(port)),
+    reconcile: invoke(port.reconcile.bind(port)),
+    dispose: invoke(port.dispose.bind(port)),
+  };
 }
 
 function unavailableRuntime(): RunRuntime {

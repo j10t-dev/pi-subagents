@@ -8,6 +8,9 @@ import { canDelegateFrom, parseExtensionLaunchContext, type DelegationLimits } f
 import { SubagentController } from "./src/controller.ts";
 import { delegationDepth, type AbsolutePath, type DelegationDepth } from "./src/domain.ts";
 import { createProductionController } from "./src/pi-composition.ts";
+import { createObservationDisplayResolver, renderLifecycleToolResult } from "./src/tool-presentation.ts";
+import { publishObservationPort, type ObservationPublication } from "./src/observation-registry.ts";
+import type { SubagentObservationPort } from "./src/agent-observation.ts";
 import { absolutePath } from "./src/paths.ts";
 import { loadSubagentSettings, readGlobalMaxDepth, readSubagentSettingsFiles, type SubagentSettingsResolved } from "./src/settings.ts";
 import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
@@ -45,6 +48,7 @@ export interface ExtensionController {
   shutdown(): Promise<void>;
   status(): string;
   tools(): SubagentToolRegistry;
+  observationPort?(): SubagentObservationPort;
   beforeTree?(): boolean;
   beforeSwitch?(): boolean;
   beforeFork?(): boolean;
@@ -83,6 +87,7 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
     let current: ExtensionController | undefined;
     let activeContext: ExtensionContext | undefined;
     let closing: Promise<void> | undefined;
+    let publication: { readonly owner: ExtensionController; readonly token: ObservationPublication } | undefined;
     let lifecycleTail = Promise.resolve();
 
     // Bound to the controller that actually executed: a tool call can outlive its session
@@ -107,9 +112,26 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       current = controller;
       activeContext = context;
       await controller.restore();
+      const port = controller.observationPort?.();
+      if (port !== undefined && current === controller) publication = { owner: controller, token: publishObservationPort(port) };
       context.ui.setStatus(STATUS_KEY, controller.status());
     }));
     pi.on("session_before_tree", () => ({ cancel: current?.beforeTree?.() === false }));
+    pi.on("session_tree", (_event, context) => serialiseLifecycle(async () => {
+      if (current === undefined) return;
+      await closeCurrent();
+      let controller!: ExtensionController;
+      const refreshStatus = (): void => {
+        if (current === controller && activeContext === context) context.ui.setStatus(STATUS_KEY, controller.status());
+      };
+      controller = options.createController(context, pi, refreshStatus);
+      current = controller;
+      activeContext = context;
+      await controller.restore();
+      const port = controller.observationPort?.();
+      if (port !== undefined && current === controller) publication = { owner: controller, token: publishObservationPort(port) };
+      context.ui.setStatus(STATUS_KEY, controller.status());
+    }));
     pi.on("session_before_switch", () => { current?.beforeSwitch?.(); });
     pi.on("session_before_fork", () => { current?.beforeFork?.(); });
     pi.on("session_shutdown", (_event, context) => serialiseLifecycle(async () => {
@@ -128,6 +150,10 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       const owned = current;
       if (owned === undefined) return;
       const ownedContext = activeContext;
+      if (publication?.owner === owned) {
+        publication.token.clear();
+        publication = undefined;
+      }
       const operation = owned.shutdown().then(() => {
         if (current === owned) current = undefined;
         if (activeContext === ownedContext) activeContext = undefined;
@@ -159,8 +185,11 @@ function registerSubagentTool<K extends SubagentToolName>(
       return { content: [{ type: "text", text: result.content }], details: result.details };
     },
     renderCall: () => new Text(spec.label, 0, 0),
-    renderResult: (result) => {
-      const text = resolveController()?.tools()[name].renderResult?.(recordDetails(result.details)) ?? compactResult(result.details);
+    renderResult: (result, renderOptions) => {
+      const details = recordDetails(result.details);
+      const expanded = renderOptions?.expanded ?? false;
+      const text = resolveController()?.tools()[name].renderResult?.(details, { expanded })
+        ?? renderLifecycleToolResult(name, details, { resolve: () => undefined }, { expanded });
       return new Text(text, 0, 0);
     },
   });
@@ -180,11 +209,6 @@ function requireController(value: ExtensionController | undefined): ExtensionCon
 
 function recordDetails(value: object | undefined): object {
   return value ?? {};
-}
-
-function compactResult(value: object | undefined): string {
-  const text = JSON.stringify(value ?? {});
-  return text.length <= 500 ? text : `${text.slice(0, 497)}...`;
 }
 
 const launchContext = parseExtensionLaunchContext(process.env);
@@ -223,7 +247,9 @@ const extension = createPiSubagentsExtension({
     );
     // Built once per controller: `tools()` is called on every tool execution and every render.
     let registry: SubagentToolRegistry | undefined;
-    return Object.assign(controller, { tools: () => (registry ??= createSubagentTools(controller)) });
+    return Object.assign(controller, {
+      tools: () => (registry ??= createSubagentTools(controller, createObservationDisplayResolver(controller.observationPort()))),
+    });
   },
   diagnostic: (message) => { process.stderr.write(`${message}\n`); },
 });

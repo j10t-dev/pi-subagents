@@ -238,8 +238,13 @@ export function classifyTerminal(observation: TerminalObservation, controllerSto
   ) };
 }
 
+export interface RunObservationCallbacks {
+  readonly afterMutation?: (record: Readonly<RunRecord>) => void;
+}
+
 export interface RunControllerOptions {
   capacity: RunCapacity;
+  observation?: RunObservationCallbacks;
   onReserve?: () => void;
   onStopping?: (record: Readonly<RunRecord>, reason: CancellationReason) => void | Promise<void>;
   onTerminal?: (record: Readonly<RunRecord>, settlement: Settlement) => RunId | void | Promise<RunId | void>;
@@ -272,7 +277,7 @@ export class RunController {
     if (this.agents.has(record.agentId)) throw new CodedError(AgentErrorCode.InvalidAgent);
     if (record.state !== AgentState.Stopped) throw new CodedError(AgentErrorCode.InvalidState);
     const provenance = provenanceFrom(record);
-    this.agents.set(record.agentId, {
+    const retained: LiveRecord = {
       agentId: record.agentId,
       transcriptPath: record.transcriptPath,
       mutex: new Mutex(),
@@ -281,7 +286,9 @@ export class RunController {
         ...(record.runId === undefined ? {} : { runId: record.runId }),
         ...(provenance === undefined ? {} : { provenance }),
       },
-    });
+    };
+    this.agents.set(record.agentId, retained);
+    this.observe(retained);
   }
 
   async beginRestore(): Promise<RestoreAdmission> {
@@ -332,7 +339,10 @@ export class RunController {
           mutex: new Mutex(),
           phase: restoredPhase(item.record, item.reservation),
         }));
-        for (const record of restored) this.agents.set(record.agentId, record);
+        for (const record of restored) {
+          this.agents.set(record.agentId, record);
+          this.observe(record);
+        }
         staged = undefined;
       },
       release: () => {
@@ -370,6 +380,7 @@ export class RunController {
       launchPhase = phase;
       registered = { ...record, mutex: new Mutex(), phase };
       this.agents.set(record.agentId, registered);
+      this.observe(registered);
     };
     const adoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>): void => {
       if (registered === undefined || launchPhase.identity !== undefined) throw new CodedError(AgentErrorCode.InvalidState);
@@ -401,6 +412,7 @@ export class RunController {
           runtime: launched.runtime,
           ...(launchPhase.provenance === undefined ? {} : { provenance: launchPhase.provenance }),
         };
+        this.observe(launchRecord);
         this.finishPreIdentityLaunch(launchRecord, launchPhase, { releaseReservation: false });
         return { status: "containment_failed", agentId: launched.agentId };
       }
@@ -475,6 +487,7 @@ export class RunController {
     if (reservation === undefined) throw new CodedError(AgentErrorCode.CapacityExceeded);
     const launchPhase = launchingPhase(reservation, phase.provenance);
     record.phase = launchPhase;
+    this.observe(record);
     let launched: ExistingLaunchOperation;
     const adoptIdentity = (runId: RunId, runtime: RunRuntime, beforeTerminal?: () => Promise<void>): void => {
       const phase = record.phase;
@@ -513,6 +526,7 @@ export class RunController {
           runtime: launched.runtime,
           ...(launchPhase.provenance === undefined ? {} : { provenance: launchPhase.provenance }),
         };
+        this.observe(record);
         this.finishPreIdentityLaunch(record, launchPhase, { releaseReservation: false });
         return { status: "containment_failed" as const, agentId };
       }
@@ -630,6 +644,7 @@ export class RunController {
     if (prev.kind === "stopped") throw new CodedError(AgentErrorCode.InvalidState);
     const phase = terminatingPhase(prev, transition, settlement);
     record.phase = phase;
+    this.observe(record);
     let resolve!: (value: StopResult) => void;
     phase.completion = new Promise<StopResult>((done) => { resolve = done; });
     return { record, phase, settlement, abort, ...(reason === undefined ? {} : { reason }), resolve };
@@ -660,6 +675,7 @@ export class RunController {
       record.phase = launching.identity === undefined
         ? { kind: "stopped", ...(launching.provenance === undefined ? {} : { provenance: launching.provenance }) }
         : runningPhase(launching, launching.identity, preserveStopRequested);
+      this.observe(record);
     }
     launching.resolveDone();
   }
@@ -697,6 +713,7 @@ export class RunController {
     await record.mutex.runExclusive(() => {
       owner.phase.reservation.release();
       record.phase = stoppedFromTerminating(owner.phase);
+      this.observe(record);
       this.options.onRelease?.(agentId);
     });
     const phase = record.phase;
@@ -761,11 +778,17 @@ export class RunController {
     await record.mutex.runExclusive(() => {
       activePhase.reservation.release();
       record.phase = { kind: "stopped", ...(activePhase.runId === undefined ? {} : { runId: activePhase.runId }) };
+      this.observe(record);
       this.options.onRelease?.(record.agentId);
     });
     const result = { status: "already_stopped" as const, agentId: record.agentId };
     resolve(result);
     return result;
+  }
+
+  private observe(record: LiveRecord): void {
+    try { this.options.observation?.afterMutation?.(toCallbackRecord(record)); }
+    catch { /* observation cannot alter lifecycle authority */ }
   }
 
   private require(agentId: AgentId): LiveRecord {

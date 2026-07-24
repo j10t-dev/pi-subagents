@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { CompletionService } from "../src/completion-service.ts";
+import type { AgentObservationMutationPort } from "../src/agent-observation-store.ts";
+import type { ObservationReconciliationSnapshot, SpawnObservationInput } from "../src/agent-observation.ts";
 import { SubagentController, type LaunchTransport, type PiControllerComposition, type RestorationPort, type SurrenderContainment } from "../src/controller.ts";
 import type { ContainmentAttempt, ContainmentBackend, ContainmentDescriptor } from "../src/containment.ts";
 import {
@@ -15,6 +17,7 @@ import {
   CancellationReason,
   CompletionState,
   agentId,
+  agentRunKey,
   createRunAttemptId,
   delegationDepth,
   modelSpec,
@@ -61,6 +64,69 @@ const _rawOutputStore = new OutputStore({ workDir: "/tmp/raw-output-root" });
 void _rawOutputStore;
 
 describe("controller orchestration scenarios", () => {
+  test("spawn observes only after persistence, accepts before bind, and acknowledges exact delivery", async () => {
+    const events: string[] = [];
+    const observation = recordingObservation(events);
+    const host = controllerWithNativeLaunch(A, R1, () => {}, { observation, events });
+    const started = await host.spawn({ task: "Review races" });
+    expect(started).toMatchObject({ agentId: A, runId: R1, state: AgentState.Running });
+    expect(events.indexOf("persist:spawned")).toBeLessThan(events.indexOf(`spawned:${A}`));
+    expect(events.indexOf("persist:started")).toBeLessThan(events.indexOf(`accepted:${A}:${R1}`));
+    expect(events.indexOf(`accepted:${A}:${R1}`)).toBeLessThan(events.indexOf(`bind:${R1}`));
+    await host.publish(completion(A, R1, "done"));
+    await host.awaitReady();
+    expect(events).toContain(`completion:${A}:${R1}`);
+    expect(events).toContain(`ack:${agentRunKey(A, R1)}`);
+  });
+
+  test("durably spawned children receive a safe observation when optional session metadata is absent", async () => {
+    let registered: SpawnObservationInput | undefined;
+    const host = controllerWithNativeLaunch(A, R1, () => {}, {
+      observation: recordingObservation([], { registerSpawned: (input) => { registered = input; } }),
+      omitObservationMetadata: true,
+    });
+
+    expect(await host.spawn({ task: "Review races" })).toMatchObject({ state: AgentState.Running });
+    expect(registered).toMatchObject({
+      agentId: A,
+      cwd: "/tmp/pi-subagents-test",
+      model: "mock-provider/luna",
+      thinkingLevel: "high",
+      assignment: "Review races",
+    });
+  });
+
+  test("observation failure leaves durable lifecycle and completion outcomes unchanged", async () => {
+    const host = controllerWithNativeLaunch(A, R1, () => {}, {
+      observation: recordingObservation([], {
+        registerSpawned: () => { throw new Error("spawn projection fault"); },
+        updateLifecycle: () => { throw new Error("lifecycle projection fault"); },
+      }),
+    });
+    expect(await host.spawn({ task: "Review races" })).toMatchObject({ state: AgentState.Running });
+    await host.publish(completion(A, R1, "done"));
+    expect(await host.awaitReady()).toMatchObject({ completion: { agentId: A, runId: R1, state: CompletionState.Completed } });
+  });
+
+  test("reconciliation sees complete durable outcomes and exact undrained delivery keys", async () => {
+    const reconciliations: ObservationReconciliationSnapshot[] = [];
+    const host = new SubagentController({ observation: recordingObservation([], {
+      publishCompletion: () => { throw new Error("completion projection fault"); },
+      acknowledgeDelivered: () => { throw new Error("delivery projection fault"); },
+      reconcile: (snapshot) => { reconciliations.push(snapshot); },
+    }) });
+    await host.publish(completion(A, R1, "first"));
+    await host.publish(completion(B, R2, "second"));
+
+    const delivered = await host.awaitReady();
+    await Promise.resolve().then(() => Promise.resolve());
+    const reconciled = reconciliations.at(-1)!;
+
+    expect(delivered.completion).toMatchObject({ agentId: A, runId: R1 });
+    expect(reconciled.completions.map(({ agentId: id, runId: run }) => [id, run])).toEqual([[A, R1], [B, R2]]);
+    expect([...reconciled.pendingDelivery]).toEqual([agentRunKey(B, R2)]);
+  });
+
   test("01 spawn one child and await its completion", async () => {
     const service = new CompletionService();
     service.upsertAgent(summary(A, AgentState.Running, R1));
@@ -528,9 +594,13 @@ function controllerWithNativeLaunch(
   id: AgentId,
   nativeRunId: RunId,
   onPrompt: (message: string) => void,
+  options: { observation?: AgentObservationMutationPort; events?: string[]; omitObservationMetadata?: boolean } = {},
 ): SubagentController {
   const session = { agentId: id, transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${id}.jsonl`), previousLeafId: null,
-    attemptId: testAttemptId(`attempt-${id}`), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${id}.receipt`) };
+    attemptId: testAttemptId(`attempt-${id}`), containmentReceiptPath: testReceiptPath(`/tmp/pi-subagents-test/${id}.receipt`),
+    ...(options.omitObservationMetadata === true ? {} : {
+      cwd: testAbsolutePath("/tmp/pi-subagents-test"), model: modelSpec("mock-provider/luna"), thinkingLevel: "high" as const,
+    }) };
   const launch = async (surrender: SurrenderContainment) => {
     const owned = runtime();
     surrender(owned);
@@ -539,19 +609,33 @@ function controllerWithNativeLaunch(
     const containment = testContainmentAttempt(session.attemptId).descriptor;
     return {
       runtime: owned,
-      ready: async () => containment, persistLaunchRequested: async () => {}, persistRunStarted: async () => {}, start: async () => {},
+      ready: async () => containment, persistLaunchRequested: async () => {}, persistRunStarted: async () => { options.events?.push("persist:started"); }, start: async () => {},
       getEntries: async () => reads++ === 0 ? { entries: [], leafId: null } : {
         entries: [{ type: "message", id: nativeRunId, message: { role: "user", content: assignment } }], leafId: nativeRunId,
       },
-      prompt: async (message: string) => { assignment = message; onPrompt(message); }, waitForAgentStart: async () => {}, bindRun: () => {}, waitSettled: () => new Promise<never>(() => {}),
+      prompt: async (message: string) => { assignment = message; onPrompt(message); }, waitForAgentStart: async () => {}, bindRun: (run: RunId) => { options.events?.push(`bind:${run}`); }, waitSettled: () => new Promise<never>(() => {}),
     };
   };
   const composition = {
     prepareSpawn: async () => ({ selection: { model: modelSpec("mock-provider/luna"), thinkingLevel: "high", tools: [testToolName("read")] },
-      createSession: async () => session, persistSpawned: async () => {}, createLaunch: async (_session, surrender) => launch(surrender) }),
+      createSession: async () => session, persistSpawned: async () => { options.events?.push("persist:spawned"); }, createLaunch: async (_session, surrender) => launch(surrender) }),
     prepareSend: async () => ({ session, createLaunch: (surrender: SurrenderContainment) => launch(surrender) }),
   } satisfies PiControllerComposition;
-  return new SubagentController({ composition });
+  return new SubagentController({ composition, ...(options.observation === undefined ? {} : { observation: options.observation }) });
+}
+
+function recordingObservation(events: string[], overrides: Partial<AgentObservationMutationPort> = {}): AgentObservationMutationPort {
+  const base: AgentObservationMutationPort = {
+    registerSpawned: ({ agentId }) => { events.push(`spawned:${agentId}`); },
+    acceptRun: ({ agentId, runId }) => { events.push(`accepted:${agentId}:${runId}`); },
+    updateLifecycle: ({ agentId, state }) => { events.push(`lifecycle:${agentId}:${state}`); },
+    publishCompletion: ({ agentId, runId }) => { events.push(`completion:${agentId}:${runId}`); },
+    registerSensitiveValues: () => { events.push("sensitive"); },
+    acknowledgeDelivered: (keys) => { events.push(`ack:${keys.join(",")}`); },
+    reconcile: () => { events.push("reconcile"); },
+    dispose: () => { events.push("dispose"); },
+  };
+  return { ...base, ...overrides };
 }
 
 function productionContext(

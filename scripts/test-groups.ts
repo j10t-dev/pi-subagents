@@ -19,6 +19,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "completion-service.test.ts",
     "domain.test.ts",
     "durable-fs.test.ts",
+    "observation-registry.test.ts",
     "observation-snapshot-path.test.ts",
     "persistence.test.ts",
     "pi-integration-harness.test.ts",
@@ -45,6 +46,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "watchdog.test.ts",
   ]),
   controller: new Set([
+    "agent-observation-store.test.ts",
     "context-safety.test.ts",
     "controller-scenarios.test.ts",
     "controller.test.ts",

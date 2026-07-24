@@ -15,6 +15,10 @@ import {
   type ModelLabel,
   type ModelSpec,
   type RunId,
+  type RunAttemptId,
+  type SessionPath,
+  type AgentRunKey,
+  type AgentCompletion,
   type TaskLabel,
   type ThinkingLevel,
   type ToolDisplayName,
@@ -59,6 +63,43 @@ export interface SubagentObservationPort {
   directSnapshot(): DirectAgentSnapshotResult;
   transcriptSource(agentId: AgentId): TranscriptSource | undefined;
   subscribe(listener: ObservationListener): () => void;
+}
+
+export interface ObservationAgentAuthority {
+  readonly agentId: AgentId;
+  readonly sessionPath: SessionPath;
+  readonly cwd: AbsolutePath;
+  readonly model: ModelSpec;
+  readonly thinkingLevel: ThinkingLevel;
+}
+export interface SpawnObservationInput extends ObservationAgentAuthority {
+  readonly ordinal: AgentOrdinal;
+  readonly assignment: string;
+}
+export interface AcceptedRunObservationInput {
+  readonly agentId: AgentId;
+  readonly runId: RunId;
+  readonly attemptId: RunAttemptId;
+  readonly assignment: string;
+}
+export interface ObservationRunAuthority {
+  readonly agentId: AgentId;
+  readonly state: AgentState;
+  readonly runId?: RunId;
+}
+export interface ObservationSensitiveValues {
+  readonly agentIds: ReadonlySet<AgentId>;
+  readonly runIds: ReadonlySet<RunId>;
+  readonly internalPaths: ReadonlySet<AbsolutePath>;
+}
+export interface ObservationReconciliationSnapshot {
+  readonly spawnSequence: readonly AgentId[];
+  readonly agents: readonly ObservationAgentAuthority[];
+  readonly runs: readonly ObservationRunAuthority[];
+  readonly completions: readonly AgentCompletion[];
+  readonly pendingDelivery: ReadonlySet<AgentRunKey>;
+  readonly acceptedAssignments: ReadonlyMap<AgentRunKey, string>;
+  readonly sensitiveValues: ObservationSensitiveValues;
 }
 
 export interface AgentRow {

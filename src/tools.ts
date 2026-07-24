@@ -28,6 +28,7 @@ import { AbortError } from "./async-primitives.ts";
 import { MAX_AGGREGATE_AWAIT_BYTES, MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
 import type { PublicStopOutcome, SpawnStartResult, StartResult, SubagentController } from "./controller.ts";
 import type { AgentSummary, CompletionAwaitResult } from "./completion-service.ts";
+import { renderLifecycleToolResult, type AgentDisplayResolver } from "./tool-presentation.ts";
 
 export const spawnAgentSchema = Type.Object({
   task: Type.String({ description: "Literal first assignment for the fresh child session." }),
@@ -97,7 +98,7 @@ export interface SubagentTool<K extends SubagentToolName> {
     input: SubagentToolInput<K>,
     signal?: AbortSignal,
   ): Promise<{ content: string; details: object }>;
-  renderResult?(result: object): string;
+  renderResult?(result: object, options?: { readonly expanded: boolean }): string;
 }
 
 export type SubagentToolRegistry = {
@@ -115,19 +116,24 @@ type ToolStopOutcome = PublicStopOutcome | {
   error: AgentError;
 };
 
-export function createSubagentTools(controller: SubagentToolController): SubagentToolRegistry {
+export function createSubagentTools(
+  controller: SubagentToolController,
+  resolver: AgentDisplayResolver = { resolve: () => undefined },
+): SubagentToolRegistry {
+  const render = (name: SubagentToolName) => (result: object, options = { expanded: false }): string =>
+    renderLifecycleToolResult(name, resultDetails(result), resolver, options);
   return {
     spawn_agent: tool("spawn_agent", "Start an isolated child agent assignment.", spawnAgentSchema,
-      async (input) => executeSpawn(() => controller.spawn(input)), projectSpawnStart, renderStart,
+      async (input) => executeSpawn(() => controller.spawn(input)), projectSpawnStart, render("spawn_agent"),
       undefined, { preservePublicPreflight: true }),
     send_input: tool("send_input", "Start a literal assignment on a stopped child agent.", sendInputSchema,
       async (input) => executeStart(() => controller.sendInput(agentId(input.agentId), input.message),
-        AgentErrorCode.SessionUnavailable), projectStart, renderStart),
+        AgentErrorCode.SessionUnavailable), projectStart, render("send_input")),
     await_agent: tool("await_agent", "Await one ready completion and page the owned-agent inventory.", awaitAgentSchema,
       async (input, signal) => projectAwaitResult(await controller.awaitReady({
         ...(input.timeoutMs === undefined ? {} : { timeoutMs: milliseconds(input.timeoutMs) }),
         ...(signal === undefined ? {} : { signal }),
-      }), input.afterAgentId), projectAwait, renderAwait, boundAwaitContent),
+      }), input.afterAgentId), projectAwait, render("await_agent"), boundAwaitContent),
     stop_agent: tool("stop_agent", "Stop one or more owned child agents.", stopAgentSchema,
       async (input) => {
         const outcomes: ToolStopOutcome[] = await Promise.all(input.agentIds.map(async (raw) => {
@@ -138,7 +144,7 @@ export function createSubagentTools(controller: SubagentToolController): Subagen
           catch (error) { return failed(raw, stableError(error)); }
         }));
         return { outcomes };
-      }, projectStop, renderStop),
+      }, projectStop, render("stop_agent")),
   };
 }
 
@@ -148,7 +154,7 @@ function tool<K extends SubagentToolName, TResult extends object>(
   parameters: (typeof subagentToolSchemas)[K],
   execute: (input: SubagentToolInput<K>, signal?: AbortSignal) => Promise<TResult>,
   project: (result: TResult) => object,
-  renderResult: (result: object) => string,
+  renderResult: (result: object, options?: { readonly expanded: boolean }) => string,
   projectContent?: (details: object) => object,
   options: { preservePublicPreflight?: boolean } = {},
 ): SubagentTool<K> {
@@ -180,8 +186,8 @@ function tool<K extends SubagentToolName, TResult extends object>(
       }
       catch { throw invalidPublicResult(); }
     },
-    renderResult: (result) => {
-      try { return renderResult(result); }
+    renderResult: (result, renderOptions) => {
+      try { return renderResult(result, renderOptions); }
       catch { throw invalidPublicResult(); }
     },
   };

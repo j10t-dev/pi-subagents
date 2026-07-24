@@ -45,6 +45,16 @@ function running(agentId = AGENT): AgentSummary {
 }
 
 describe("CompletionService.await", () => {
+  test("authority snapshot clones inventory and exact undrained delivery keys without draining", async () => {
+    const service = new CompletionService();
+    const ready = completion();
+    await service.publish(ready);
+    const snapshot = service.authoritySnapshot();
+    expect(snapshot.agents).toMatchObject([{ agentId: ready.agentId, latestCompletionState: ready.state }]);
+    expect([...snapshot.pendingDelivery]).toEqual([completionKey(ready)]);
+    expect(Object.isFrozen(snapshot.agents)).toBeTrue();
+    expect(service.queuedCount()).toBe(1);
+  });
   test("returns immediately with an empty batch when nothing is queued and no run is active", async () => {
     const service = new CompletionService();
     const result = await service.awaitReady();

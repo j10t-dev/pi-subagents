@@ -42,6 +42,11 @@ export interface CompletionAwaitResult {
   readonly timedOut: boolean;
 }
 
+export interface CompletionAuthoritySnapshot {
+  readonly agents: readonly AgentSummary[];
+  readonly pendingDelivery: ReadonlySet<AgentRunKey>;
+}
+
 export interface PublishResult {
   /** True only on an empty-to-non-empty queue transition with no active receiver. */
   shouldNotify: boolean;
@@ -240,6 +245,14 @@ export class CompletionService {
         }
       }
     }
+  }
+
+  /** Non-destructive authoritative inventory and exact queued delivery identities. */
+  authoritySnapshot(): CompletionAuthoritySnapshot {
+    return {
+      agents: Object.freeze(this.snapshotAgentsLocked().map((summary) => Object.freeze(summary))),
+      pendingDelivery: new Set(this.queue.map(completionKey)),
+    };
   }
 
   /** Full inventory of every owned agent, including agents with no completion yet. */

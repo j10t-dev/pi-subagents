@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { Value } from "typebox/value";
-import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runCapacity, runId, truncateUtf8, utf8Bytes, type AgentCompletion, type ToolName, type Utf8Bytes } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, directAgentOrdinal, modelSpec, runCapacity, runId, runAttemptId, truncateUtf8, utf8Bytes, type AgentCompletion, type ToolName, type Utf8Bytes } from "../src/domain.ts";
+import { directAgentRow } from "../src/agent-observation.ts";
+import { AgentObservationStore } from "../src/agent-observation-store.ts";
+import { createObservationDisplayResolver } from "../src/tool-presentation.ts";
 import { diagnosticsPath } from "../src/paths.ts";
 import { CompletionService, type AgentSummary } from "../src/completion-service.ts";
 import { MAX_AGGREGATE_AWAIT_BYTES } from "../src/constants.ts";
@@ -59,6 +62,40 @@ const _internalSelectionTools: readonly ToolName[] = TEST_SELECTION.tools;
 void _internalSelectionTools;
 
 describe("exact tool contracts", () => {
+  test("production resolver renders an individually addressed owned observation", () => {
+    const store = new AgentObservationStore();
+    const id = agentId("agent-a");
+    store.registerSpawned({ agentId: id, ordinal: directAgentOrdinal(1), assignment: "Review races",
+      sessionPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl"), cwd: testAbsolutePath("/tmp/pi-subagents-test"),
+      model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
+    store.acceptRun({ agentId: id, runId: testRunId("deadbeef"), attemptId: runAttemptId("attempt-a"), assignment: "Review races" });
+    store.updateLifecycle({ agentId: id, runId: testRunId("deadbeef"), state: AgentState.Running,
+      transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl") });
+    const tools = createSubagentTools(new SubagentController(), createObservationDisplayResolver(store));
+    expect(tools.spawn_agent.renderResult?.({ agentId: id, runId: testRunId("deadbeef"), state: "running" }, { expanded: false }))
+      .toBe("A1 · luna:h · Review races · running");
+  });
+
+  test("production resolver renders an owned agent omitted from directSnapshot", () => {
+    const store = new AgentObservationStore();
+    for (let index = 0; index < 201; index++) {
+      const id = agentId(`agent-${String(index).padStart(3, "0")}`);
+      store.registerSpawned({ agentId: id, ordinal: directAgentOrdinal(index + 1), assignment: "Review races",
+        sessionPath: testSessionPath(`/tmp/pi-subagents-test/${id}.jsonl`), cwd: testAbsolutePath("/tmp/pi-subagents-test"),
+        model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
+    }
+    const active = agentId("agent-active");
+    store.registerSpawned({ agentId: active, ordinal: directAgentOrdinal(202), assignment: "Inspect output",
+      sessionPath: testSessionPath("/tmp/pi-subagents-test/agent-active.jsonl"), cwd: testAbsolutePath("/tmp/pi-subagents-test"),
+      model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
+    store.updateLifecycle({ agentId: active, runId: testRunId("cafebabe"), state: AgentState.Running,
+      transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-active.jsonl") });
+    const target = store.observation(agentId("agent-000"))!;
+
+    expect(store.directSnapshot()).toMatchObject({ kind: "snapshot", omitted: 2 });
+    expect(createObservationDisplayResolver(store).resolve(target.agentId)).toEqual(directAgentRow(target));
+  });
+
   test("returns each exported input schema by identity", () => {
     const tools = createSubagentTools(new SubagentController());
     expect(tools.spawn_agent.parameters).toBe(spawnAgentSchema);
@@ -224,7 +261,7 @@ describe("exact tool contracts", () => {
 
     expect(result.details).toEqual({ agentId: "agent-a", runId: "deadbeef", state: "settling",
       error: { code: "spawn_failed", message: "failed to spawn child agent" } });
-    expect(tool.renderResult!(result)).toBe("agentId=agent-a runId=deadbeef state=settling");
+    expect(tool.renderResult!(result)).toBe("Agent · unavailable");
   });
 
   test("preserves only typed public preflight detail at the spawn tool boundary", async () => {
@@ -583,9 +620,7 @@ describe("exact tool contracts", () => {
       tools.stop_agent.renderResult!(results[3]!),
     ];
 
-    expect(rendered[0]).toBe(
-      "agentId=agent-a runId=deadbeef state=running model=family/luna reasoning=off",
-    );
+    expect(rendered[0]).toBe("Agent · unavailable");
     expect(rendered[0]).not.toContain("mock-provider");
     expect(rendered[0]).not.toContain("thinkingLevel");
     expect(results[0]!.details).toMatchObject({
@@ -594,10 +629,10 @@ describe("exact tool contracts", () => {
     });
     expect(results[0]!.content).toContain('"model":"mock-provider/family/luna"');
     expect(results[0]!.content).toContain('"thinkingLevel":"off"');
-    expect(rendered[1]).toContain("agentId=agent-a runId=cafebabe state=running");
-    expect(rendered[2]).toContain("completions=1 agents=1 timedOut=false");
-    expect(rendered[2]).toContain("outputPath=/tmp/out.md");
-    expect(rendered[2]).toContain("latestOutputPath=/tmp/out.md");
+    expect(rendered[1]).toBe("Agent · unavailable");
+    expect(rendered[2]).toBe("Agent · unavailable");
+    expect(rendered[2]).not.toContain("outputPath");
+    expect(rendered[2]).not.toContain("latestOutputPath");
     expect(rendered[2]).not.toContain("transcriptPath");
     expect(rendered[2]).not.toContain("/tmp/session.jsonl");
     expect(results[2]!.details).toMatchObject({
@@ -605,8 +640,7 @@ describe("exact tool contracts", () => {
       inventory: { agents: [{ transcriptPath: "/tmp/session.jsonl" }] },
     });
     expect(results[2]!.content).toContain('"transcriptPath":"/tmp/session.jsonl"');
-    expect(rendered[3]).toContain("outcomes=1");
-    expect(rendered[3]).toContain("errorCode=containment_failed");
+    expect(rendered[3]).toBe("Agent · unavailable");
     for (const text of rendered) {
       expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(8_192);
       expect(text).not.toContain("MODEL_OUTPUT_SECRET");
@@ -628,7 +662,7 @@ describe("exact tool contracts", () => {
 
     const rendered = awaitTool.renderResult!(await awaitTool.execute({}));
 
-    expect(rendered).toMatch(/^completions=0 agents=\d+ timedOut=false/);
+    expect(rendered).toMatch(/^\d+ stopped agents not shown/);
     expect(rendered).not.toContain("transcriptPath");
     expect(rendered).not.toContain("/tmp/path/");
     expect(new TextEncoder().encode(rendered).byteLength).toBeLessThanOrEqual(8_192);

@@ -51,6 +51,21 @@ const terminalOrderings = [
 
 describe("RunController arbitration", () => {
 
+  test("post-mutation observations see committed lifecycle state and cannot alter outcomes", async () => {
+    const seen: string[] = [];
+    const c = testRunController({
+      observation: { afterMutation: (record) => {
+        seen.push(record.state);
+        if (record.state === AgentState.Stopping) throw new Error("projection fault");
+      } },
+    });
+    const id = registerStopped(c);
+    expect(await c.launch(id, async () => ({ status: "accepted", runId: testRunId("deadbeef"), runtime: testRuntime() })))
+      .toMatchObject({ status: "running" });
+    expect(await c.stop(id, CancellationReason.StopRequested)).toMatchObject({ status: "stopped" });
+    expect(seen).toEqual([AgentState.Stopped, AgentState.Stopped, AgentState.Running, AgentState.Stopping, AgentState.Stopped]);
+  });
+
   test("register rejects non-stopped records (delta 7)", () => {
     const c = testRunController();
     expect(() => c.register({

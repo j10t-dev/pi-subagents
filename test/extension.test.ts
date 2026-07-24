@@ -4,12 +4,17 @@ import extension, { buildProductionControllerOptions, createPiSubagentsExtension
 import { parseExtensionLaunchContext } from "../src/delegation-policy.ts";
 import { withProductionContainmentPreflight } from "../src/pi-composition.ts";
 import type { ContainmentBackend } from "../src/containment.ts";
-import { delegationDepth, runCapacity, type AbsolutePath } from "../src/domain.ts";
+import { AgentState, agentId, agentObservationRevision, delegationDepth, directAgentOrdinal, modelSpec, runId, runCapacity, type AbsolutePath } from "../src/domain.ts";
+import type { SubagentObservationPort } from "../src/agent-observation.ts";
+import { AgentObservationStore } from "../src/agent-observation-store.ts";
+import { SubagentController } from "../src/controller.ts";
+import { onObservationPort } from "../src/observation-registry.ts";
 import { absolutePath } from "../src/paths.ts";
-import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
+import { createObservationDisplayResolver } from "../src/tool-presentation.ts";
+import { awaitAgentSchema, createSubagentTools, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
 import { deferred } from "./support/async.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
-import { testAbsolutePath } from "./support/brands.ts";
+import { testAbsolutePath, testSessionPath } from "./support/brands.ts";
 
 interface HarnessContext {
   statuses: Array<string | undefined>;
@@ -56,11 +61,12 @@ function context(): HarnessContext {
   };
 }
 
-function controller(log: string[]): ExtensionController {
+function controller(log: string[], observation?: SubagentObservationPort): ExtensionController {
   return {
     restore: async () => { log.push("restore"); },
     shutdown: async () => { log.push("shutdown"); },
     status: () => "0 running · 0 ready",
+    ...(observation === undefined ? {} : { observationPort: () => observation }),
     tools: () => ({
       spawn_agent: { name: "spawn_agent", description: "spawn_agent", parameters: spawnAgentSchema, execute: async () => ({ content: "spawn_agent", details: { name: "spawn_agent" } }), renderResult: () => "spawn_agent" },
       send_input: { name: "send_input", description: "send_input", parameters: sendInputSchema, execute: async () => ({ content: "send_input", details: { name: "send_input" } }), renderResult: () => "send_input" },
@@ -71,6 +77,27 @@ function controller(log: string[]): ExtensionController {
 }
 
 describe("Pi subagents extension", () => {
+  test("publishes only the restored controller port and clears it before shutdown", async () => {
+    const h = harness();
+    const log: string[] = [];
+    const port: SubagentObservationPort = {
+      observation: () => undefined,
+      directSnapshot: () => ({ kind: "unavailable", finalRevision: agentObservationRevision(0) }),
+      transcriptSource: () => undefined,
+      subscribe: () => () => {},
+    };
+    const seen: Array<SubagentObservationPort | undefined> = [];
+    const unsubscribe = onObservationPort((value) => seen.push(value));
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+      createController: () => controller(log, port), diagnostic: () => {} })(extensionApiForTest(h.api));
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    expect(seen.at(-1)).toBe(port);
+    await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+    expect(seen.at(-1)).toBeUndefined();
+    expect(log).toEqual(["restore", "shutdown"]);
+    unsubscribe();
+  });
+
   test("supported parent registers four rendered tools and the lifecycle handlers without starting resources", () => {
     const h = harness();
     const log: string[] = [];
@@ -90,11 +117,11 @@ describe("Pi subagents extension", () => {
     expect(h.tools[2]?.parameters).toBe(awaitAgentSchema);
     expect(h.tools[3]?.parameters).toBe(stopAgentSchema);
     expect([...h.handlers.keys()]).toEqual([
-      "session_start", "session_before_tree", "session_before_switch", "session_before_fork", "session_shutdown",
+      "session_start", "session_before_tree", "session_tree", "session_before_switch", "session_before_fork", "session_shutdown",
     ]);
   });
 
-  test("renders historical tool results without an active session", async () => {
+  test("renders historical tool results without exposing raw details", async () => {
     const h = harness();
     const log: string[] = [];
     createPiSubagentsExtension({
@@ -102,11 +129,75 @@ describe("Pi subagents extension", () => {
       createController: () => controller(log), diagnostic: () => {},
     })(extensionApiForTest(h.api));
     const tool = h.tools[0] as { renderResult(result: { details?: object }): { text: string } };
+    const result = { details: { agentId: "agent-secret", outputPath: "/tmp/secret" } };
 
-    expect(tool.renderResult({ details: { name: "historical" } }).text).toBe('{"name":"historical"}');
+    expect(tool.renderResult(result).text).toBe("Agent · unavailable");
     await h.emit("session_start", { type: "session_start", reason: "startup" });
     await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-    expect(tool.renderResult({ details: { name: "historical" } }).text).toBe('{"name":"historical"}');
+    expect(tool.renderResult(result).text).toBe("Agent · unavailable");
+  });
+
+  test.each([
+    ["spawn_agent", { agentId: agentId("agent-a"), runId: runId("deadbeef"), state: "running" }],
+    ["send_input", { agentId: agentId("agent-a"), runId: runId("deadbeef"), state: "running" }],
+    ["await_agent", {
+      completions: [], remainingCompletions: 0,
+      inventory: { total: 1, omitted: 0, remaining: 0, agents: [{ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: "running" }] },
+      timedOut: false,
+    }],
+    ["stop_agent", { outcomes: [{ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: "cancelled" }] }],
+  ] as const)("registered %s uses the observation-backed lifecycle renderer", async (name, details) => {
+    const h = harness();
+    const store = observedRunningStore();
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+      createController: () => ({ ...controller([], store), tools: () => createSubagentTools(
+        new SubagentController(), createObservationDisplayResolver(store),
+      ) }), diagnostic: () => {} })(extensionApiForTest(h.api));
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    const definition = h.tools.find((entry) => entry.name === name) as {
+      renderResult(result: { details: object }, options: { expanded: boolean }): { text: string };
+    };
+
+    const rendered = definition.renderResult({ details }, { expanded: false }).text;
+
+    expect(rendered).toContain("A1 · luna:h · task · running");
+    expect(rendered).not.toContain("agent-a");
+  });
+
+  test("registered await_agent forwards expanded to diagnostic rendering", async () => {
+    const h = harness();
+    const log: string[] = [];
+    const store = new AgentObservationStore();
+    const id = agentId("agent-a");
+    const nativeRunId = runId("deadbeef");
+    store.registerSpawned({ agentId: id, ordinal: directAgentOrdinal(1), assignment: "task",
+      sessionPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl"), cwd: testAbsolutePath("/tmp/pi-subagents-test"),
+      model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
+    store.updateLifecycle({ agentId: id, runId: nativeRunId, state: AgentState.Running,
+      transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl") });
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+      createController: () => ({ ...controller(log, store), tools: () => createSubagentTools(
+        new SubagentController(), createObservationDisplayResolver(store),
+      ) }), diagnostic: () => {} })(extensionApiForTest(h.api));
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    const details = {
+      completions: [], remainingCompletions: 0,
+      inventory: { total: 1, omitted: 0, remaining: 0,
+        agents: [{ agentId: id, runId: nativeRunId, state: "running", transcriptPath: "/tmp/pi-subagents-test/agent-a.jsonl" }] },
+      timedOut: false,
+    };
+    const definition = h.tools.find((entry) => entry.name === "await_agent") as {
+      renderResult(result: { details: object }, options: { expanded: boolean }): { text: string };
+    };
+
+    const collapsed = definition.renderResult({ details }, { expanded: false }).text;
+    const expanded = definition.renderResult({ details }, { expanded: true }).text;
+
+    expect(collapsed).toContain("A1 · luna:h · task · running");
+    expect(collapsed).not.toContain(String(id));
+    expect(collapsed).not.toContain("/tmp/pi-subagents-test/agent-a.jsonl");
+    expect(expanded).toContain(`agentId=${id}`);
+    expect(expanded).toContain("/tmp/pi-subagents-test/agent-a.jsonl");
   });
 
   test("a tool execution outliving its session returns its result instead of throwing session_unavailable", async () => {
@@ -318,6 +409,33 @@ describe("Pi subagents extension", () => {
     }
   });
 
+  test("stopped-only tree navigation clears, disposes, restores, and republishes serially", async () => {
+    const h = harness();
+    const log: string[] = [];
+    const ports: SubagentObservationPort[] = [new AgentObservationStore(), new AgentObservationStore()];
+    let created = 0;
+    const seen: Array<SubagentObservationPort | undefined> = [];
+    const unsubscribe = onObservationPort((port) => seen.push(port));
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+      createController: () => {
+        const index = created++;
+        return {
+          ...controller([], ports[index]),
+          beforeTree: () => true,
+          restore: async () => { log.push(`restore:${index}`); },
+          shutdown: async () => { log.push(`shutdown:${index}`); },
+        };
+      }, diagnostic: () => {} })(extensionApiForTest(h.api));
+
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    await h.emit("session_tree", { type: "session_tree", newLeafId: "second", oldLeafId: "first" });
+
+    expect(log).toEqual(["restore:0", "shutdown:0", "restore:1"]);
+    expect(seen.slice(-3)).toEqual([ports[0], undefined, ports[1]]);
+    await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+    unsubscribe();
+  });
+
   test("reload shuts down the old instance before the next instance restores", async () => {
     const h = harness();
     const log: string[] = [];
@@ -456,6 +574,17 @@ describe("Pi subagents extension", () => {
 
   test("default export is an extension factory", () => expect(typeof extension).toBe("function"));
 });
+
+function observedRunningStore(): AgentObservationStore {
+  const store = new AgentObservationStore();
+  const id = agentId("agent-a");
+  store.registerSpawned({ agentId: id, ordinal: directAgentOrdinal(1), assignment: "task",
+    sessionPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl"), cwd: testAbsolutePath("/tmp/pi-subagents-test"),
+    model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
+  store.updateLifecycle({ agentId: id, runId: runId("deadbeef"), state: AgentState.Running,
+    transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl") });
+  return store;
+}
 
 function containmentBackend(preflight: () => Promise<void>): ContainmentBackend {
   return {

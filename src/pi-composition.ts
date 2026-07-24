@@ -14,6 +14,7 @@ import {
   type SurrenderContainment,
 } from "./controller.ts";
 import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord, type RestoredRegistry } from "./persistence.ts";
+import { AgentObservationStore, createTotalAgentObservationAdapter } from "./agent-observation-store.ts";
 import { buildRpcLaunchSpec, resolvePiInvocation, type BuildRpcLaunchOptions, type RpcLaunchSpec } from "./pi-launcher.ts";
 import { isLocalOutputPublicationError, RpcRunClient } from "./rpc-client.ts";
 import { OutputStore } from "./output-store.ts";
@@ -168,8 +169,15 @@ export function createProductionController(
       if (containment.kind === "available") await containment.backend.shutdown();
     },
   };
-  return new SubagentController({
+  let controller!: SubagentController;
+  const observationStore = new AgentObservationStore({
+    reconciliation: () => controller.observationReconciliationSnapshot(),
+    diagnostic: (message) => context.ui.notify(message, "warning"),
+  });
+  controller = new SubagentController({
     capacity: options.capacity,
+    observation: createTotalAgentObservationAdapter(observationStore),
+    observationPort: observationStore,
     ...(options.onStatusChange === undefined ? {} : { onStatusChange: options.onStatusChange }),
     composition,
     restoration: {
@@ -216,6 +224,9 @@ export function createProductionController(
         const entries = SessionManager.open(path).getEntries();
         return firstUserEntryAfterCursor(entries, cursor);
       },
+      readAssignment: async (path, nativeRunId) => assignmentForExactRun(
+        SessionManager.open(path).getEntries(), nativeRunId,
+      ),
       finaliseContained: (record, nativeRunId, settlement) => restoredCompletion(record, nativeRunId, settlement),
       restoreCompletion: async (record) => {
         const store = new OutputStore({
@@ -234,6 +245,7 @@ export function createProductionController(
       warn: (message) => context.ui.notify(message, "warning"),
     },
   });
+  return controller;
 
   function restoreChildRegistry(registry: RestoredRegistry): void {
     for (const record of registry.agents.values()) {
@@ -247,7 +259,11 @@ export function createProductionController(
       const attemptId = pending?.payload.attemptId ?? fromRun?.attemptId ?? record.completion?.attemptId ?? createRunAttemptId();
       const receipt = pending?.payload.containmentReceiptPath ?? fromRun?.receiptPath ?? record.completion?.receiptPath ?? receiptFor(root, attemptId);
       children.set(record.agentId, {
-        session: { agentId: record.agentId, transcriptPath: record.sessionPath, previousLeafId: leaf, attemptId, containmentReceiptPath: receipt },
+        session: {
+          agentId: record.agentId, transcriptPath: record.sessionPath, previousLeafId: leaf, attemptId,
+          containmentReceiptPath: receipt, cwd: record.cwd, model: modelSpecFrom(record.provider, record.modelId),
+          thinkingLevel: record.thinkingLevel,
+        },
         cwd: record.cwd,
         model: modelSpecFrom(record.provider, record.modelId),
         thinking: record.thinkingLevel,
@@ -302,6 +318,9 @@ export function createProductionController(
           previousLeafId: null,
           attemptId,
           containmentReceiptPath: receiptFor(root, attemptId),
+          cwd,
+          model: selection.model,
+          thinkingLevel: selection.thinkingLevel,
         };
         const record: ChildRecord = { session, cwd, model: selection.model, thinking: selection.thinkingLevel, tools: selection.tools };
         child = record;
@@ -499,6 +518,21 @@ export function firstUserEntryAfterCursor(entries: readonly SessionEntry[], curs
     if (candidate !== undefined) return candidate;
   }
   return undefined;
+}
+
+/** Returns only the exact authoritative run's literal user assignment. */
+export function assignmentForExactRun(entries: readonly SessionEntry[], nativeRunId: RunId): string | undefined {
+  const entry = entries.find((candidate) => candidate.id === nativeRunId);
+  if (entry?.type !== "message" || entry.message.role !== "user") return undefined;
+  const content = entry.message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const text: string[] = [];
+  for (const part of content) {
+    if (typeof part !== "object" || part === null || !("type" in part) || part.type !== "text" || !("text" in part) || typeof part.text !== "string") return undefined;
+    text.push(part.text);
+  }
+  return text.join("\n");
 }
 
 /** Transfers containment to controller ownership before any launch construction can proceed. */
