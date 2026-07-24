@@ -256,6 +256,31 @@ describe("completed output restoration", () => {
     }
   });
 
+  test("canonicalises restored output destinations through the injected filesystem", () => {
+    const state = temporaryStateRoot("restored-completion-injected-realpath-");
+    try {
+      const workDir = testAbsolutePath(join(state.path, "output", "agent-a"));
+      const transcript = sessionPath(state.path, "session.jsonl");
+      const candidate = restorableCompletion(workDir, transcript, "persisted output");
+      writeFileSync(candidate.outputPath, "persisted output", { mode: 0o600 });
+      writeTranscript(transcript, candidate.runId, "persisted output");
+      const trace: string[] = [];
+      const durableFileSystem = {
+        ...tracedDurableFileSystem(trace),
+        realpath(path: string) {
+          trace.push(`realpath:${path}`);
+          return systemDurableFileSystem.realpath(path);
+        },
+      };
+
+      new OutputStore({ workDir, durableFileSystem }).restoreCompletion(candidate, transcript);
+
+      expect(trace.filter((entry) => entry.startsWith("realpath:"))).toHaveLength(2);
+    } finally {
+      state.cleanup();
+    }
+  });
+
   test.each([
     ["missing", "persisted candidate", undefined],
     ["original-byte-mismatching", "persisted candidate", "different visible bytes"],
@@ -495,14 +520,47 @@ describe("completed output restoration", () => {
     const failedPort = Object.assign(testRestorationPort(), {
       restoreCompletion: async () => { throw new Error("output sync failed"); },
     });
-    const error = await applyRestoration(plan, tracedAdmission([]), failedPort, applicationState())
-      .catch((caught: unknown) => caught);
-    expect(error).toBeInstanceOf(RestorationApplicationError);
-    expect((error as RestorationApplicationError).restored[0]?.completion).toBeUndefined();
+    const failedState = applicationState();
+    const failed = await applyRestoration(plan, tracedAdmission([]), failedPort, failedState);
+    expect(failed[0]?.completion).toBeUndefined();
+    expect([...failedState.restoredRecords.keys()]).toEqual([testAgentId()]);
   });
 });
 
 describe("restoration application", () => {
+  test("isolates an unreadable restored completion and retains only its retry obligation", async () => {
+    const agentB = testAgentId("agent-b");
+    const runB = testRunId("feedface");
+    const registry = foldAgentEvents([
+      spawned(), launch(), started(), completed(),
+      spawnedFor("agent-b", "b.jsonl"), launchFor("agent-b", "attempt-b"),
+      startedFor("agent-b", "feedface", "attempt-b"), completedFor("agent-b", "feedface", "b.jsonl"),
+    ], TEST_STATE_ROOT);
+    const basePort = testRestorationPort();
+    const evidence = await collectRestorationEvidence(registry, basePort, () => testRuntime());
+    const plan = planRestoration(registry, evidence);
+    const attempts: string[] = [];
+    const port = testRestorationPort({
+      restoreCompletion: async (record) => {
+        attempts.push(record.agentId);
+        if (record.agentId === testAgentId()) throw new Error("output unreadable");
+        return completedCompletion({
+          agentId: record.agentId,
+          runId: record.completion.payload.runId,
+          transcriptPath: record.sessionPath,
+        });
+      },
+    });
+    const state = applicationState();
+
+    const restored = await applyRestoration(plan, tracedAdmission([]), port, state);
+
+    expect(attempts).toEqual([testAgentId(), agentB]);
+    expect(restored.find((record) => record.agentId === testAgentId())?.completion).toBeUndefined();
+    expect(restored.find((record) => record.agentId === agentB)?.completion?.payload.runId).toBe(runB);
+    expect([...state.restoredRecords.keys()]).toEqual([testAgentId()]);
+  });
+
   test("applies durable work in transactional order before committing stopped records", async () => {
     const trace: string[] = [];
     const { plan, port: basePort } = await applicationFixture();
@@ -1551,6 +1609,18 @@ function completed(id = "deadbeef") {
       workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"),
       runId: testRunId(id),
     }), output: truncateUtf8("", utf8Bytes(50_000)),
+  }, 1);
+}
+function completedFor(agent: string, id: string, transcript: string) {
+  return completedEntry({
+    agentId: testAgentId(agent),
+    runId: testRunId(id),
+    transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${transcript}`),
+    outputPath: testCommittedOutputPath({
+      workDir: testAbsolutePath(`/tmp/pi-subagents-test/output/${agent}`),
+      runId: testRunId(id),
+    }),
+    output: truncateUtf8("", utf8Bytes(50_000)),
   }, 1);
 }
 function completedV2(id = "deadbeef") {

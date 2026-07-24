@@ -251,8 +251,7 @@ function spawnRaceFixture(
   parentSessionId: AgentId,
   fixture = fileURLToPath(new URL("fixtures/cgroup-root-race.ts", import.meta.url)),
 ): RaceFixture {
-  const primitiveParentSessionId: string = parentSessionId;
-  const child = spawn(process.execPath, [fixture, membership, scratch, id, barrier, primitiveParentSessionId], {
+  const child = spawn(process.execPath, [fixture, membership, scratch, id, barrier, parentSessionId], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";

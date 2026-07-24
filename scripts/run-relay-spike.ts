@@ -10,16 +10,24 @@ import { createInterface } from "node:readline";
 import { agentId, milliseconds, type Milliseconds } from "../src/domain.ts";
 import { absolutePath } from "../src/paths.ts";
 import { readKnownChildSnapshots, type ObservationSnapshotV1 } from "../src/observation-snapshot-path.ts";
+import { runtimeEvidenceLine } from "./b0-orchestration.ts";
+import { detectPiRuntime, piExecutable } from "./pi-runtime-target.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = join(HERE, "..", "test", "fixtures", "relay-spike-extension");
 
+function argValue(flag: string, fallback: string): string {
+  const index = process.argv.indexOf(flag);
+  return index === -1 ? fallback : (process.argv[index + 1] ?? fallback);
+}
+
 async function main(): Promise<void> {
+  const target = detectPiRuntime(piExecutable(argValue("--pi", "pi")));
+  console.log(runtimeEvidenceLine(target.detectedVersion));
   const workDir = mkdtempSync(join(tmpdir(), "pi-relay-spike-"));
   const agentDir = absolutePath(join(workDir, "agent"));
-  const primitiveAgentDir: string = agentDir;
   const sessionDir = join(workDir, "session");
-  const extDir = join(primitiveAgentDir, "extensions", "relay-spike");
+  const extDir = join(agentDir, "extensions", "relay-spike");
   mkdirSync(extDir, { recursive: true });
   mkdirSync(sessionDir, { recursive: true });
   // The fixture is self-contained (no src import), so copy only the fixture into the autoload dir.
@@ -29,11 +37,11 @@ async function main(): Promise<void> {
     "--mode", "rpc", "--session-dir", sessionDir,
     "--offline", "--no-context-files", "--no-skills", "--no-prompt-templates", "--approve",
   ];
-  const child = spawn("pi", args, {
+  const child = spawn(target.executable, args, {
     cwd: workDir,
     env: {
       ...process.env,
-      PI_CODING_AGENT_DIR: primitiveAgentDir,
+      PI_CODING_AGENT_DIR: agentDir,
       PI_SUBAGENT_CHILD: "1",
       PI_SUBAGENT_DEPTH: "1",
       PI_SUBAGENT_MAX_DEPTH: "2",
@@ -86,23 +94,20 @@ async function main(): Promise<void> {
     if (readKnownChildSnapshots(agentDir, [agentId("definitely-not-a-child")]).snapshots.size !== 0) {
       console.log(`RPC_RELAY_UNSUPPORTED: discovery returned an unknown-id snapshot`); return;
     }
-    const primitiveSessionId: string = best.sessionId;
-    const primitiveRevision: number = best.revision;
     const snapshotWire = {
       version: best.version,
-      sessionId: primitiveSessionId,
-      revision: primitiveRevision,
+      sessionId: best.sessionId,
+      revision: best.revision,
       agents: best.agents,
     };
     process.stderr.write(`relay snapshot: ${JSON.stringify(snapshotWire)}\n`);
-    console.log(`RPC_RELAY_SUPPORTED revision=${primitiveRevision}`);
+    console.log(`RPC_RELAY_SUPPORTED revision=${best.revision}`);
   } finally {
     try { child.stdin.write(`${JSON.stringify({ type: "shutdown" })}\n`); } catch { /* stdin may be closed */ }
     child.kill("SIGTERM");
     await new Promise<void>((resolve) => {
       const shutdownTimeout = milliseconds(2_000);
-      const primitiveShutdownTimeout: number = shutdownTimeout;
-      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, primitiveShutdownTimeout);
+      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, shutdownTimeout);
       child.once("exit", () => { clearTimeout(timer); resolve(); });
     });
     rl.close();
@@ -119,8 +124,7 @@ async function waitUntil(predicate: () => boolean, timeoutMs: Milliseconds): Pro
 }
 
 function sleep(duration: Milliseconds): Promise<void> {
-  const primitiveDuration: number = duration;
-  return Bun.sleep(primitiveDuration);
+  return Bun.sleep(duration);
 }
 
 await main();

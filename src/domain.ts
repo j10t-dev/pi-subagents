@@ -23,7 +23,8 @@ export type ModelId = Brand<string, "ModelId">;
 export type ToolName = Brand<string, "ToolName">;
 export type ModelSpec = Brand<string, "PiCliModelSpec">;
 export type AbsolutePath = Brand<string, "AbsolutePath">;
-export type CgroupScopePath = AbsolutePath & Brand<string, "CgroupScopePath">;
+export type ObservedCgroupScopePath = AbsolutePath & Brand<string, "ObservedCgroupScopePath">;
+export type CgroupScopePath = ObservedCgroupScopePath & Brand<string, "CgroupScopePath">;
 export type ObservationSnapshotPath = AbsolutePath & Brand<string, "ObservationSnapshotPath">;
 export type SessionPath = AbsolutePath & Brand<string, "ContainedSessionFile">;
 export type OutputPath = AbsolutePath & Brand<string, "OutputFileLocation">;
@@ -125,6 +126,11 @@ export function runAttemptId(value: string): RunAttemptId {
     throw new Error("invalid_input: run attempt id must be non-empty");
   }
   return value as RunAttemptId;
+}
+
+/** Brands an absolute cgroup path decoded from runtime or persisted containment evidence. */
+export function observedCgroupScopePath(path: AbsolutePath): ObservedCgroupScopePath {
+  return path as ObservedCgroupScopePath;
 }
 
 /**

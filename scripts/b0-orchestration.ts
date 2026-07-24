@@ -1,6 +1,7 @@
 import { truncateUtf8, utf8Bytes } from "../src/domain.ts";
 import type { GateResult } from "./b0-report.ts";
 import type { FocusMechanism } from "./focus-spike-protocol.ts";
+import { detectedPiVersion, type DetectedPiVersion } from "./pi-runtime-target.ts";
 
 export interface SpikeProcessResult {
   readonly status: number | null;
@@ -14,9 +15,11 @@ export interface SpikeExecution {
   readonly status: "completed" | "not-run";
   readonly output: string;
   readonly truncated: boolean;
+  readonly detectedVersion?: DetectedPiVersion;
 }
 
 const MAX_SPIKE_OUTPUT_BYTES = 50_000;
+const RUNTIME_EVIDENCE_PREFIX = "PI_RUNTIME_VERSION ";
 const TRUNCATION_MARKER = "\n[output truncated]";
 const REASON = "\\S(?:.*\\S)?";
 const FOCUS_OUTCOME_LINE = new RegExp(
@@ -32,6 +35,10 @@ function labelledOutcome(output: string, prefix: string, pattern: RegExp): RegEx
   return pattern.exec(candidates[0]!) ?? undefined;
 }
 
+export function runtimeEvidenceLine(version: DetectedPiVersion): string {
+  return `${RUNTIME_EVIDENCE_PREFIX}${JSON.stringify(version)}`;
+}
+
 export function spikeExecutionFromResult(result: SpikeProcessResult): SpikeExecution {
   const combined = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   const diagnostic = result.error === undefined
@@ -41,7 +48,24 @@ export function spikeExecutionFromResult(result: SpikeProcessResult): SpikeExecu
   const bounded = truncateUtf8(diagnostic, utf8Bytes(budget));
   const output = bounded.truncated ? `${bounded.text}${TRUNCATION_MARKER}` : bounded.text;
   const completed = result.error === undefined && result.signal === null && result.status === 0;
-  return { status: completed ? "completed" : "not-run", output, truncated: bounded.truncated };
+  const detectedVersion = parseRuntimeEvidence(output);
+  return {
+    status: completed ? "completed" : "not-run",
+    output,
+    truncated: bounded.truncated,
+    ...(detectedVersion === undefined ? {} : { detectedVersion }),
+  };
+}
+
+function parseRuntimeEvidence(output: string): DetectedPiVersion | undefined {
+  const candidates = output.split(/\r?\n/u).filter((line) => line.startsWith(RUNTIME_EVIDENCE_PREFIX));
+  if (candidates.length !== 1) return undefined;
+  try {
+    const value: unknown = JSON.parse(candidates[0]!.slice(RUNTIME_EVIDENCE_PREFIX.length));
+    return typeof value === "string" ? detectedPiVersion(value) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function focusResult(

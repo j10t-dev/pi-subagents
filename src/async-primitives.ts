@@ -108,8 +108,7 @@ export class AbortError extends Error {
 /** Resolves after `milliseconds`, or rejects with `AbortError` if `signal` aborts first. */
 export function delayWithAbort(milliseconds: Milliseconds, signal?: AbortSignal): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const primitiveMilliseconds: number = milliseconds;
-  const delay = new Promise<void>((resolve) => { timer = setTimeout(resolve, primitiveMilliseconds); });
+  const delay = new Promise<void>((resolve) => { timer = setTimeout(resolve, milliseconds); });
   return waitWithAbort(delay, signal).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
   });

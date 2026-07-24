@@ -1,6 +1,7 @@
 import type {
   AbsolutePath,
   CgroupScopePath,
+  ObservedCgroupScopePath,
   RunAttemptId,
   VerifiedContainmentReceiptPath,
 } from "./domain.ts";
@@ -12,7 +13,7 @@ export interface ContainmentCandidateDescriptor {
 
 export interface RestorationContainmentDescriptor {
   readonly backend: "cgroup-v2";
-  readonly scopePath: AbsolutePath;
+  readonly scopePath: ObservedCgroupScopePath;
 }
 
 export interface ContainmentDescriptor {

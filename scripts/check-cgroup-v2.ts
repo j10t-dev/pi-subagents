@@ -7,7 +7,6 @@ import { agentId, processId } from "../src/domain.ts";
 import { absolutePath, containmentReceiptPath } from "../src/paths.ts";
 
 const state = absolutePath(mkdtempSync(join(tmpdir(), "pi-subagents-cgroup-check-")));
-const primitiveState: string = state;
 let root: string | undefined;
 
 try {
@@ -29,5 +28,5 @@ try {
   process.stderr.write("cgroup-v2 containment unavailable: cgroup-v2\n");
   process.exitCode = 1;
 } finally {
-  rmSync(primitiveState, { recursive: true, force: true });
+  rmSync(state, { recursive: true, force: true });
 }

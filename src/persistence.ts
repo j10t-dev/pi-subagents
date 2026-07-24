@@ -27,6 +27,7 @@ import {
   runId as brandRunId,
   sessionEntryId,
   modelId,
+  observedCgroupScopePath,
   providerId,
   toolName,
   utf8Bytes,
@@ -119,7 +120,7 @@ export function decodeAgentEvent(value: unknown, stateRoot: AbsolutePath): Decod
         ...common,
         containment: {
           backend: dto.payload.containment.backend,
-          scopePath: absolutePath(dto.payload.containment.scopePath),
+          scopePath: observedCgroupScopePath(absolutePath(dto.payload.containment.scopePath)),
         },
       };
       return { schemaVersion: 2, eventType: dto.eventType, payload };

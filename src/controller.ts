@@ -20,6 +20,7 @@ import {
   type RunAttemptId,
   verifiedContainmentReceiptPath,
   isPublicPreflightError,
+  truncateUtf8,
 } from "./domain.ts";
 import type { EffectiveChildSelection } from "./child-selection.ts";
 import { RunController, classifyTerminal, type RunRecord, type RunRuntime, type Settlement, type StopResult } from "./run-controller.ts";
@@ -27,7 +28,12 @@ import { foldAgentEvents } from "./persistence.ts";
 import type { RpcRunClient } from "./rpc-client.ts";
 import { classifyAssignmentEntries } from "./assignment-identity.ts";
 import { delayWithAbort, waitWithAbort } from "./async-primitives.ts";
-import { ASSIGNMENT_IDENTITY_POLL_MS, ASSIGNMENT_IDENTITY_TIMEOUT_MS, DEFAULT_MAX_CONCURRENT_RUNS } from "./constants.ts";
+import {
+  ASSIGNMENT_IDENTITY_POLL_MS,
+  ASSIGNMENT_IDENTITY_TIMEOUT_MS,
+  DEFAULT_MAX_CONCURRENT_RUNS,
+  MAX_ERROR_MESSAGE_BYTES,
+} from "./constants.ts";
 import type { ContainmentDescriptor } from "./containment.ts";
 import {
   RestorationApplicationError,
@@ -364,7 +370,7 @@ export class SubagentController {
           durableCompletions: this.durableCompletions,
           restoredStartedAppends: this.restoredStartedAppends,
           restoredRecords: this.restoredRecords,
-        });
+        }, (agentIdValue, error) => this.warnCompletionRestoreFailure(agentIdValue, error));
       } catch (error) {
         if (!(error instanceof RestorationApplicationError)) {
           this.stagedRestorePlan = undefined;
@@ -380,7 +386,9 @@ export class SubagentController {
       this.completions.restore(restored.map(completionInventory));
       this.restorationApplied = true;
       this.stagedRestorePlan = undefined;
-      this.restored = true;
+      this.restored = ![...this.restoredRecords.values()].some(
+        (obligation) => obligation.kind === "restore-completion",
+      );
     } finally {
       admission.release();
     }
@@ -638,6 +646,12 @@ export class SubagentController {
 
   private warnContainment(agentIdValue: AgentId): void {
     this.parent?.warn?.(`containment_failed: receipt for agent ${agentIdValue} could not be verified`);
+  }
+
+  private warnCompletionRestoreFailure(agentIdValue: AgentId, error: unknown): void {
+    const detail = error instanceof Error ? error.message : String(error);
+    const warning = `Restored completion for agent ${agentIdValue} remains unavailable: ${detail}`;
+    this.parent?.warn?.(truncateUtf8(warning, MAX_ERROR_MESSAGE_BYTES).text);
   }
 
   private completedRestorationRuntime(

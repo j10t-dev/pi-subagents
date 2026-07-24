@@ -65,11 +65,8 @@ export function observationSnapshotPath(
   if (ownerSessionId.length === 0 || /[/\\]/.test(ownerSessionId) || ownerSessionId === "." || ownerSessionId === "..") {
     throw new Error(`invalid owner session id for snapshot path: ${JSON.stringify(ownerSessionId)}`);
   }
-  const primitiveAgentDir: string = agentDir;
-  const managedRoot = absolutePath(join(primitiveAgentDir, STATE_DIR_NAME));
-  const primitiveManagedRoot: string = managedRoot;
-  const primitiveOwnerSessionId: string = ownerSessionId;
-  const path = absolutePath(join(primitiveManagedRoot, primitiveOwnerSessionId, "ui", "observation-v1.json"));
+  const managedRoot = absolutePath(join(agentDir, STATE_DIR_NAME));
+  const path = absolutePath(join(managedRoot, ownerSessionId, "ui", "observation-v1.json"));
   if (!isContainedPath(managedRoot, path)) {
     throw new Error(`invalid owner session id for snapshot path: ${JSON.stringify(ownerSessionId)}`);
   }
@@ -117,8 +114,7 @@ function readOne(agentDir: AbsolutePath, sessionId: AgentId): ReadOutcome {
   // been written yet, and a containment error once something has — different facts, so report them
   // as different reasons.
   try {
-    const primitiveAgentDir: string = agentDir;
-    realContainedPath(join(primitiveAgentDir, STATE_DIR_NAME), path);
+    realContainedPath(join(agentDir, STATE_DIR_NAME), path);
   } catch (error) {
     return { ok: false, reason: isMissing(error) ? "missing" : "escapes-managed-root" };
   }
@@ -145,12 +141,11 @@ function readOne(agentDir: AbsolutePath, sessionId: AgentId): ReadOutcome {
 function readBounded(path: ObservationSnapshotPath): BoundedRead {
   let fd = -1;
   try {
-    const primitivePath: string = path;
     // O_NOFOLLOW closes the TOCTOU gap after the realpath containment check: if the final component
     // is swapped for a symlink between check and open, the open fails (ELOOP) rather than following
     // it. O_NONBLOCK stops a FIFO planted at the path (the slot directory is written by a same-user
     // child) from blocking open(2) forever waiting for a writer; it is a no-op for a regular file.
-    fd = openSync(primitivePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     // Only regular files are snapshots. FIFOs, devices and directories are refused rather than read
     // from, since a non-regular file can block or stream indefinitely.
     if (!fstatSync(fd).isFile()) return { ok: false, reason: "not-a-regular-file" };

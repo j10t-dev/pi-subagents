@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  AgentEventType, AgentState, RestorationActionType, agentId, modelId,
+  AgentEventType, AgentState, RestorationActionType, agentId, modelId, observedCgroupScopePath,
   utf8Bytes, type CommittedOutputPath, type ModelId, type OutputPath, type ProviderId,
   type RunCompletedPayload, type RunLaunchRequestedPayload, type RunStartedPayload,
   type RunStoppingPayload, type SpawnedPayload, type ToolName,
@@ -38,6 +38,10 @@ const OUTPUT_PATH = `${STATE_ROOT}/output/${RUN}.committed`;
 const descriptor = {
   backend: "cgroup-v2" as const,
   scopePath: "/tmp/pi-subagents/cgroups/parent/attempt",
+};
+const restoredDescriptor: RestorationContainmentDescriptor = {
+  ...descriptor,
+  scopePath: observedCgroupScopePath(absolutePath(descriptor.scopePath)),
 };
 const launchV2 = {
   schemaVersion: 2,
@@ -162,7 +166,7 @@ function spawnedPayload(id = AGENT): SpawnedPayload {
 }
 
 function launchPayload(id = AGENT, attempt = ATTEMPT): RestorationRunLaunchRequestedPayloadV2 {
-  return { agentId: testAgentId(id), previousLeafId: null, attemptId: testAttemptId(attempt), containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH), containment: { ...descriptor, scopePath: absolutePath(descriptor.scopePath) } };
+  return { agentId: testAgentId(id), previousLeafId: null, attemptId: testAttemptId(attempt), containmentReceiptPath: containmentReceiptPath(STATE_ROOT, RECEIPT_PATH), containment: restoredDescriptor };
 }
 
 function liveLaunchPayload(id = AGENT, attempt = ATTEMPT): RunLaunchRequestedPayload {
@@ -460,17 +464,17 @@ describe("foldAgentEvents", () => {
     const firstRecord = first.agents.get(agentId(AGENT));
     const pending = firstRecord?.state === AgentState.Stopped ? firstRecord.pendingLaunch?.payload : undefined;
     expect(pending !== undefined && "containment" in pending ? pending.containment : undefined)
-      .toEqual({ ...descriptor, scopePath: absolutePath(descriptor.scopePath) });
+      .toEqual(restoredDescriptor);
 
     const running = foldAgentEvents([spawnedEntry(), launchV2Entry(), startedEntry()]);
     const runningRecord = running.agents.get(agentId(AGENT));
     expect(runningRecord?.state === AgentState.Stopped ? runningRecord.pendingLaunch : undefined).toBeUndefined();
     expect(runningRecord?.state === AgentState.Running ? runningRecord.run.containment : undefined)
-      .toEqual({ ...descriptor, scopePath: absolutePath(descriptor.scopePath) });
+      .toEqual(restoredDescriptor);
 
     const completed = foldAgentEvents([spawnedEntry(), launchV2Entry(), startedEntry(), completedEntry()]);
     expect(completed.agents.get(agentId(AGENT))?.completion?.containment)
-      .toEqual({ ...descriptor, scopePath: absolutePath(descriptor.scopePath) });
+      .toEqual(restoredDescriptor);
 
     const later = foldAgentEvents([
       spawnedEntry(), launchV2Entry(), startedEntry(), completedEntry(), launchEntry(AGENT, "attempt-2"),

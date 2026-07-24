@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { runtimeEvidenceLine } from "./b0-orchestration.ts";
+import { detectPiRuntime, piExecutable } from "./pi-runtime-target.ts";
 import { assertOrdered, encodeKey, type FocusMechanism } from "./focus-spike-protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -106,8 +108,10 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, resultFile: 
 
 async function main(): Promise<void> {
   const mode = (argValue("--mode", "primary") === "fallback" ? "fallback" : "primary") as FocusMechanism;
+  const target = detectPiRuntime(piExecutable(argValue("--pi", "pi")));
+  console.log(runtimeEvidenceLine(target.detectedVersion));
   const piCommand = [
-    "pi", "-e", FIXTURE, "--no-extensions",
+    target.executable, "-e", FIXTURE, "--no-extensions",
     "--no-session", "--offline", "--no-context-files", "--no-skills",
     "--no-prompt-templates", "--no-themes", "--approve",
   ];

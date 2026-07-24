@@ -194,12 +194,11 @@ export class CompletionService {
       } else {
         options.signal?.addEventListener("abort", onAbort, { once: true });
         if (options.timeoutMs !== undefined) {
-          const primitiveTimeout: number = options.timeoutMs;
           timer = setTimeout(() => {
             void this.finishWaitLocked(waiter, () => {
               finish({ completions: [], agents: this.snapshotAgentsLocked(), timedOut: true });
             });
-          }, primitiveTimeout);
+          }, options.timeoutMs);
         }
       }
     }

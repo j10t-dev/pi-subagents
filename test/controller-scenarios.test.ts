@@ -18,6 +18,7 @@ import {
   createRunAttemptId,
   delegationDepth,
   modelSpec,
+  observedCgroupScopePath,
   runCapacity,
   runId,
   truncateUtf8,
@@ -426,7 +427,10 @@ describe("controller orchestration scenarios", () => {
           expect(captured?.effectiveTools).toEqual([testToolName("read")]);
           return deterministicLaunch(
             prepared.runtime,
-            prepared.attempt.proveRuntimeDescriptor(prepared.attempt.candidate),
+            prepared.attempt.proveRuntimeDescriptor({
+              ...prepared.attempt.candidate,
+              scopePath: observedCgroupScopePath(prepared.attempt.candidate.scopePath),
+            }),
           );
         },
         constructLaunch: async () => {

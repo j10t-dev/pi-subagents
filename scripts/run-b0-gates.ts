@@ -17,7 +17,7 @@ import { detectGlobalPi } from "./pi-runtime-target.ts";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function runSpike(script: string, args: readonly string[]): SpikeExecution {
-  return spikeExecutionFromResult(spawnSync("bun", [join(HERE, script), ...args], {
+  return spikeExecutionFromResult(spawnSync("bun", [join(HERE, script), "--pi", target.executable, ...args], {
     encoding: "utf-8",
     timeout: 90_000,
   }));
@@ -26,7 +26,7 @@ function runSpike(script: string, args: readonly string[]): SpikeExecution {
 const target = detectGlobalPi();
 
 function rawOutcome(execution: SpikeExecution): RawOutcome {
-  return { detectedVersion: target.detectedVersion, line: execution.output };
+  return { detectedVersion: execution.detectedVersion ?? null, output: execution.output };
 }
 
 const primary = runSpike("run-focus-spike.ts", ["--mode", "primary"]);

@@ -5,7 +5,12 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { resolveCgroupV2Backend, type CgroupFileSystem } from "../src/cgroup-v2.ts";
-import type { AbsolutePath, ContainmentReceiptPath, RunAttemptId } from "../src/domain.ts";
+import type {
+  AbsolutePath,
+  ContainmentReceiptPath,
+  ObservedCgroupScopePath,
+  RunAttemptId,
+} from "../src/domain.ts";
 import { agentId, createRunAttemptId } from "../src/domain.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
@@ -55,7 +60,8 @@ describe("abrupt controller restoration matrix", () => {
       if (child.stdout === null) throw new Error("production abrupt-controller fixture stdout unavailable");
       report = await nextJson(child.stdout);
       expect(existsSync(persistedDescriptorPath)).toBeTrue();
-      expect(report.descriptor).toEqual({ backend: "cgroup-v2", scopePath: scope });
+      expect(report.descriptor?.backend).toBe("cgroup-v2");
+      expect(report.descriptor?.scopePath as string).toBe(scope);
       expect(typeof report.launcherPid).toBe("number");
       expect(typeof report.piPid).toBe("number");
       const treePids = await waitForTreePids(treePath);
@@ -142,7 +148,8 @@ describe("abrupt controller restoration matrix", () => {
       else {
         const descriptor = report.descriptor;
         if (descriptor === undefined) throw new Error("post-descriptor phase omitted descriptor");
-        expect(descriptor).toEqual({ backend: "cgroup-v2", scopePath: scope });
+        expect(descriptor.backend).toBe("cgroup-v2");
+        expect(descriptor.scopePath as string).toBe(scope);
         if (phase === "after-launcher-membership-before-pi-spawn" || phase === "after-pi-spawn-with-descendants") {
           expect(report.launcherPid).toEqual(expect.any(Number));
         }
@@ -178,7 +185,7 @@ interface AbruptReport {
   readonly watchdogPid: number;
   readonly launcherPid: number | null;
   readonly piPid: number | null;
-  readonly descriptor?: { readonly backend: "cgroup-v2"; readonly scopePath: AbsolutePath };
+  readonly descriptor?: { readonly backend: "cgroup-v2"; readonly scopePath: ObservedCgroupScopePath };
 }
 
 function nextJson(stream: NodeJS.ReadableStream): Promise<AbruptReport> {
@@ -287,7 +294,8 @@ function isAbruptReport(value: unknown): value is AbruptReport {
   if (report.descriptor === undefined) return true;
   if (typeof report.descriptor !== "object" || report.descriptor === null) return false;
   const descriptor = report.descriptor as Record<string, unknown>;
-  return descriptor.backend === "cgroup-v2" && typeof descriptor.scopePath === "string" && descriptor.scopePath.startsWith("/");
+  return descriptor.backend === "cgroup-v2" && typeof descriptor.scopePath === "string" &&
+    descriptor.scopePath.startsWith("/") && !descriptor.scopePath.includes("\0");
 }
 
 class RestorationFs implements CgroupFileSystem {

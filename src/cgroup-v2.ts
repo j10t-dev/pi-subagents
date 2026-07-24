@@ -78,8 +78,7 @@ export interface CgroupV2Options {
 }
 
 export function cgroupScopeName(value: AgentId | RunAttemptId): string {
-  const primitiveIdentity: string = value;
-  return createHash("sha256").update(primitiveIdentity).digest("hex");
+  return createHash("sha256").update(value).digest("hex");
 }
 
 export function resolveCgroupV2Backend(options: CgroupV2Options): ContainmentBackend {
@@ -145,8 +144,7 @@ class CgroupV2Backend implements ContainmentBackend {
 
   async preflight(): Promise<void> {
     const name = `preflight-${(this.options.randomBytes ?? nodeRandomBytes)(16).toString("hex")}`;
-    const primitiveParentScope: string = this.parentScope;
-    const scope = join(primitiveParentScope, name);
+    const scope = join(this.parentScope, name);
     let scopeCreated = false;
     let probe: ProbeProcess | undefined;
     try {
@@ -154,8 +152,7 @@ class CgroupV2Backend implements ContainmentBackend {
       scopeCreated = true;
       probe = (this.options.spawnProbe ?? defaultProbe)();
       filesystemOperation("probe process move", () => {
-        const primitivePid: number = probe!.pid;
-        this.fs.writeFile(join(scope, "cgroup.procs"), `${primitivePid}\n`);
+        this.fs.writeFile(join(scope, "cgroup.procs"), `${probe!.pid}\n`);
       });
       const members = filesystemOperation(
         "probe membership",
@@ -186,8 +183,7 @@ class CgroupV2Backend implements ContainmentBackend {
     assertContained(this.root, this.parentScope, "parent scope");
     const existing = this.attempts.get(attemptId);
     if (existing !== undefined) return existing;
-    const primitiveParentScope: string = this.parentScope;
-    const scope = absolutePath(join(primitiveParentScope, cgroupScopeName(attemptId)));
+    const scope = absolutePath(join(this.parentScope, cgroupScopeName(attemptId)));
     assertContained(this.parentScope, scope, "attempt path");
     const attempt = new CgroupAttempt(this, attemptId, scope);
     this.attempts.set(attemptId, attempt);
@@ -198,8 +194,7 @@ class CgroupV2Backend implements ContainmentBackend {
     attemptId: RunAttemptId,
     descriptor: RestorationContainmentDescriptor,
   ): ContainmentAttempt {
-    const primitiveParentScope: string = this.parentScope;
-    const expected = absolutePath(join(primitiveParentScope, cgroupScopeName(attemptId)));
+    const expected = absolutePath(join(this.parentScope, cgroupScopeName(attemptId)));
     if (descriptor.backend !== "cgroup-v2" || descriptor.scopePath !== expected) {
       unavailable("attempt descriptor");
     }
@@ -267,15 +262,13 @@ class CgroupV2Backend implements ContainmentBackend {
 
   publishReceipt(attempt: CgroupAttempt, outcome: ContainmentOutcome): VerifiedContainmentReceiptPath {
     const receiptPath = this.options.receiptPathFor(attempt.attemptId);
-    const primitiveAttemptId: string = attempt.attemptId;
-    const primitiveScopePath: string = attempt.candidate.scopePath;
     publishCommittedSync({
       destination: receiptPath,
       data: JSON.stringify({
         version: 2,
-        attemptId: primitiveAttemptId,
+        attemptId: attempt.attemptId,
         backend: "cgroup-v2",
-        scopePath: primitiveScopePath,
+        scopePath: attempt.candidate.scopePath,
         outcome,
         timestamp: new Date((this.options.now ?? Date.now)()).toISOString(),
         populated: false,
@@ -597,8 +590,7 @@ function bestEffort(operation: () => void): void {
 }
 
 function delay(milliseconds: Milliseconds): Promise<void> {
-  const primitiveMilliseconds: number = milliseconds;
-  return new Promise((done) => setTimeout(done, primitiveMilliseconds));
+  return new Promise((done) => setTimeout(done, milliseconds));
 }
 
 function defaultProbe(): ProbeProcess {

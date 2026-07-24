@@ -149,8 +149,7 @@ describe("loadSubagentSettings", () => {
       projectTrusted: true,
     });
     const cgroupRoot: AbsolutePath | undefined = configured.value.cgroupRoot;
-    const primitiveCgroupRoot: string | undefined = cgroupRoot;
-    expect(primitiveCgroupRoot).toBe("/sys/fs/cgroup/delegated");
+    expect(String(cgroupRoot)).toBe("/sys/fs/cgroup/delegated");
     expect(configured.value).toEqual({
       maxConcurrentRuns: runCapacity(1),
       maxDepth: delegationDepth(1),

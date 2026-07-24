@@ -231,6 +231,7 @@ export async function applyRestoration(
   admission: RestoreAdmission,
   port: RestorationPort,
   state: RestorationApplicationState,
+  onCompletionRestoreFailure?: (agentId: AgentId, error: unknown) => void,
 ): Promise<AppliedAgentRecord[]> {
   admission.reserve(plan.runtimeRecords);
   const runtimeRecords = new Map(plan.runtimeRecords.map((record) => [record.agentId, record]));
@@ -257,10 +258,18 @@ export async function applyRestoration(
       const completionCandidate = candidate.completion;
       const key = agentRunKey(candidate.agentId, completionCandidate.payload.runId);
       state.durableCompletions.delete(key);
-      const completion = await port.restoreCompletion({
-        ...candidate,
-        completion: completionCandidate,
-      });
+      let completion: AgentCompletion;
+      try {
+        completion = await port.restoreCompletion({
+          ...candidate,
+          completion: completionCandidate,
+        });
+      } catch (error) {
+        try {
+          onCompletionRestoreFailure?.(candidate.agentId, error);
+        } catch { /* diagnostics cannot widen one agent's restoration failure */ }
+        continue;
+      }
       state.durableCompletions.set(key, completion);
       restored[index] = {
         ...withoutCandidateCompletion(candidate),
@@ -298,7 +307,11 @@ export async function applyRestoration(
     for (const record of restored) {
       const obligation = plan.obligations.get(record.agentId);
       if (record.state === AgentState.Stopped) {
-        state.restoredRecords.delete(record.agentId);
+        if (obligation?.kind === "restore-completion" && unappliedObligations.has(record.agentId)) {
+          state.restoredRecords.set(record.agentId, obligation);
+        } else {
+          state.restoredRecords.delete(record.agentId);
+        }
       } else if (obligation !== undefined) {
         state.restoredRecords.set(record.agentId, obligation);
       }

@@ -6,17 +6,26 @@ import { describe, expect, test } from "bun:test";
 import {
   focusResult,
   relayResult,
+  runtimeEvidenceLine,
   spikeExecutionFromResult,
   type SpikeProcessResult,
 } from "../scripts/b0-orchestration.ts";
 import { evaluateB0Report, type B0Report } from "../scripts/b0-report.ts";
-import { detectGlobalPi, type PiVersionProbeResult } from "../scripts/pi-runtime-target.ts";
+import {
+  detectGlobalPi,
+  detectedPiVersion,
+  piExecutable,
+  type PiVersionProbeResult,
+} from "../scripts/pi-runtime-target.ts";
 
-test("active B0 scripts contain no local CLI fallback or version-selection flag", () => {
-  for (const file of ["run-b0-gates.ts", "run-focus-spike.ts", "run-relay-spike.ts"]) {
+test("active B0 spikes receive the selected Pi executable without a local fallback", () => {
+  const gateSource = readFileSync(join(import.meta.dir, "..", "scripts", "run-b0-gates.ts"), "utf-8");
+  expect(gateSource).not.toContain("LOCAL_CLI");
+  expect(gateSource).toContain('"--pi", target.executable');
+  for (const file of ["run-focus-spike.ts", "run-relay-spike.ts"]) {
     const source = readFileSync(join(import.meta.dir, "..", "scripts", file), "utf-8");
     expect(source).not.toContain("LOCAL_CLI");
-    expect(source).not.toContain('argValue("--pi"');
+    expect(source).toContain('argValue("--pi"');
   }
 });
 
@@ -36,6 +45,22 @@ test("a non-zero spike cannot supply supported evidence", () => {
     stdout: "FOCUS_TRANSFER_PRIMARY_SUPPORTED",
   }));
   expect(focusResult(execution, "primary")).toBe("not-run");
+});
+
+test("spike execution carries the runtime version reported by the spike", () => {
+  const version = detectedPiVersion("pi test-current");
+  const execution = spikeExecutionFromResult(processResult({
+    stdout: `${runtimeEvidenceLine(version)}\nRPC_RELAY_SUPPORTED revision=1\n`,
+  }));
+  expect(execution.detectedVersion).toBe(version);
+});
+
+test.each([
+  "RPC_RELAY_SUPPORTED revision=1\n",
+  'PI_RUNTIME_VERSION "pi one"\nPI_RUNTIME_VERSION "pi two"\nRPC_RELAY_SUPPORTED revision=1\n',
+  "PI_RUNTIME_VERSION not-json\nRPC_RELAY_SUPPORTED revision=1\n",
+])("missing, duplicate, or malformed runtime evidence remains unproven", (stdout) => {
+  expect(spikeExecutionFromResult(processResult({ stdout })).detectedVersion).toBeUndefined();
 });
 
 test.each([
@@ -172,9 +197,9 @@ function report(overrides: Partial<B0Report["gates"]> = {}): B0Report {
     detectedVersion,
     gates,
     raw: {
-      focusPrimary: { detectedVersion, line: `FOCUS_TRANSFER_PRIMARY_${gates.focusPrimary.toUpperCase()}` },
-      focusFallback: { detectedVersion, line: `FOCUS_TRANSFER_FALLBACK_${gates.focusFallback.toUpperCase()}` },
-      rpcRelay: { detectedVersion, line: `RPC_RELAY_${gates.rpcRelay.toUpperCase()}` },
+      focusPrimary: { detectedVersion, output: `FOCUS_TRANSFER_PRIMARY_${gates.focusPrimary.toUpperCase()}` },
+      focusFallback: { detectedVersion, output: `FOCUS_TRANSFER_FALLBACK_${gates.focusFallback.toUpperCase()}` },
+      rpcRelay: { detectedVersion, output: `RPC_RELAY_${gates.rpcRelay.toUpperCase()}` },
     },
   };
 }
@@ -201,7 +226,7 @@ describe("B0 latest-runtime report", () => {
       ...value,
       raw: {
         ...value.raw,
-        rpcRelay: { ...value.raw.rpcRelay, detectedVersion: "pi other-runtime" as B0Report["detectedVersion"] },
+        rpcRelay: { ...value.raw.rpcRelay, detectedVersion: detectedPiVersion("pi other-runtime") },
       },
     };
     expect(evaluateB0Report(mismatched)).toEqual({
@@ -209,4 +234,21 @@ describe("B0 latest-runtime report", () => {
       blockers: ["RPC relay evidence runtime does not match pi test-current"],
     });
   });
+
+  test("rejects a gate whose spike did not report its runtime", () => {
+    const value = report();
+    expect(evaluateB0Report({
+      ...value,
+      raw: { ...value.raw, rpcRelay: { ...value.raw.rpcRelay, detectedVersion: null } },
+    })).toEqual({
+      decision: "stop",
+      blockers: ["RPC relay evidence runtime does not match pi test-current"],
+    });
+  });
+});
+
+test("Pi executable identities reject empty or NUL-containing values", () => {
+  expect(piExecutable("pi") as string).toBe("pi");
+  expect(() => piExecutable("")).toThrow(/Pi executable/);
+  expect(() => piExecutable("pi\0other")).toThrow(/Pi executable/);
 });

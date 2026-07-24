@@ -54,8 +54,9 @@ export interface EffectiveChildSelection {
 
 export function resolveChildSelection(input: ChildSelectionInput): EffectiveChildSelection {
   const parentModel = projectNativeModel(input.parentModel);
-  const models = input.modelRegistry.getAll().map(projectNativeModel);
-  const selection = selectModel(input, parentModel, models);
+  const catalogue = input.requestedModel === undefined ? [] : input.modelRegistry.getAll();
+  const models = catalogue.flatMap((model) => projectCatalogueModel(model) ?? []);
+  const selection = selectModel(input, parentModel, models, catalogue.length - models.length);
   const activeTools = input.parentActiveTools.map(toolName);
   const tools = selectTools(input.requestedTools, activeTools, input.allowLifecycleTools);
   return Object.freeze({ ...selection, tools });
@@ -90,6 +91,7 @@ function selectModel(
   input: ChildSelectionInput,
   parentModel: BrandedNativeModel,
   models: readonly BrandedNativeModel[],
+  skippedModels: number,
 ): Pick<EffectiveChildSelection, "model" | "thinkingLevel" | "warning"> {
   if (input.requestedModel === undefined) {
     return {
@@ -103,7 +105,7 @@ function selectModel(
     models,
     parentModel.provider,
   );
-  if (resolved === undefined) throw unavailableModel(input.requestedModel);
+  if (resolved === undefined) throw unavailableModel(input.requestedModel, skippedModels);
   return {
     model: resolved.model,
     thinkingLevel: resolved.thinkingLevel ?? input.parentThinking,
@@ -207,6 +209,14 @@ function projectNativeModel(model: NativeModel): BrandedNativeModel {
   return { ...model, provider: providerId(model.provider), id: modelId(model.id) };
 }
 
+function projectCatalogueModel(model: NativeModel): BrandedNativeModel | undefined {
+  try {
+    return projectNativeModel(model);
+  } catch {
+    return undefined;
+  }
+}
+
 function modelReference(model: BrandedNativeModel): ModelSpec {
   return modelSpecFrom(model.provider, model.id);
 }
@@ -234,10 +244,11 @@ function selectTools(
   const eligible = filterLifecycleTools(parentActiveTools, allowLifecycleTools);
   if (requestedTools === undefined) return Object.freeze([...eligible]);
 
+  const eligibleByName = new Map<string, ToolName>(eligible.map((tool) => [tool, tool]));
   const selected: ToolName[] = [];
   const unavailable: string[] = [];
   for (const requested of new Set(requestedTools)) {
-    const activeMember = eligible.find((tool) => tool === requested);
+    const activeMember = eligibleByName.get(requested);
     if (activeMember === undefined) unavailable.push(requested);
     else selected.push(activeMember);
   }
@@ -245,12 +256,15 @@ function selectTools(
   return Object.freeze(selected);
 }
 
-function unavailableModel(pattern: string): PublicPreflightError {
+function unavailableModel(pattern: string, skippedModels: number): PublicPreflightError {
   const projected = diagnosticText(pattern, "model");
-  const message = projected === undefined
+  const base = projected === undefined
     ? "supplied model pattern is unavailable; use a printable Pi model identifier"
     : `model pattern "${projected}" is unavailable; use a configured Pi model identifier`;
-  return new PublicPreflightError(AgentErrorCode.ModelUnavailable, message);
+  const skipped = skippedModels === 0
+    ? ""
+    : `; ignored ${skippedModels} invalid configured model ${skippedModels === 1 ? "entry" : "entries"}`;
+  return new PublicPreflightError(AgentErrorCode.ModelUnavailable, `${base}${skipped}`);
 }
 
 function unavailableTools(tools: readonly string[]): PublicPreflightError {

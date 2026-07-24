@@ -174,13 +174,18 @@ describe("parent lifecycle wiring", () => {
         },
       });
       const pings: string[] = [];
+      const warnings: string[] = [];
       const c = new SubagentController({ restoration, parent: {
         isBusy: () => false,
         sendMessage: async (text) => { pings.push(text); },
+        warn: (message) => { warnings.push(message); },
       } });
 
-      await expect(c.restore()).rejects.toThrow("output proof unavailable");
+      await expect(c.restore()).resolves.toBeUndefined();
       expect((await c.receive()).completions).toEqual([]);
+      expect(warnings).toEqual([
+        `Restored completion for agent ${testAgentId()} remains unavailable: output proof unavailable`,
+      ]);
 
       await expect(c.restore()).resolves.toBeUndefined();
       expect(proofAttempts).toBe(2);
@@ -252,7 +257,7 @@ describe("parent lifecycle wiring", () => {
       });
       const c = new SubagentController({ restoration });
 
-      await expect(c.restore()).rejects.toThrow("B output proof unavailable");
+      await expect(c.restore()).resolves.toBeUndefined();
       expect(proofAttempts).toEqual([agentA, agentB]);
       expect(readFileSync(committedA, "utf8")).toBe("reconstructed A");
       expect(c.status()).toBe("agents: 0 running, 1 result ready");

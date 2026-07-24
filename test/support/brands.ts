@@ -1,14 +1,15 @@
 import {
   agentId, delegationDepth, milliseconds, modelId, modelSpec, observationRevision, processCount,
   processGroupId, processId, providerId, rpcRequestId, runAttemptId, runCapacity, runId,
-  sessionEntryId, toolName, uiRequestId,
+  observedCgroupScopePath, sessionEntryId, toolName, uiRequestId,
   utf16CodeUnitOffset, utf8Bytes, verifiedContainmentReceiptPath,
   type AbsolutePath, type AgentId, type CommittedOutputPath,
   type ContainmentReceiptPath, type ModelId, type ModelSpec, type Milliseconds,
   type DelegationDepth, type ObservationRevision, type OutputPath, type ProcessCount,
   type ProcessGroupId, type ProcessId, type ProviderId, type RpcRequestId, type RunAttemptId,
   type RunCapacity, type RunId, type SessionEntryId,
-  type SessionPath, type ToolName, type UIRequestId, type Utf16CodeUnitOffset, type Utf8Bytes,
+  type ObservedCgroupScopePath, type SessionPath, type ToolName, type UIRequestId,
+  type Utf16CodeUnitOffset, type Utf8Bytes,
   type VerifiedContainmentReceiptPath,
 } from "../../src/domain.ts";
 import {
@@ -44,6 +45,8 @@ export const testProcessId = (value: number): ProcessId => processId(value);
 export const testProcessGroupId = (value: number): ProcessGroupId => processGroupId(value);
 export const testObservationRevision = (value: number): ObservationRevision => observationRevision(value);
 export const testAbsolutePath = (value: string): AbsolutePath => absolutePath(value);
+export const testObservedCgroupScopePath = (value: string): ObservedCgroupScopePath =>
+  observedCgroupScopePath(absolutePath(value));
 
 /**
  * Runs the production cgroup proof operation against a deterministic canonical filesystem.
@@ -78,7 +81,10 @@ export function testContainmentAttempt(
     receiptPathFor: (id) => testReceiptPath(`${TEST_ROOT}/receipts/${id}.json`),
   }).prepareAttempt(attemptId);
   directories.add(attempt.candidate.scopePath);
-  const descriptor = attempt.proveRuntimeDescriptor(attempt.candidate);
+  const descriptor = attempt.proveRuntimeDescriptor({
+    ...attempt.candidate,
+    scopePath: observedCgroupScopePath(attempt.candidate.scopePath),
+  });
   return Object.assign(attempt, { descriptor });
 }
 

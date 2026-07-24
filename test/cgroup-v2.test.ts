@@ -9,7 +9,14 @@ import {
   type CgroupV2Options,
   type ProbeProcess,
 } from "../src/cgroup-v2.ts";
-import { agentId, processId, PublicPreflightError, runAttemptId, verifiedContainmentReceiptPath } from "../src/domain.ts";
+import {
+  agentId,
+  observedCgroupScopePath,
+  processId,
+  PublicPreflightError,
+  runAttemptId,
+  verifiedContainmentReceiptPath,
+} from "../src/domain.ts";
 import type { AbsolutePath, CgroupScopePath } from "../src/domain.ts";
 import type { ContainmentDescriptor, RestorationContainmentDescriptor } from "../src/containment.ts";
 import { absolutePath, containmentReceiptPath } from "../src/paths.ts";
@@ -23,6 +30,10 @@ const PARENT = `${ROOT}/${cgroupScopeName(PARENT_ID)}`;
 const ATTEMPT_ID = runAttemptId("attempt-1");
 const ATTEMPT = `${PARENT}/${cgroupScopeName(ATTEMPT_ID)}`;
 const PREFLIGHT = `${PARENT}/preflight-00112233445566778899aabbccddeeff`;
+
+function runtimeDescriptor(path = ATTEMPT): RestorationContainmentDescriptor {
+  return { backend: "cgroup-v2", scopePath: observedCgroupScopePath(absolutePath(path)) };
+}
 const RAW_PARENT_ID: string = PARENT_ID;
 // @ts-expect-error raw strings must be validated before cgroup parent identity construction.
 const _scopeFromRawParent = cgroupScopeName(RAW_PARENT_ID);
@@ -199,17 +210,20 @@ describe("cgroup-v2", () => {
     const first = resolved.prepareAttempt(ATTEMPT_ID);
     const second = resolved.prepareAttempt(ATTEMPT_ID);
     const candidateScope: AbsolutePath = first.candidate.scopePath;
+    // @ts-expect-error lexical preparation is not observed runtime evidence.
+    const _candidateAsObserved: RestorationContainmentDescriptor = first.candidate;
     // @ts-expect-error lexical preparation cannot produce a live canonical cgroup proof.
     const _candidateAsProven: CgroupScopePath = first.candidate.scopePath;
+    void _candidateAsObserved;
     void _candidateAsProven;
     expect(first).toBe(second);
     expect(JSON.parse(JSON.stringify(first.candidate))).toEqual({ backend: "cgroup-v2", scopePath: ATTEMPT });
     expect(fs.trace).toEqual([]);
     expect(fs.directories.has(ATTEMPT)).toBeFalse();
-    expect(() => first.proveRuntimeDescriptor(first.candidate)).toThrow(/^containment_unavailable:attempt scope/);
+    expect(() => first.proveRuntimeDescriptor(runtimeDescriptor())).toThrow(/^containment_unavailable:attempt scope/);
 
     fs.addDirectory(candidateScope);
-    const proven: ContainmentDescriptor = first.proveRuntimeDescriptor(first.candidate);
+    const proven: ContainmentDescriptor = first.proveRuntimeDescriptor(runtimeDescriptor());
     expect(proven.backend).toBe("cgroup-v2");
     expect(String(proven.scopePath)).toBe(candidateScope);
   });
@@ -224,14 +238,14 @@ describe("cgroup-v2", () => {
     fs.addDirectory(ATTEMPT);
     fs.reals.set(ATTEMPT, canonicalScope);
 
-    expect(() => attempt.proveRuntimeDescriptor(attempt.candidate))
+    expect(() => attempt.proveRuntimeDescriptor(runtimeDescriptor()))
       .toThrow(/^containment_unavailable:attempt scope/);
   });
 
   test("restore validates backend, exact identity and extant canonical containment without minting live proof", () => {
     const fs = baseFs();
     const resolved = backend(fs);
-    const stored: RestorationContainmentDescriptor = resolved.prepareAttempt(ATTEMPT_ID).candidate;
+    const stored = runtimeDescriptor();
     const restored = resolved.restoreAttempt(ATTEMPT_ID, stored);
     const candidateScope: AbsolutePath = restored.candidate.scopePath;
     // @ts-expect-error restoration validation alone does not prove a live cgroup scope.
@@ -239,7 +253,7 @@ describe("cgroup-v2", () => {
     void _restoredAsLive;
     expect(candidateScope).toBe(stored.scopePath);
     expect(restored.candidate).toEqual(stored);
-    expect(() => resolved.restoreAttempt(ATTEMPT_ID, { ...stored, scopePath: absolutePath(`${ATTEMPT}-wrong`) }))
+    expect(() => resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor(`${ATTEMPT}-wrong`)))
       .toThrow(/^containment_unavailable:attempt descriptor/);
     const malformedDescriptor: RestorationContainmentDescriptor = { ...stored };
     Reflect.set(malformedDescriptor, "backend", "other");
@@ -313,7 +327,7 @@ describe("cgroup-v2", () => {
   test("absence without matching durable proof never proves cleanup", async () => {
     const fs = baseFs();
     const resolved = backend(fs);
-    const attempt = resolved.restoreAttempt(ATTEMPT_ID, { backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    const attempt = resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor());
     await expect(attempt.cleanup()).rejects.toThrow(/^containment_unavailable:missing attempt scope/);
     await expect(attempt.cleanup(verifiedContainmentReceiptPath(containmentReceiptPath("/wrong", "receipt.json"))))
       .rejects.toThrow(/^containment_unavailable:missing attempt scope/);
@@ -373,7 +387,7 @@ describe("cgroup-v2", () => {
     const fs = baseFs();
     const receipt = containmentReceiptPath("/state", "receipt.json");
     const resolved = backend(fs, { receiptPathFor: () => receipt, diagnostic: (message) => fs.diagnostics.push(message) });
-    const attempt = resolved.restoreAttempt(ATTEMPT_ID, { backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    const attempt = resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor());
     const childRoot = `${ATTEMPT}/pi-subagents`;
     const childParent = `${childRoot}/${cgroupScopeName(agentId("child-session"))}`;
     const childAttempt = `${childParent}/${cgroupScopeName(runAttemptId("child-attempt"))}`;
@@ -399,7 +413,7 @@ describe("cgroup-v2", () => {
     const fs = baseFs();
     const receipt = containmentReceiptPath("/state", "receipt.json");
     const resolved = backend(fs, { receiptPathFor: () => receipt, diagnostic: (message) => fs.diagnostics.push(message) });
-    const attempt = resolved.restoreAttempt(ATTEMPT_ID, { backend: "cgroup-v2", scopePath: absolutePath(ATTEMPT) });
+    const attempt = resolved.restoreAttempt(ATTEMPT_ID, runtimeDescriptor());
     fs.addDirectory(ATTEMPT);
     fs.failure = "attempt-remove-once";
     const proof = verifiedContainmentReceiptPath(receipt);

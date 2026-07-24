@@ -3,8 +3,8 @@ import type { DetectedPiVersion, PiExecutable } from "./pi-runtime-target.ts";
 export type GateResult = "supported" | "unsupported" | "not-run";
 
 export interface RawOutcome {
-  readonly detectedVersion: DetectedPiVersion;
-  readonly line: string;
+  readonly detectedVersion: DetectedPiVersion | null;
+  readonly output: string;
 }
 
 export interface B0Report {

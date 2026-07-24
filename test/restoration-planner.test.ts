@@ -27,6 +27,7 @@ import {
   testAttemptId,
   testEntryId,
   testModelId,
+  testObservedCgroupScopePath,
   testProviderId,
   testReceiptPath,
   testRunId,
@@ -46,7 +47,7 @@ const launchFixture: PendingLaunch = {
   payload: {
     agentId: AGENT, previousLeafId: testEntryId("aaaaaaaa"), attemptId: ATTEMPT,
     containmentReceiptPath: testReceiptPath(),
-    containment: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
   },
   eventVersion: 2,
 };
@@ -81,7 +82,7 @@ function completionRecord(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, 
       payload: completedCompletion({ agentId, runId: RUN, transcriptPath: record.sessionPath }),
       receiptPath: testReceiptPath(),
       attemptId: ATTEMPT,
-      containment: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+      containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
       eventVersion: 2,
     },
   };
@@ -95,7 +96,7 @@ function launchRecord(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { st
       payload: {
         agentId, previousLeafId: testEntryId("aaaaaaaa"), attemptId: ATTEMPT,
         containmentReceiptPath: testReceiptPath(),
-        containment: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+        containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
       },
       eventVersion: 2,
     },
@@ -108,7 +109,7 @@ function startedRecord(agentId: AgentId = AGENT): Extract<FoldedAgentRecord, { s
     state: AgentState.Running,
     run: {
       runId: RUN, receiptPath: testReceiptPath(), attemptId: ATTEMPT,
-      containment: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+      containment: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
       eventVersion: 2,
     },
   };
@@ -131,7 +132,7 @@ function launchAction(agentId: AgentId = AGENT): RestorationAction {
     attemptId: ATTEMPT,
     previousLeafId: testEntryId("aaaaaaaa"),
     containmentReceiptPath: testReceiptPath(),
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }
@@ -143,7 +144,7 @@ function startedAction(agentId: AgentId = AGENT): RestorationAction {
     runId: RUN,
     containmentReceiptPath: testReceiptPath(),
     attemptId: ATTEMPT,
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }
@@ -156,7 +157,7 @@ function stoppingAction(agentId: AgentId = AGENT): RestorationAction {
     reason: REASON,
     containmentReceiptPath: testReceiptPath(),
     attemptId: ATTEMPT,
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }
@@ -167,7 +168,7 @@ function completedAction(agentId: AgentId = AGENT): RestorationAction {
     agentId,
     containmentReceiptPath: testReceiptPath(),
     attemptId: ATTEMPT,
-    descriptor: { backend: "cgroup-v2", scopePath: testAbsolutePath("/tmp/cgroup/attempt-1") },
+    descriptor: { backend: "cgroup-v2", scopePath: testObservedCgroupScopePath("/tmp/cgroup/attempt-1") },
     eventVersion: 2,
   };
 }

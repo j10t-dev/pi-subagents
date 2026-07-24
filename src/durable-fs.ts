@@ -5,6 +5,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -22,6 +23,7 @@ export interface DurableFileSystem {
   rename(source: string, destination: string): void;
   unlink(path: string): void;
   readFile(path: string): Buffer;
+  realpath(path: string): string;
 }
 
 export interface CommittedPublication {
@@ -40,6 +42,7 @@ export const systemDurableFileSystem: DurableFileSystem = {
   rename: renameSync,
   unlink: unlinkSync,
   readFile: readFileSync,
+  realpath: realpathSync,
 };
 
 export function ensureDurableDirectorySync(path: string, fs = systemDurableFileSystem): void {

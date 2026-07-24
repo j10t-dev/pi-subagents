@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, existsSync, fstatSync, openSync, readSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -271,7 +271,7 @@ export class OutputStore {
   }
 
   discardPartial(id: RunAttemptId | RunId): void {
-    const attempt = [...this.attempts].find(([attemptId]) => attemptId === id)?.[1];
+    const attempt = getByStringIdentity(this.attempts, id);
     if (attempt !== undefined) {
       if (attempt.finalised) return;
       if (attempt.candidatePath !== undefined) removeIfPresent(attempt.candidatePath);
@@ -281,7 +281,7 @@ export class OutputStore {
       attempt.transportIncomplete = true;
       return;
     }
-    const run = [...this.runs].find(([runId]) => runId === id)?.[1];
+    const run = getByStringIdentity(this.runs, id);
     if (run !== undefined) this.removeCandidate(run);
   }
 
@@ -304,7 +304,8 @@ export class OutputStore {
     transcriptPath: SessionPath,
   ): AgentCompletion {
     const expected = outputPath(this.workDir, `${candidate.runId}.committed`);
-    if (normalisedOutputDestination(candidate.outputPath) !== normalisedOutputDestination(expected)) {
+    if (normalisedOutputDestination(candidate.outputPath, this.durableFileSystem) !==
+        normalisedOutputDestination(expected, this.durableFileSystem)) {
       throw new Error("output_error: restored completion destination does not match its managed output path");
     }
 
@@ -570,12 +571,17 @@ function digest(bytes: Uint8Array): string { return createHash("sha256").update(
 function matches(publication: PublicationEvidence, bytes: Uint8Array): boolean {
   return bytes.byteLength === publication.byteLength && digest(bytes) === publication.digest;
 }
+/** Map lookup is safe across string brands: a mismatched identity simply has no entry. */
+function getByStringIdentity<K extends string, V>(map: ReadonlyMap<K, V>, key: string): V | undefined {
+  return map.get(key as K);
+}
+
 function readIfPresent(path: string, fs: DurableFileSystem): Buffer | undefined {
   try { return fs.readFile(path); } catch { return undefined; }
 }
 
-function normalisedOutputDestination(path: OutputPath): string {
-  return existsSync(path) ? realpathSync(path) : path;
+function normalisedOutputDestination(path: OutputPath, fs: DurableFileSystem): string {
+  return fs.exists(path) ? fs.realpath(path) : path;
 }
 
 function completionEvidenceMatches(

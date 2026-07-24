@@ -327,12 +327,11 @@ class FakeAttempt implements ContainmentAttempt {
   async terminate(outcome: ContainmentOutcome): Promise<VerifiedContainmentReceiptPath> {
     this.terminateCalls++;
     if (this.terminateFailure) throw new Error("parent cgroup kill failed");
-    const primitiveScopePath: string = this.descriptor.scopePath;
-    const primitiveReceiptPath: string = this.receipt;
-    const primitiveAttemptId: string = this.attemptId;
-    if (existsSync(primitiveScopePath)) writeFileSync(join(primitiveScopePath, "cgroup.events"), "populated 0\n");
-    writeFileSync(primitiveReceiptPath, `${JSON.stringify({ version: 2, attemptId: primitiveAttemptId, backend: "cgroup-v2",
-      scopePath: primitiveScopePath, outcome, populated: false, timestamp: new Date().toISOString() })}\n`, { mode: 0o600 });
+    if (existsSync(this.descriptor.scopePath)) {
+      writeFileSync(join(this.descriptor.scopePath, "cgroup.events"), "populated 0\n");
+    }
+    writeFileSync(this.receipt, `${JSON.stringify({ version: 2, attemptId: this.attemptId, backend: "cgroup-v2",
+      scopePath: this.descriptor.scopePath, outcome, populated: false, timestamp: new Date().toISOString() })}\n`, { mode: 0o600 });
     return verifiedContainmentReceiptPath(this.receipt);
   }
 

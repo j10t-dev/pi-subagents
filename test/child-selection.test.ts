@@ -137,6 +137,38 @@ describe("resolveChildSelection", () => {
     expect(resolveChildSelection(selectionInput({ parentThinking: "off" })).thinkingLevel).toBe("off");
   });
 
+  test("does not read the model catalogue when inheriting the parent model", () => {
+    const input = selectionInput();
+    expect(resolveChildSelection({
+      ...input,
+      modelRegistry: { getAll: () => { throw new Error("catalogue must not be read"); } },
+    }).model as string).toBe("mock-provider/luna");
+  });
+
+  test("ignores unusable catalogue entries when resolving an explicit model", () => {
+    const input = selectionInput({ requestedModel: "solar" });
+    expect(resolveChildSelection({
+      ...input,
+      modelRegistry: {
+        getAll: () => [
+          fixtureModel("invalid/provider", "broken", "Invalid"),
+          fixtureModel("second-provider", "solar", "BrightStar"),
+        ],
+      },
+    }).model as string).toBe("second-provider/solar");
+  });
+
+  test("reports the number of unusable catalogue entries when no model resolves", () => {
+    const input = selectionInput({ requestedModel: "broken" });
+    const error = capturePublicError(() => resolveChildSelection({
+      ...input,
+      modelRegistry: {
+        getAll: () => [fixtureModel("invalid/provider", "broken", "Invalid")],
+      },
+    }));
+    expect(error.message).toContain("ignored 1 invalid configured model entry");
+  });
+
   test.each([
     [undefined, ["read", "web_fetch", "spawn_agent"], ["read", "web_fetch"]],
     [["web_fetch", "read", "web_fetch"], ["read", "web_fetch"], ["web_fetch", "read"]],
