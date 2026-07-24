@@ -11,23 +11,23 @@ import {
   modelSpec,
   toolName,
   toAgentError,
-  utf16CodeUnitOffset,
   utf8Bytes,
   codedErrorToAgentError,
   truncateUtf8,
   isPublicPreflightError,
+  agentCount,
   type AgentCompletion,
+  type AgentCount,
   type AgentError,
   type AgentId,
   type AgentUsage,
   type RunId,
-  type Utf16CodeUnitOffset,
   type Utf8Bytes,
 } from "./domain.ts";
 import { AbortError } from "./async-primitives.ts";
-import { MAX_AGGREGATE_RECEIVE_BYTES, MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
+import { MAX_AGGREGATE_AWAIT_BYTES, MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
 import type { PublicStopOutcome, SpawnStartResult, StartResult, SubagentController } from "./controller.ts";
-import type { AgentSummary, ReceiveAgentResult } from "./completion-service.ts";
+import type { AgentSummary, CompletionAwaitResult } from "./completion-service.ts";
 
 export const spawnAgentSchema = Type.Object({
   task: Type.String({ description: "Literal first assignment for the fresh child session." }),
@@ -42,7 +42,7 @@ export const spawnAgentSchema = Type.Object({
   })),
 }, {
   additionalProperties: false,
-  description: "Start a fresh persistent child session asynchronously; collect completion with receive_agent.",
+  description: "Start a fresh persistent child session asynchronously; collect completion with await_agent.",
 });
 export type SpawnAgentInput = Static<typeof spawnAgentSchema>;
 
@@ -52,10 +52,26 @@ export const sendInputSchema = Type.Object({
 }, { additionalProperties: false });
 export type SendInputInput = Static<typeof sendInputSchema>;
 
-export const receiveAgentSchema = Type.Object({
+export const awaitAgentSchema = Type.Object({
   timeoutMs: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+  afterAgentId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
 }, { additionalProperties: false });
-export type ReceiveAgentInput = Static<typeof receiveAgentSchema>;
+export type AwaitAgentInput = Static<typeof awaitAgentSchema>;
+
+export interface AwaitInventoryPage {
+  readonly total: AgentCount;
+  readonly omitted: AgentCount;
+  readonly remaining: AgentCount;
+  readonly nextAfterAgentId?: AgentId;
+  readonly agents: readonly AgentSummary[];
+}
+
+export interface AwaitAgentResult {
+  readonly completions: readonly [] | readonly [AgentCompletion];
+  readonly remainingCompletions: AgentCount;
+  readonly inventory: AwaitInventoryPage;
+  readonly timedOut: boolean;
+}
 
 export const stopAgentSchema = Type.Object({
   agentIds: Type.Array(Type.String(), { minItems: 1 }),
@@ -65,155 +81,9 @@ export type StopAgentInput = Static<typeof stopAgentSchema>;
 export const subagentToolSchemas = {
   spawn_agent: spawnAgentSchema,
   send_input: sendInputSchema,
-  receive_agent: receiveAgentSchema,
+  await_agent: awaitAgentSchema,
   stop_agent: stopAgentSchema,
 } as const;
-
-export interface FairPrefix {
-  readonly endOffset: Utf16CodeUnitOffset;
-  readonly retainedBytes: Utf8Bytes;
-  readonly serialisedDeltaBytes: Utf8Bytes;
-}
-
-export interface FairOutputTable {
-  readonly text: string;
-  readonly originalRetainedBytes: Utf8Bytes;
-  readonly previouslyTruncated: boolean;
-  readonly prefixes: readonly FairPrefix[];
-}
-
-export interface FairAllocation {
-  readonly prefixIndices: readonly number[];
-  readonly retainedBytes: readonly Utf8Bytes[];
-  readonly serialisedBytes: Utf8Bytes;
-}
-
-export interface FairAllocationStats {
-  fullAdmissionChecks: number;
-  prefixSearches: number;
-  slackTransitions: number;
-}
-
-/**
- * Builds exact JSON projection costs at each complete Unicode code-point boundary.
- * The caller's retained-byte value represents the unmodified persisted output.
- */
-export function buildFairOutputTable(
-  text: string,
-  retainedBytes: Utf8Bytes,
-  previouslyTruncated: boolean,
-): FairOutputTable {
-  const encoder = new TextEncoder();
-  const originalRetainedBytes = retainedBytes;
-  const zeroTruncated = previouslyTruncated || 0 < originalRetainedBytes;
-  const prefixes: FairPrefix[] = [{
-    endOffset: utf16CodeUnitOffset(0),
-    retainedBytes: utf8Bytes(0),
-    serialisedDeltaBytes: utf8Bytes(0),
-  }];
-  let endOffset = 0;
-  let prefixRetainedBytes = 0;
-  let serialisedPayloadBytes = 0;
-
-  for (const codePoint of text) {
-    endOffset += codePoint.length;
-    prefixRetainedBytes += encoder.encode(codePoint).byteLength;
-    serialisedPayloadBytes += encoder.encode(JSON.stringify(codePoint).slice(1, -1)).byteLength;
-    const truncated = previouslyTruncated || prefixRetainedBytes < originalRetainedBytes;
-    const serialisedDeltaBytes = serialisedPayloadBytes
-      + String(prefixRetainedBytes).length - 1
-      + String(truncated).length - String(zeroTruncated).length;
-    prefixes.push({
-      endOffset: utf16CodeUnitOffset(endOffset),
-      retainedBytes: utf8Bytes(prefixRetainedBytes),
-      serialisedDeltaBytes: utf8Bytes(serialisedDeltaBytes),
-    });
-  }
-
-  if (prefixRetainedBytes !== originalRetainedBytes) throw new CodedError(AgentErrorCode.InternalError);
-  return { text, originalRetainedBytes, previouslyTruncated, prefixes };
-}
-
-/** Allocates provider-visible serialised bytes by nominal max-min shares. */
-export function allocateFairOutputs(
-  tables: readonly FairOutputTable[],
-  zeroTextSerialisedBytes: Utf8Bytes,
-  cap: Utf8Bytes,
-  stats?: FairAllocationStats,
-): FairAllocation {
-  if (zeroTextSerialisedBytes > cap) throw new CodedError(AgentErrorCode.InternalError);
-
-  const prefixIndices = tables.map(() => 0);
-  let remaining = cap - zeroTextSerialisedBytes;
-  const active = tables.flatMap((table, index) => table.text.length === 0 ? [] : [index]);
-
-  while (active.length > 0) {
-    const share = Math.floor(remaining / active.length);
-    let admittedFull = false;
-    for (let position = 0; position < active.length; position++) {
-      if (stats !== undefined) stats.fullAdmissionChecks++;
-      const tableIndex = active[position]!;
-      const table = tables[tableIndex]!;
-      const finalIndex = table.prefixes.length - 1;
-      const fullDelta = table.prefixes[finalIndex]!.serialisedDeltaBytes;
-      if (fullDelta > share) continue;
-      prefixIndices[tableIndex] = finalIndex;
-      remaining -= fullDelta;
-      active.splice(position, 1);
-      admittedFull = true;
-      break;
-    }
-    if (admittedFull) continue;
-
-    const remainder = remaining % active.length;
-    for (let position = 0; position < active.length; position++) {
-      const tableIndex = active[position]!;
-      prefixIndices[tableIndex] = fairPrefixAtMost(
-        tables[tableIndex]!.prefixes,
-        utf8Bytes(share + (position < remainder ? 1 : 0)),
-      );
-      if (stats !== undefined) stats.prefixSearches++;
-    }
-    break;
-  }
-
-  let slack = cap - zeroTextSerialisedBytes;
-  for (let index = 0; index < tables.length; index++) {
-    slack -= tables[index]!.prefixes[prefixIndices[index]!]!.serialisedDeltaBytes;
-  }
-  let advanced = true;
-  while (advanced) {
-    advanced = false;
-    for (let index = 0; index < tables.length; index++) {
-      const table = tables[index]!;
-      const currentIndex = prefixIndices[index]!;
-      const next = table.prefixes[currentIndex + 1];
-      if (next === undefined) continue;
-      const increment = next.serialisedDeltaBytes - table.prefixes[currentIndex]!.serialisedDeltaBytes;
-      if (increment > slack) continue;
-      prefixIndices[index] = currentIndex + 1;
-      slack -= increment;
-      if (stats !== undefined) stats.slackTransitions++;
-      advanced = true;
-      break;
-    }
-  }
-
-  const retainedBytes = prefixIndices.map((prefixIndex, index) =>
-    tables[index]!.prefixes[prefixIndex]!.retainedBytes);
-  return { prefixIndices, retainedBytes, serialisedBytes: utf8Bytes(cap - slack) };
-}
-
-function fairPrefixAtMost(prefixes: readonly FairPrefix[], allowance: Utf8Bytes): number {
-  let low = 0;
-  let high = prefixes.length - 1;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (prefixes[middle]!.serialisedDeltaBytes <= allowance) low = middle;
-    else high = middle - 1;
-  }
-  return low;
-}
 
 export type SubagentToolName = keyof typeof subagentToolSchemas;
 export type SubagentToolInput<K extends SubagentToolName> =
@@ -235,7 +105,7 @@ export type SubagentToolRegistry = {
 };
 
 /** The controller surface required by public subagent tools. */
-export type SubagentToolController = Pick<SubagentController, "spawn" | "sendInput" | "receive" | "stop">;
+export type SubagentToolController = Pick<SubagentController, "spawn" | "sendInput" | "awaitReady" | "stop">;
 
 type ToolStopOutcome = PublicStopOutcome | {
   agentId: string;
@@ -253,11 +123,11 @@ export function createSubagentTools(controller: SubagentToolController): Subagen
     send_input: tool("send_input", "Start a literal assignment on a stopped child agent.", sendInputSchema,
       async (input) => executeStart(() => controller.sendInput(agentId(input.agentId), input.message),
         AgentErrorCode.SessionUnavailable), projectStart, renderStart),
-    receive_agent: tool("receive_agent", "Receive ready completions and the complete owned-agent inventory.", receiveAgentSchema,
-      async (input, signal) => controller.receive({
+    await_agent: tool("await_agent", "Await one ready completion and page the owned-agent inventory.", awaitAgentSchema,
+      async (input, signal) => projectAwaitResult(await controller.awaitReady({
         ...(input.timeoutMs === undefined ? {} : { timeoutMs: milliseconds(input.timeoutMs) }),
         ...(signal === undefined ? {} : { signal }),
-      }), projectReceive, renderReceive, boundReceiveContent),
+      }), input.afterAgentId), projectAwait, renderAwait, boundAwaitContent),
     stop_agent: tool("stop_agent", "Stop one or more owned child agents.", stopAgentSchema,
       async (input) => {
         const outcomes: ToolStopOutcome[] = await Promise.all(input.agentIds.map(async (raw) => {
@@ -376,94 +246,103 @@ function projectSpawnStart(value: SpawnStartResult): object {
   };
 }
 
-function projectReceive(value: ReceiveAgentResult): object {
+function projectAwait(value: AwaitAgentResult): object {
   return {
     completions: value.completions.map(projectCompletion),
-    agents: value.agents.map(projectAgentSummary),
+    remainingCompletions: value.remainingCompletions,
+    inventory: {
+      total: value.inventory.total,
+      omitted: value.inventory.omitted,
+      remaining: value.inventory.remaining,
+      ...(value.inventory.nextAfterAgentId === undefined ? {} : { nextAfterAgentId: value.inventory.nextAfterAgentId }),
+      agents: value.inventory.agents.map(projectAgentSummary),
+    },
     timedOut: value.timedOut,
   };
 }
 
+function projectAwaitResult(value: CompletionAwaitResult, rawAfterAgentId?: string): AwaitAgentResult {
+  const sorted = [...value.agents].sort((left, right) => left.agentId < right.agentId ? -1 : left.agentId > right.agentId ? 1 : 0);
+  let after: AgentId | undefined;
+  if (rawAfterAgentId !== undefined) after = agentId(rawAfterAgentId);
+  const start = after === undefined ? 0 : sorted.findIndex((summary) => summary.agentId > after!);
+  const offset = start < 0 ? sorted.length : start;
+  const eligible = sorted.slice(offset, offset + 100);
+  const total = agentCount(sorted.length);
+  const candidates: AgentSummary[] = [];
+  for (const candidate of eligible) {
+    const tentative = [...candidates, candidate];
+    const tentativeRemaining = agentCount(sorted.length - offset - tentative.length);
+    const tentativeCursor = tentativeRemaining > 0 ? tentative.at(-1)?.agentId : undefined;
+    const reserved: AwaitAgentResult = {
+      completions: value.completion === undefined ? [] : [withoutCompletionText(value.completion)],
+      remainingCompletions: value.remainingCompletions,
+      inventory: { total, omitted: agentCount(sorted.length - tentative.length), remaining: tentativeRemaining, ...(tentativeCursor === undefined ? {} : { nextAfterAgentId: tentativeCursor }), agents: tentative },
+      timedOut: value.timedOut,
+    };
+    if (jsonBytes(projectAwait(reserved)) > MAX_AGGREGATE_AWAIT_BYTES) break;
+    candidates.push(candidate);
+  }
+  const omitted = agentCount(sorted.length - candidates.length);
+  const remaining = agentCount(sorted.length - offset - candidates.length);
+  const nextAfterAgentId = remaining > 0 ? candidates.at(-1)?.agentId : undefined;
+  return {
+    completions: value.completion === undefined ? [] : [value.completion],
+    remainingCompletions: value.remainingCompletions,
+    inventory: { total, omitted, remaining, ...(nextAfterAgentId === undefined ? {} : { nextAfterAgentId }), agents: candidates },
+    timedOut: value.timedOut,
+  };
+}
+
+function withoutCompletionText(completion: AgentCompletion): AgentCompletion {
+  return {
+    ...completion,
+    output: {
+      ...completion.output,
+      text: "",
+      retainedBytes: utf8Bytes(0),
+      truncated: completion.output.originalBytes > 0,
+    },
+  };
+}
+
 /** Bounds only provider content; full projected details remain available to renderers. */
-function boundReceiveContent(value: object): object {
-  if (jsonBytes(value) <= MAX_AGGREGATE_RECEIVE_BYTES) return value;
+function boundAwaitContent(value: object): object {
+  if (jsonBytes(value) <= MAX_AGGREGATE_AWAIT_BYTES) return value;
   const source = requiredRecord(value);
   const completions = requiredArray(source, "completions");
-  let selectedSource = source;
-  let zeroText = materialiseReceive(selectedSource, completions, completions.map(() => 0));
-  let zeroTextSerialisedBytes = jsonBytes(zeroText);
-
-  if (zeroTextSerialisedBytes > MAX_AGGREGATE_RECEIVE_BYTES) {
-    selectedSource = { ...source, agents: compactReceiveAgents(requiredArray(source, "agents")) };
-    zeroText = materialiseReceive(selectedSource, completions, completions.map(() => 0));
-    zeroTextSerialisedBytes = jsonBytes(zeroText);
-    if (zeroTextSerialisedBytes > MAX_AGGREGATE_RECEIVE_BYTES) throw invalidPublicResult();
-  }
-
-  const tables = completions.map((value) => {
-    const output = requiredRecord(requiredRecord(value).output);
-    return buildFairOutputTable(
-      requiredString(output, "text"),
-      requiredUtf8Bytes(output, "retainedBytes"),
-      requiredBoolean(output, "truncated"),
-    );
-  });
-  const allocation = allocateFairOutputs(
-    tables,
-    zeroTextSerialisedBytes,
-    MAX_AGGREGATE_RECEIVE_BYTES,
-  );
-  const selected = materialiseReceive(selectedSource, completions, allocation.prefixIndices, tables);
-  const measuredBytes = jsonBytes(selected);
-  if (measuredBytes !== allocation.serialisedBytes || measuredBytes > MAX_AGGREGATE_RECEIVE_BYTES) {
-    throw invalidPublicResult();
-  }
-  return selected;
-}
-
-function compactReceiveAgents(agents: unknown[]): object[] {
-  return agents.map((value) => {
-    const agent = requiredRecord(value);
+  if (completions.length > 1) throw invalidPublicResult();
+  if (completions.length === 0) throw invalidPublicResult();
+  const completion = requiredRecord(completions[0]);
+  const output = requiredRecord(completion.output);
+  const text = requiredString(output, "text");
+  const originalRetainedBytes = requiredUtf8Bytes(output, "retainedBytes");
+  const previouslyTruncated = requiredBoolean(output, "truncated");
+  const materialise = (prefix: string): object => {
+    const retainedBytes = utf8Bytes(new TextEncoder().encode(prefix).byteLength);
     return {
-      agentId: requiredString(agent, "agentId"),
-      state: requiredString(agent, "state"),
-      ...optionalStringContentField(agent, "currentRunId"),
-      ...optionalStringContentField(agent, "latestCompletionState"),
+      ...source,
+      completions: [{
+        ...completion,
+        output: {
+          text: prefix,
+          originalBytes: requiredUtf8Bytes(output, "originalBytes"),
+          retainedBytes,
+          truncated: previouslyTruncated || retainedBytes < originalRetainedBytes,
+        },
+      }],
     };
-  });
-}
-
-function optionalStringContentField(value: Record<string, unknown>, key: string): Record<string, string> {
-  return value[key] === undefined ? {} : { [key]: requiredString(value, key) };
-}
-
-function materialiseReceive(
-  source: Record<string, unknown>,
-  completions: unknown[],
-  prefixIndices: readonly number[],
-  tables?: readonly FairOutputTable[],
-): object {
-  const boundedCompletions = completions.map((value, index) => {
-    const completion = requiredRecord(value);
-    const output = requiredRecord(completion.output);
-    const inputRetainedBytes = requiredUtf8Bytes(output, "retainedBytes");
-    const previouslyTruncated = requiredBoolean(output, "truncated");
-    const prefixIndex = prefixIndices[index];
-    if (prefixIndex === undefined) throw invalidPublicResult();
-    const prefix = tables?.[index]?.prefixes[prefixIndex];
-    const text = prefix === undefined ? "" : tables![index]!.text.slice(0, prefix.endOffset);
-    const retainedBytes = prefix?.retainedBytes ?? utf8Bytes(0);
-    return {
-      ...completion,
-      output: {
-        text,
-        originalBytes: requiredUtf8Bytes(output, "originalBytes"),
-        retainedBytes,
-        truncated: previouslyTruncated || retainedBytes < inputRetainedBytes,
-      },
-    };
-  });
-  return { ...source, completions: boundedCompletions };
+  };
+  if (jsonBytes(materialise("")) > MAX_AGGREGATE_AWAIT_BYTES) throw invalidPublicResult();
+  const points = [...text];
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (jsonBytes(materialise(points.slice(0, middle).join(""))) <= MAX_AGGREGATE_AWAIT_BYTES) low = middle;
+    else high = middle - 1;
+  }
+  return materialise(points.slice(0, low).join(""));
 }
 
 function jsonBytes(value: object): Utf8Bytes {
@@ -714,10 +593,11 @@ function renderStart(result: object): string {
   return compact([`${fields(details, ["agentId", "runId", "state"])}${selection}`]);
 }
 
-function renderReceive(result: object): string {
+function renderAwait(result: object): string {
   const details = resultDetails(result);
   const completions = objectArray(details.completions);
-  const agents = objectArray(details.agents);
+  const inventory = record(details.inventory) ?? {};
+  const agents = objectArray(inventory.agents);
   const lines = [
     `completions=${completions.length} agents=${agents.length}${field(details, "timedOut")}`,
     ...completions.map((completion) => `completion ${fields(completion, ["agentId", "runId", "state", "outputPath"])}`),

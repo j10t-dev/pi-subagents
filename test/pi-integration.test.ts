@@ -39,7 +39,7 @@ clearManagedChildEnvironment(process.env);
 
 const PI_EXECUTABLE = resolveIntegrationCli();
 reportIntegrationCli(PI_EXECUTABLE);
-const LIFECYCLE_TOOLS = ["spawn_agent", "send_input", "receive_agent", "stop_agent"] as const;
+const LIFECYCLE_TOOLS = ["spawn_agent", "send_input", "await_agent", "stop_agent"] as const;
 
 describe("installed Pi integration prerequisites", () => {
   test("the literal command-v Pi launcher registers the extension in a real parent session", async () => {
@@ -103,10 +103,10 @@ describe("installed Pi integration prerequisites", () => {
       await client.start();
       await client.promptAndWait("REPORT_TOOLS", undefined, 20_000);
       const tools = JSON.parse((await client.getLastAssistantText()) ?? "[]") as unknown;
-      expect(tools).toEqual(expect.arrayContaining(["spawn_agent", "send_input", "receive_agent", "stop_agent"]));
+      expect(tools).toEqual(expect.arrayContaining(["spawn_agent", "send_input", "await_agent", "stop_agent"]));
       expect(client.getStderr()).not.toContain("pi-subagents disabled:");
       await client.promptAndWait("CALL_SPAWN", undefined, 20_000);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const text = await client.getLastAssistantText();
       expect(text).toContain("child-complete");
       const completed = lifecycleEntries((await client.getEntries()).entries)
@@ -152,7 +152,7 @@ describe("installed Pi integration prerequisites", () => {
     const spawned = lifecycleEntries((await first.getEntries()).entries)
       .find((event) => lifecycleEventTypes([event])[0] === "spawned");
     const newlyPersistedPayload = lifecyclePayload(spawned);
-    await first.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+    await first.promptAndWait("CALL_AWAIT", undefined, 20_000);
     const parentFile = (await first.getState()).sessionFile;
     expect(parentFile).toBeString();
     await first.stop();
@@ -169,9 +169,9 @@ describe("installed Pi integration prerequisites", () => {
       expect(resumed.runId).not.toBe(started.runId);
       expect({ provider: newlyPersistedPayload.provider, modelId: newlyPersistedPayload.modelId })
         .toEqual({ provider: "mock-provider", modelId: "luna" });
-      await second.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await second.promptAndWait("CALL_AWAIT", undefined, 20_000);
       expect(await second.getLastAssistantText()).toContain(started.runId!);
-      await second.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await second.promptAndWait("CALL_AWAIT", undefined, 20_000);
       expect(await second.getLastAssistantText()).toContain("CHILD_COMPLETE>CHILD_COMPLETE_AGAIN");
       const transcript = readFileSync(findChildTranscript(agentDir, started.agentId), "utf8");
       expect(transcript).toContain('"provider":"mock-provider"');
@@ -208,7 +208,7 @@ describe("installed Pi integration prerequisites", () => {
       const first = decodeStartResult(await client.getLastAssistantText());
       expect(first.agentId).toBeString();
       expect(first.runId).toMatch(/^[0-9a-f]{8}$/);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const contextResult = (await client.getLastAssistantText()) ?? "";
       expect(contextResult).toContain("GLOBAL_CONTEXT_MARKER");
       expect(contextResult).toContain("PROJECT_CONTEXT_MARKER");
@@ -216,13 +216,13 @@ describe("installed Pi integration prerequisites", () => {
       expect(contextResult).toContain("project-skill");
 
       await client.promptAndWait("CALL_SPAWN_TASK|REPORT_TOOLS", undefined, 20_000);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const toolsResult = (await client.getLastAssistantText()) ?? "";
       expect(toolsResult).toContain("bash");
       expect(toolsResult).toContain("edit");
       expect(toolsResult).toContain("mock_child_extension");
       expect(toolsResult).not.toContain("spawn_agent");
-      expect(toolsResult).not.toContain("receive_agent");
+      expect(toolsResult).not.toContain("await_agent");
 
       await client.promptAndWait("CALL_SPAWN_TASK|CHILD_COMPLETE|||read,missing-tool", undefined, 20_000);
       expect(await client.getLastAssistantText()).toContain("invalid_input");
@@ -266,7 +266,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       expect(parseStringArray(await client.getLastAssistantText())).toEqual(expect.arrayContaining([
         "spawn_agent",
         "send_input",
-        "receive_agent",
+        "await_agent",
         "stop_agent",
       ]));
     }, { ...process.env, PI_SUBAGENT_CHILD: "1" });
@@ -289,7 +289,7 @@ describe("deterministic network-free real-Pi matrix", () => {
   test("01 trusted cwd discovers global/project context and skills", async () => {
     await withFixture("discovery", async ({ client }) => {
       await client.promptAndWait("CALL_SPAWN_TASK|REPORT_CONTEXT", undefined, 20_000);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const result = (await client.getLastAssistantText()) ?? "";
       expect(result).toContain("GLOBAL_CONTEXT_MARKER");
       expect(result).toContain("PROJECT_CONTEXT_MARKER");
@@ -334,7 +334,7 @@ describe("deterministic network-free real-Pi matrix", () => {
   test("04 each spawn/resume run ID is its exact literal assignment user-entry ID", async () => {
     await withFixture("run-id", async ({ client, agentDir }) => {
       const started = await spawn(client);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       let entries = SessionManager.open(findChildTranscript(agentDir, started.agentId)).getEntries();
       expect(exactUserEntryId(entries, "CHILD_COMPLETE")).toBe(started.runId);
       await client.promptAndWait(`CALL_SEND|${started.agentId}|CHILD_COMPLETE_AGAIN`, undefined, 20_000);
@@ -378,14 +378,14 @@ describe("deterministic network-free real-Pi matrix", () => {
         state: "running", model: "mock-provider/mock-model", thinkingLevel: "high",
         tools: ["mock_child_extension"],
       });
-      expect(await receiveReportedTools(client)).toEqual(["mock_child_extension"]);
+      expect(await awaitReportedTools(client)).toEqual(["mock_child_extension"]);
 
       await client.promptAndWait("CALL_SPAWN_TASK|REPORT_TOOLS|mock-provider/mock-model:minimal||<none>", undefined, 20_000);
       const explicit = decodeStartResult(await client.getLastAssistantText());
       expect(explicit).toMatchObject({
         state: "running", model: "mock-provider/mock-model", thinkingLevel: "minimal", tools: [],
       });
-      expect(await receiveReportedTools(client)).toEqual([]);
+      expect(await awaitReportedTools(client)).toEqual([]);
       expect(readFileSync(findChildTranscript(agentDir, explicit.agentId), "utf8")).toContain('"thinkingLevel":"minimal"');
 
       await client.promptAndWait("REPORT_TOOLS", undefined, 20_000);
@@ -398,7 +398,7 @@ describe("deterministic network-free real-Pi matrix", () => {
         state: "running", model: "mock-provider/mock-model", thinkingLevel: "high",
       });
       expect([...inherited.tools!].sort()).toEqual(expectedInheritedTools);
-      const childReportedTools = await receiveReportedTools(client);
+      const childReportedTools = await awaitReportedTools(client);
       expect(childReportedTools).toEqual(expectedInheritedTools);
       expect(expectedInheritedTools).toContain("mock_child_extension");
       for (const lifecycleTool of LIFECYCLE_TOOLS) {
@@ -411,7 +411,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       expect(clamped).toMatchObject({
         state: "running", model: "mock-provider/plain-model", thinkingLevel: "high",
       });
-      expect(await receiveReportedTools(client)).toEqual([...clamped.tools!].sort());
+      expect(await awaitReportedTools(client)).toEqual([...clamped.tools!].sort());
       const transcript = readFileSync(findChildTranscript(agentDir, clamped.agentId), "utf8");
       expect(transcript).toContain('"modelId":"plain-model"');
       expect(transcript).toContain('"thinkingLevel":"off"');
@@ -422,16 +422,16 @@ describe("deterministic network-free real-Pi matrix", () => {
     await withFixture("nested-delegation", async ({ client, childLaunchDir, agentDir }) => {
       await client.promptAndWait("CALL_SPAWN_TASK|NESTED_DELEGATION", undefined, 20_000);
       const child = decodeStartResult(await client.getLastAssistantText());
-      expect(child.tools).toEqual(expect.arrayContaining(["spawn_agent", "receive_agent"]));
+      expect(child.tools).toEqual(expect.arrayContaining(["spawn_agent", "await_agent"]));
 
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const received = parseJsonRecord(await client.getLastAssistantText());
       const completions = received.completions;
       if (!Array.isArray(completions) || completions.length !== 1) throw new Error("missing nested child completion");
       const childOutput = requireJsonRecord(requireJsonRecord(completions[0]).output).text;
       if (typeof childOutput !== "string") throw new Error("missing nested child output");
       const nested = parseJsonRecord(childOutput);
-      expect(nested.childTools).toEqual(expect.arrayContaining(["spawn_agent", "receive_agent"]));
+      expect(nested.childTools).toEqual(expect.arrayContaining(["spawn_agent", "await_agent"]));
       const grandchildReceive = requireJsonRecord(nested.grandchildReceive);
       const grandchildCompletions = grandchildReceive.completions;
       if (!Array.isArray(grandchildCompletions) || grandchildCompletions.length !== 1) {
@@ -444,7 +444,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       for (const lifecycleTool of LIFECYCLE_TOOLS) expect(grandchildTools).not.toContain(lifecycleTool);
 
       const childTranscript = SessionManager.open(findChildTranscript(agentDir, child.agentId)).getEntries();
-      expect(transcriptToolNames(childTranscript)).toEqual(expect.arrayContaining(["spawn_agent", "receive_agent"]));
+      expect(transcriptToolNames(childTranscript)).toEqual(expect.arrayContaining(["spawn_agent", "await_agent"]));
       expect(transcriptToolNames(childTranscript)).not.toContain("bash");
       expect(containsPiCommand(transcriptAssistantText(childTranscript))).toBeFalse();
       if (typeof grandchild.agentId !== "string") throw new Error("missing grandchild agent ID");
@@ -474,7 +474,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       expect(started).toMatchObject({
         state: "running", model: "mock-provider/luna", thinkingLevel: "minimal", tools: [],
       });
-      expect(await receiveReportedTools(client)).toEqual([]);
+      expect(await awaitReportedTools(client)).toEqual([]);
 
       expect(readFileSync(settingsPath, "utf8")).toBe(defaultsBefore);
     });
@@ -485,11 +485,11 @@ describe("deterministic network-free real-Pi matrix", () => {
       for (const tools of [["read"], ["mock_child_extension"], ["read", "mock_child_extension"]] as const) {
         await client.promptAndWait(`CALL_SPAWN_TASK|REPORT_TOOLS|||${tools.join(",")}`, undefined, 20_000);
         expect(decodeStartResult(await client.getLastAssistantText())).toMatchObject({ state: "running", tools: [...tools] });
-        expect(await receiveReportedTools(client)).toEqual([...tools].sort());
+        expect(await awaitReportedTools(client)).toEqual([...tools].sort());
       }
       await client.promptAndWait("CALL_SPAWN_TASK|REPORT_TOOLS|||<none>", undefined, 20_000);
       expect(decodeStartResult(await client.getLastAssistantText())).toMatchObject({ state: "running", tools: [] });
-      expect(await receiveReportedTools(client)).toEqual([]);
+      expect(await awaitReportedTools(client)).toEqual([]);
     });
   }, 40_000);
 
@@ -497,10 +497,10 @@ describe("deterministic network-free real-Pi matrix", () => {
     await withFixture("rejection", async ({ client, agentDir, childLaunchDir }) => {
       await client.promptAndWait("CALL_SPAWN_TASK|CHILD_COMPLETE|||<none>", undefined, 20_000);
       expect(decodeStartResult(await client.getLastAssistantText()).state).toBe("running");
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       expect(snapshotTree(childLaunchDir)).toHaveLength(1);
       expect(childLaunchPids(childLaunchDir).every(processAbsent)).toBeTrue();
-      for (const rejectedTool of ["missing-tool", "spawn_agent", "receive_agent"]) {
+      for (const rejectedTool of ["missing-tool", "spawn_agent", "await_agent"]) {
         const lifecycleBefore = lifecycleEntries((await client.getEntries()).entries);
         const stateBefore = snapshotTree(join(agentDir, "pi-subagents"));
         const launchesBefore = snapshotTree(childLaunchDir);
@@ -520,9 +520,9 @@ describe("deterministic network-free real-Pi matrix", () => {
     await withFixture("schema", async ({ client }) => {
       await client.promptAndWait("REPORT_SPAWN_SCHEMA", undefined, 20_000);
       const metadata = parseJsonRecord(await client.getLastAssistantText());
-      expect(metadata.description).toBe("Start a persistent child assignment asynchronously; collect completion with receive_agent.");
+      expect(metadata.description).toBe("Start a persistent child assignment asynchronously; collect completion with await_agent.");
       const parameters = requireJsonRecord(metadata.parameters);
-      expect(parameters.description).toBe("Start a fresh persistent child session asynchronously; collect completion with receive_agent.");
+      expect(parameters.description).toBe("Start a fresh persistent child session asynchronously; collect completion with await_agent.");
       const properties = requireJsonRecord(parameters.properties);
       expect(requireJsonRecord(properties.task).description).toBe("Literal first assignment for the fresh child session.");
       expect(requireJsonRecord(properties.model).description).toContain("child model pattern");
@@ -542,16 +542,16 @@ describe("deterministic network-free real-Pi matrix", () => {
         warning: 'Model pattern "mock-provider/new-model" uses the custom model-id fallback.',
       });
       expect(started.warning).not.toContain('Model "new-model" not found');
-      expect(await receiveReportedTools(client)).toEqual([]);
+      expect(await awaitReportedTools(client)).toEqual([]);
     });
   }, 30_000);
 
   test("10 stopped-child resume preserves native conversation context", async () => {
     await withFixture("conversation", async ({ client }) => {
       const started = await spawn(client);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       await client.promptAndWait(`CALL_SEND|${started.agentId}|CHILD_COMPLETE_AGAIN`, undefined, 20_000);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       expect(await client.getLastAssistantText()).toContain("CHILD_COMPLETE>CHILD_COMPLETE_AGAIN");
     });
   }, 30_000);
@@ -559,7 +559,7 @@ describe("deterministic network-free real-Pi matrix", () => {
   test("11 child confirmation is forwarded and cancelled when the parent has no UI", async () => {
     await withFixture("confirmation", async ({ client }) => {
       await client.promptAndWait("CALL_SPAWN_TASK|CHILD_CONFIRM", undefined, 20_000);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const result = (await client.getLastAssistantText()) ?? "";
       expect(result).toContain("active");
       expect(result).not.toContain("confirmed");
@@ -569,7 +569,7 @@ describe("deterministic network-free real-Pi matrix", () => {
   test("12 external cwd receives no inherited trust approval", async () => {
     await withFixture("external-trust", async ({ client, external }) => {
       await client.promptAndWait(`CALL_SPAWN_TASK|REPORT_PROCESS||${external}`, undefined, 20_000);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const result = (await client.getLastAssistantText()) ?? "";
       expect(result).toContain(`\\\"cwd\\\":\\\"${external}\\\"`);
       expect(result).not.toContain("--approve");
@@ -579,7 +579,7 @@ describe("deterministic network-free real-Pi matrix", () => {
   test("13 parent custom entries survive compaction, process reload and resume", async () => {
     await withFixture("custom-entries", async ({ client, options }) => {
       const started = await spawn(client);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const before = await client.getEntries();
       const customBefore = lifecycleEntries(before.entries);
       expect(customBefore.length).toBeGreaterThanOrEqual(4);
@@ -594,7 +594,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       try {
         await resumed.start();
         await resumed.promptAndWait("ACK_RESTORATION_NOTIFICATION", undefined, 20_000);
-        await resumed.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+        await resumed.promptAndWait("CALL_AWAIT", undefined, 20_000);
         expect(await resumed.getLastAssistantText()).toContain(started.agentId);
         expect(lifecycleEntries((await resumed.getEntries()).entries)).toEqual(customBefore);
       } finally { await resumed.stop(); }
@@ -637,7 +637,7 @@ describe("deterministic network-free real-Pi matrix", () => {
       try {
         await resumed.start();
         await resumed.promptAndWait("ACK_RESTORATION_NOTIFICATION", undefined, 20_000);
-        await resumed.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+        await resumed.promptAndWait("CALL_AWAIT", undefined, 20_000);
         const result = (await resumed.getLastAssistantText()) ?? "";
         expect(result).toContain(started.runId);
         expect(result).toContain("parent_shutdown");
@@ -656,7 +656,7 @@ describe("deterministic network-free real-Pi matrix", () => {
   test("14a restart recovery replaces a stale destination from authoritative child transcript evidence", async () => {
     await withFixture("stale-output-recovery", async ({ client, options }) => {
       const started = await spawn(client);
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       const parentFile = (await client.getState()).sessionFile;
       expect(parentFile).toBeString();
       const completed = lifecycleEntries((await client.getEntries()).entries)
@@ -720,7 +720,7 @@ describe("deterministic network-free real-Pi matrix", () => {
 
         await resumed.promptAndWait("CALL_SPAWN", undefined, 20_000);
         expect(decodeStartResult(await resumed.getLastAssistantText()).runId).toMatch(/^[0-9a-f]{8}$/);
-        await resumed.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+        await resumed.promptAndWait("CALL_AWAIT", undefined, 20_000);
       } finally { await resumed.stop(); }
     });
   }, 40_000);
@@ -815,7 +815,7 @@ describe("deterministic network-free real-Pi matrix", () => {
         populated: false,
         scopePath: expect.stringMatching(/^\//),
       });
-      await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+      await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
       expect(await client.getLastAssistantText()).toContain(started.runId);
       expect(await client.getLastAssistantText()).toContain("stop_requested");
     });
@@ -955,8 +955,8 @@ function decodeStartResult(text: string | null | undefined): DecodedStartResult 
   };
 }
 
-async function receiveReportedTools(client: RpcClient): Promise<string[]> {
-  await client.promptAndWait("CALL_RECEIVE", undefined, 20_000);
+async function awaitReportedTools(client: RpcClient): Promise<string[]> {
+  await client.promptAndWait("CALL_AWAIT", undefined, 20_000);
   const received = parseJsonRecord(await client.getLastAssistantText());
   if (!Array.isArray(received.completions) || received.completions.length !== 1) throw new Error("missing real-Pi completion");
   const completion = requireJsonRecord(received.completions[0]);

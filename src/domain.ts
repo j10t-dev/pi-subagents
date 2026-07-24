@@ -42,6 +42,24 @@ export type ProcessCount = Brand<number, "ProcessCount">;
 export type ProcessId = Brand<number, "ProcessId">;
 export type ProcessGroupId = Brand<number, "ProcessGroupId">;
 export type ObservationRevision = Brand<number, "ObservationRevision">;
+export type AgentOrdinal = Brand<string, "HierarchicalAgentOrdinal">;
+export type AgentObservationRevision = Brand<number, "AgentObservationRevision">;
+export type AgentWidgetRevision = Brand<number, "AgentWidgetRevision">;
+export type TranscriptSequence = Brand<number, "TranscriptSequence">;
+export type TranscriptRevision = Brand<number, "TranscriptRevision">;
+export type ContextPercent = Brand<number, "ContextPercent">;
+export type TaskLabel = Brand<string, "SafeTaskLabel">;
+export type ModelLabel = Brand<string, "ModelDisplayLabel">;
+export type ContextLabel = Brand<string, "ContextDisplayLabel">;
+export type ActivityText = Brand<string, "BoundedActivityText">;
+export type TranscriptText = Brand<string, "BoundedTranscriptText">;
+export type ToolDisplayName = Brand<string, "ToolDisplayName">;
+export type AgentDepth = Brand<number, "AgentTreeDepth">;
+export type AgentCount = Brand<number, "AgentCount">;
+export type AssistantGeneration = Brand<number, "AssistantGeneration">;
+export type RpcContentIndex = Brand<number, "RpcContentIndex">;
+export type RpcToolCallId = Brand<string, "RpcToolCallId">;
+export type RpcStopReason = Brand<string, "RpcStopReason">;
 
 /** Canonical identity for state belonging to one agent run. Native entry IDs are session-local. */
 export type AgentRunKey = Brand<string, "AgentRunKey">;
@@ -54,6 +72,8 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const MAX_SESSION_ID_BYTES = 256;
 /** Pi generates entry IDs as `randomUUID().slice(0, 8)`: 8 lowercase hex characters. */
 const SESSION_ENTRY_ID_PATTERN = /^[0-9a-f]{8}$/;
+const AGENT_ORDINAL_PATTERN = /^A[1-9][0-9]*(?:\.[1-9][0-9]*)*$/;
+const DISPLAY_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 /** Brands a native `SessionManager.getSessionId()` value, matching Pi's own lexical rule. */
 export function agentId(value: string): AgentId {
@@ -240,6 +260,75 @@ export function processGroupId(value: number): ProcessGroupId {
 export function observationRevision(value: number): ObservationRevision {
   requireNonnegativeSafeInteger(value, "observation revision");
   return value as ObservationRevision;
+}
+
+export function agentOrdinal(value: string): AgentOrdinal {
+  if (!AGENT_ORDINAL_PATTERN.test(value) || new TextEncoder().encode(value).byteLength > 128) {
+    throw new Error(`invalid_input: invalid agent ordinal: ${JSON.stringify(value)}`);
+  }
+  return value as AgentOrdinal;
+}
+
+export function directAgentOrdinal(position: number): AgentOrdinal {
+  requirePositiveSafeInteger(position, "direct agent position");
+  return agentOrdinal(`A${position}`);
+}
+
+export function agentObservationRevision(value: number): AgentObservationRevision {
+  requireNonnegativeSafeInteger(value, "agent observation revision");
+  return value as AgentObservationRevision;
+}
+export function agentWidgetRevision(value: number): AgentWidgetRevision {
+  requireNonnegativeSafeInteger(value, "agent widget revision");
+  return value as AgentWidgetRevision;
+}
+export function transcriptSequence(value: number): TranscriptSequence {
+  requireNonnegativeSafeInteger(value, "transcript sequence");
+  return value as TranscriptSequence;
+}
+export function transcriptRevision(value: number): TranscriptRevision {
+  requireNonnegativeSafeInteger(value, "transcript revision");
+  return value as TranscriptRevision;
+}
+export function contextPercent(value: number): ContextPercent {
+  if (!Number.isFinite(value) || value < 0) throw new Error(`invalid_input: invalid context percent: ${value}`);
+  return value as ContextPercent;
+}
+export function agentDepth(value: number): AgentDepth {
+  requireNonnegativeSafeInteger(value, "agent depth");
+  if (value > 8) throw new Error(`invalid_input: agent depth exceeds hard recursion maximum: ${value}`);
+  return value as AgentDepth;
+}
+export function agentCount(value: number): AgentCount {
+  requireNonnegativeSafeInteger(value, "agent count");
+  return value as AgentCount;
+}
+export function assistantGeneration(value: number): AssistantGeneration {
+  requirePositiveSafeInteger(value, "assistant generation");
+  return value as AssistantGeneration;
+}
+export function rpcContentIndex(value: number): RpcContentIndex {
+  requireNonnegativeSafeInteger(value, "RPC content index");
+  return value as RpcContentIndex;
+}
+export function rpcToolCallId(value: string): RpcToolCallId {
+  return boundedControlFreeIdentity(value, 256, "RPC tool-call id") as RpcToolCallId;
+}
+export function rpcStopReason(value: string): RpcStopReason {
+  return boundedControlFreeIdentity(value, 256, "RPC stop reason") as RpcStopReason;
+}
+export function agentErrorCode(value: string): AgentErrorCode {
+  if (!Object.values(AgentErrorCode).includes(value as AgentErrorCode)) {
+    throw new Error(`invalid_input: invalid agent error code: ${JSON.stringify(value)}`);
+  }
+  return value as AgentErrorCode;
+}
+
+function boundedControlFreeIdentity(value: string, maxBytes: number, label: string): string {
+  if (value.length === 0 || DISPLAY_CONTROL_PATTERN.test(value) || new TextEncoder().encode(value).byteLength > maxBytes) {
+    throw new Error(`invalid_input: invalid ${label}`);
+  }
+  return value;
 }
 
 function requirePositiveSafeInteger(value: number, label: string): void {

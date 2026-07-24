@@ -11,6 +11,7 @@ export interface TestGroup {
 
 export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string>>> = {
   unit: new Set([
+    "agent-observation.test.ts",
     "assignment-identity.test.ts",
     "async-primitives.test.ts",
     "b0-gates.test.ts",
@@ -51,6 +52,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "restoration-planner.test.ts",
     "restoration.test.ts",
     "run-controller.test.ts",
+    "tool-presentation.test.ts",
     "tools.test.ts",
   ]),
   integration: new Set(["pi-integration.test.ts"]),

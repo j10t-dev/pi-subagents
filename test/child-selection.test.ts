@@ -193,8 +193,8 @@ describe("resolveChildSelection", () => {
   test("retains inherited and explicitly requested lifecycle tools below the boundary", () => {
     expect(primitiveTools(resolveChildSelection(selectionInput({
       allowLifecycleTools: true,
-      parentActiveTools: ["read", "spawn_agent", "receive_agent"],
-    })).tools)).toEqual(["read", "spawn_agent", "receive_agent"]);
+      parentActiveTools: ["read", "spawn_agent", "await_agent"],
+    })).tools)).toEqual(["read", "spawn_agent", "await_agent"]);
 
     expect(primitiveTools(resolveChildSelection(selectionInput({
       allowLifecycleTools: true,
@@ -206,7 +206,7 @@ describe("resolveChildSelection", () => {
   test("rejects inactive lifecycle tools below the boundary", () => {
     expect(() => resolveChildSelection(selectionInput({
       allowLifecycleTools: true,
-      requestedTools: ["receive_agent"],
+      requestedTools: ["await_agent"],
       parentActiveTools: ["read", "spawn_agent"],
     }))).toThrow(expect.objectContaining({ code: AgentErrorCode.InvalidInput }));
   });
@@ -223,7 +223,7 @@ describe("resolveChildSelection", () => {
     }
   });
 
-  test.each(["spawn_agent", "send_input", "receive_agent", "stop_agent", "inactive", "unknown"])(
+  test.each(["spawn_agent", "send_input", "await_agent", "stop_agent", "inactive", "unknown"])(
     "rejects unavailable tool %s with a typed public error",
     (tool) => {
       expect(() => resolveChildSelection(selectionInput({ requestedTools: [tool] })))

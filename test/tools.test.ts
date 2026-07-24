@@ -2,26 +2,23 @@ import { describe, expect, test } from "bun:test";
 import { Value } from "typebox/value";
 import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, modelSpec, runCapacity, runId, truncateUtf8, utf8Bytes, type AgentCompletion, type ToolName, type Utf8Bytes } from "../src/domain.ts";
 import { diagnosticsPath } from "../src/paths.ts";
-import { CompletionService, type AgentSummary, type ReceiveAgentResult } from "../src/completion-service.ts";
-import { MAX_AGGREGATE_RECEIVE_BYTES } from "../src/constants.ts";
+import { CompletionService, type AgentSummary } from "../src/completion-service.ts";
+import { MAX_AGGREGATE_AWAIT_BYTES } from "../src/constants.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PublicStopOutcome } from "../src/controller.ts";
 import { deferred } from "./support/async.ts";
 import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testReceiptPath, testRunId, testSessionPath, testToolName, testVerifiedReceiptPath } from "./support/brands.ts";
 import { launchSession, runningTransport as sharedRunningTransport, testRuntime } from "./support/launches.ts";
 import {
-  allocateFairOutputs,
-  buildFairOutputTable,
   createSubagentTools,
-  type FairAllocationStats,
   type SubagentToolController,
   type SubagentToolInput,
   type SubagentToolName,
   type SubagentToolRegistry,
   type SpawnAgentInput,
   type SendInputInput,
-  type ReceiveAgentInput,
+  type AwaitAgentInput,
   type StopAgentInput,
-  receiveAgentSchema,
+  awaitAgentSchema,
   sendInputSchema,
   spawnAgentSchema,
   stopAgentSchema,
@@ -34,10 +31,10 @@ type Assert<T extends true> = T;
 
 type _SpawnInput = Assert<Equal<SubagentToolInput<"spawn_agent">, SpawnAgentInput>>;
 type _SendInput = Assert<Equal<SubagentToolInput<"send_input">, SendInputInput>>;
-type _ReceiveInput = Assert<Equal<SubagentToolInput<"receive_agent">, ReceiveAgentInput>>;
+type _AwaitInput = Assert<Equal<SubagentToolInput<"await_agent">, AwaitAgentInput>>;
 type _StopInput = Assert<Equal<SubagentToolInput<"stop_agent">, StopAgentInput>>;
 type _RegistryKeys = Assert<Equal<keyof SubagentToolRegistry,
-  "spawn_agent" | "send_input" | "receive_agent" | "stop_agent">>;
+  "spawn_agent" | "send_input" | "await_agent" | "stop_agent">>;
 type ToolControllerFake = Partial<Record<keyof SubagentToolController, (...args: never[]) => unknown>>;
 
 /**
@@ -66,7 +63,7 @@ describe("exact tool contracts", () => {
     const tools = createSubagentTools(new SubagentController());
     expect(tools.spawn_agent.parameters).toBe(spawnAgentSchema);
     expect(tools.send_input.parameters).toBe(sendInputSchema);
-    expect(tools.receive_agent.parameters).toBe(receiveAgentSchema);
+    expect(tools.await_agent.parameters).toBe(awaitAgentSchema);
     expect(tools.stop_agent.parameters).toBe(stopAgentSchema);
   });
 
@@ -75,14 +72,14 @@ describe("exact tool contracts", () => {
     expect(Value.Check(spawnAgentSchema, { task: "work", thinking: "high" })).toBeFalse();
     expect(Value.Check(sendInputSchema, { agentId: "agent-a", message: "literal" })).toBeTrue();
     expect(Value.Check(sendInputSchema, { agent_id: "agent-a", task: "literal" })).toBeFalse();
-    expect(Value.Check(receiveAgentSchema, { timeoutMs: 0 })).toBeTrue();
-    expect(Value.Check(receiveAgentSchema, { timeout_ms: 0 })).toBeFalse();
+    expect(Value.Check(awaitAgentSchema, { timeoutMs: 0 })).toBeTrue();
+    expect(Value.Check(awaitAgentSchema, { timeout_ms: 0 })).toBeFalse();
     expect(Value.Check(stopAgentSchema, { agentIds: ["agent-a", "agent-a"] })).toBeTrue();
   });
 
-  test("receive_agent schema rejects unsafe timeout integers at the public boundary", () => {
-    expect(Value.Check(receiveAgentSchema, { timeoutMs: Number.MAX_SAFE_INTEGER })).toBeTrue();
-    expect(Value.Check(receiveAgentSchema, { timeoutMs: Number.MAX_SAFE_INTEGER + 1 })).toBeFalse();
+  test("await_agent schema rejects unsafe timeout integers at the public boundary", () => {
+    expect(Value.Check(awaitAgentSchema, { timeoutMs: Number.MAX_SAFE_INTEGER })).toBeTrue();
+    expect(Value.Check(awaitAgentSchema, { timeoutMs: Number.MAX_SAFE_INTEGER + 1 })).toBeFalse();
   });
 
   test("spawn schema describes its asynchronous lifecycle and every input field", () => {
@@ -95,7 +92,7 @@ describe("exact tool contracts", () => {
       tools: [],
     })).toBeTrue();
     expect(schemaDescription(spawnAgentSchema)).toBe(
-      "Start a fresh persistent child session asynchronously; collect completion with receive_agent.",
+      "Start a fresh persistent child session asynchronously; collect completion with await_agent.",
     );
     expect(schemaDescription(spawnAgentSchema.properties.task)).toBe(
       "Literal first assignment for the fresh child session.",
@@ -125,88 +122,81 @@ describe("exact tool contracts", () => {
     expect(messages).toEqual(["literal"]);
   });
 
-  test("projects exact public fields from typed secret-bearing DTOs", async () => {
-    const secret = "boundary-secret";
-    const typedReceive = withFixtureExtras({
-      completions: [
-        withFixtureExtras({
-          agentId: agentId("agent-a"), runId: runId("deadbeef"), state: CompletionState.Completed,
-          output: withFixtureExtras(truncateUtf8("answer", utf8Bytes(50_000)), { raw: secret }),
-          outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"), runId: runId("deadbeef") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"),
-          usage: withFixtureExtras({
-            turns: 1,
-            usage: withFixtureExtras({
-              input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14,
-              cost: withFixtureExtras({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 }, { secret }),
-            }, { secret }),
-          }, { secret }),
-        } satisfies AgentCompletion, { message: secret }),
-        withFixtureExtras({
-          agentId: agentId("agent-b"), runId: runId("cafebabe"), state: CompletionState.Failed,
-          output: truncateUtf8("bad", utf8Bytes(50_000)),
-          outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-b"), runId: runId("cafebabe") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/b-session"),
-          error: withFixtureExtras({ code: AgentErrorCode.ProtocolError, message: "child process protocol error", diagnosticsPath: diagnosticsPath("/tmp", "diag") }, { raw: secret }),
-        } satisfies AgentCompletion, { exception: secret }),
-        withFixtureExtras({
-          agentId: agentId("agent-c"), runId: runId("feedface"), state: CompletionState.Cancelled,
-          output: truncateUtf8("", utf8Bytes(50_000)),
-          outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-c"), runId: runId("feedface") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/c-session"), reason: "stop_requested",
-        } satisfies AgentCompletion, { process: secret }),
-      ],
-      agents: [
-        withFixtureExtras({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/session"), currentRunId: runId("deadbeef"), latestCompletionState: CompletionState.Completed, latestOutputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"), runId: runId("deadbeef") }) } satisfies AgentSummary, { client: { secret } }),
-        withFixtureExtras({ agentId: agentId("agent-b"), state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/b-session") } satisfies AgentSummary, { raw: secret }),
-      ],
-      timedOut: false,
-    } satisfies ReceiveAgentResult, { message: secret });
+  test("projects one completion and exact paged inventory metadata", async () => {
+    const summaries = Array.from({ length: 205 }, (_, index) => ({
+      agentId: agentId(`agent-${String(index).padStart(3, "0")}`),
+      state: AgentState.Stopped,
+      transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${index}.jsonl`),
+    }));
+    const result = await createSubagentTools(fakeToolController({
+      awaitReady: async () => ({ completion: undefined, remainingCompletions: 0, agents: summaries, timedOut: false }),
+    })).await_agent.execute({ afterAgentId: "agent-099" });
+
+    expect(result.details).toMatchObject({
+      completions: [],
+      remainingCompletions: 0,
+      inventory: { total: 205, omitted: 105, remaining: 5, nextAfterAgentId: "agent-199" },
+    });
+    expect((result.details as { inventory: { agents: unknown[] } }).inventory.agents).toHaveLength(100);
+  });
+
+  test("allocates the exact deterministic output residual for escaped multibyte JSON", async () => {
+    const outputText = `\\\"😀£`.repeat(20_000);
+    const completion = {
+      agentId: agentId("agent-a"), runId: runId("deadbeef"), state: CompletionState.Completed,
+      output: truncateUtf8(outputText, utf8Bytes(50_000)),
+      outputPath: "/tmp/\\\"output", transcriptPath: "/tmp/\\\"transcript",
+    };
     const controller = fakeToolController({
-      spawn: async () => ({
-        agentId: "agent-a", runId: "deadbeef", state: "running",
-        model: "mock-provider/luna", thinkingLevel: "high", tools: ["web_fetch", "read"], warning: "bounded warning",
-        process: { secret }, rawModel: secret, inherited: { secret },
-      }),
-      sendInput: async () => ({ agentId: "agent-a", state: "stopped", error: { code: "spawn_failed", message: "failed to spawn child agent", diagnosticsPath: "/tmp/d", exception: secret }, client: secret }),
-      receive: async () => typedReceive,
-      stop: async (id: string) => id === "agent-a"
-        ? { agentId: id, runId: "deadbeef", state: "cancelled", process: secret }
-        : { agentId: id, runId: "cafebabe", state: "failed", agentState: "stopping", error: { code: "containment_failed", message: "could not confirm child process termination", diagnosticsPath: "/tmp/stop-diag", raw: secret }, exception: secret },
+      awaitReady: async () => ({ completion, remainingCompletions: 0, agents: [], timedOut: false }),
     });
-    const { spawn_agent: spawn, send_input: send, receive_agent: receive, stop_agent: stop } = createSubagentTools(controller);
+    const tool = createSubagentTools(controller).await_agent;
 
-    const results = await Promise.all([
-      spawn!.execute({ task: "work" }),
-      send!.execute({ agentId: "agent-a", message: "next" }),
-      receive!.execute({}),
-      stop!.execute({ agentIds: ["agent-a", "agent-b"] }),
-    ]);
+    const first = await tool.execute({});
+    const second = await tool.execute({});
+    const projected = testRecord(JSON.parse(first.content));
+    const projectedCompletion = testRecord((projected.completions as unknown[])[0]);
+    const projectedOutput = testRecord(projectedCompletion.output);
+    const retained = testString(projectedOutput, "text");
+    const nextPoint = [...completion.output.text][[...retained].length];
 
-    expect(results[0]!.details).toEqual({
-      agentId: "agent-a",
-      runId: "deadbeef",
-      state: "running",
-      model: "mock-provider/luna",
-      thinkingLevel: "high",
-      tools: ["web_fetch", "read"],
-      warning: "bounded warning",
+    expect(second.content).toBe(first.content);
+    expect(completion.output.text.startsWith(retained)).toBeTrue();
+    expect(nextPoint).toBeDefined();
+    expect(retained).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(first.content, "utf8")).toBeLessThanOrEqual(MAX_AGGREGATE_AWAIT_BYTES);
+    const extendedOutput = { ...projectedOutput, text: retained + nextPoint,
+      retainedBytes: Buffer.byteLength(retained + nextPoint!, "utf8") };
+    const extendedCompletion = { ...projectedCompletion, output: extendedOutput };
+    const extended = { ...projected, completions: [extendedCompletion] };
+    expect(Buffer.byteLength(JSON.stringify(extended), "utf8")).toBeGreaterThan(MAX_AGGREGATE_AWAIT_BYTES);
+  });
+
+  test("pages whole escaped multibyte summaries with exact metadata under byte pressure", async () => {
+    const pathSegment = `\\\"£`.repeat(500);
+    const summaries = Array.from({ length: 205 }, (_, index) => ({
+      agentId: agentId(`agent-${String(index).padStart(3, "0")}`),
+      state: AgentState.Stopped,
+      transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${pathSegment}-${index}`),
+    }));
+    const controller = fakeToolController({
+      awaitReady: async () => ({ completion: undefined, remainingCompletions: 0, agents: summaries, timedOut: false }),
     });
-    expect(results[1]!.details).toEqual({ agentId: "agent-a", state: "stopped", error: { code: "spawn_failed", message: "failed to spawn child agent", diagnosticsPath: "/tmp/d" } });
-    expect(results[2]!.details).toEqual({ completions: [
-      { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "answer", originalBytes: 6, retainedBytes: 6, truncated: false }, outputPath: "/tmp/pi-subagents-test/output/agent-a/deadbeef.committed", transcriptPath: "/tmp/pi-subagents-test/session", usage: { turns: 1, usage: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cacheWrite1h: 1, reasoning: 2, totalTokens: 14, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } } } },
-      { agentId: "agent-b", runId: "cafebabe", state: "failed", output: { text: "bad", originalBytes: 3, retainedBytes: 3, truncated: false }, outputPath: "/tmp/pi-subagents-test/output/agent-b/cafebabe.committed", transcriptPath: "/tmp/pi-subagents-test/b-session", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "/tmp/diag" } },
-      { agentId: "agent-c", runId: "feedface", state: "cancelled", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/pi-subagents-test/output/agent-c/feedface.committed", transcriptPath: "/tmp/pi-subagents-test/c-session", reason: "stop_requested" },
-    ], agents: [
-      { agentId: "agent-a", state: "running", transcriptPath: "/tmp/pi-subagents-test/session", currentRunId: "deadbeef", latestCompletionState: "completed", latestOutputPath: "/tmp/pi-subagents-test/output/agent-a/deadbeef.committed" },
-      { agentId: "agent-b", state: "stopped", transcriptPath: "/tmp/pi-subagents-test/b-session" },
-    ], timedOut: false });
-    expect(results[3]!.details).toEqual({ outcomes: [
-      { agentId: "agent-a", runId: "deadbeef", state: "cancelled" },
-      { agentId: "agent-b", runId: "cafebabe", state: "failed", agentState: "stopping", error: { code: "containment_failed", message: "could not confirm child process termination", diagnosticsPath: "/tmp/stop-diag" } },
-    ] });
-    for (const result of results) {
-      expect(result.content).toBe(JSON.stringify(result.details));
-      expect(result.content).not.toContain(secret);
-      expect(JSON.stringify(result.details)).not.toContain(secret);
-    }
+    const tool = createSubagentTools(controller).await_agent;
+
+    const first = await tool.execute({ afterAgentId: "agent-099" });
+    const second = await tool.execute({ afterAgentId: "agent-099" });
+    const inventory = testRecord(testRecord(first.details).inventory);
+    const agents = inventory.agents as Array<{ agentId: string }>;
+
+    expect(second.content).toBe(first.content);
+    expect(agents.length).toBeGreaterThan(0);
+    expect(agents.length).toBeLessThan(100);
+    expect(inventory.omitted).toBe(205 - agents.length);
+    expect(inventory.remaining).toBe(105 - agents.length);
+    expect(inventory.nextAfterAgentId).toBe(agents.at(-1)?.agentId);
+    expect(Buffer.byteLength(first.content, "utf8")).toBeLessThanOrEqual(MAX_AGGREGATE_AWAIT_BYTES);
+    expect(first.content).not.toContain("\uFFFD");
   });
 
   test("canonicalises stored error messages from known codes", async () => {
@@ -339,15 +329,15 @@ describe("exact tool contracts", () => {
   });
 
   test.each([
-    ["invalid nested usage", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", usage: { turns: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: Number.NaN, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }], agents: [], timedOut: false }) })).receive_agent.execute({})],
-    ["invalid cacheWrite1h usage", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", usage: { turns: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: Number.NaN, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }], agents: [], timedOut: false }) })).receive_agent.execute({})],
-    ["invalid output byte metadata", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "x", originalBytes: 1, retainedBytes: 999, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }], agents: [], timedOut: false }) })).receive_agent.execute({})],
-    ["invalid path", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [], agents: [{ agentId: "agent-a", state: "stopped", transcriptPath: "relative/secret" }], timedOut: false }) })).receive_agent.execute({})],
+    ["invalid nested usage", () => createSubagentTools(fakeToolController({ awaitReady: async () => ({ completion: { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", usage: { turns: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: Number.NaN, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }, remainingCompletions: 0, agents: [], timedOut: false }) })).await_agent.execute({})],
+    ["invalid cacheWrite1h usage", () => createSubagentTools(fakeToolController({ awaitReady: async () => ({ completion: { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", usage: { turns: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: Number.NaN, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }, remainingCompletions: 0, agents: [], timedOut: false }) })).await_agent.execute({})],
+    ["invalid output byte metadata", () => createSubagentTools(fakeToolController({ awaitReady: async () => ({ completion: { agentId: "agent-a", runId: "deadbeef", state: "completed", output: { text: "x", originalBytes: 1, retainedBytes: 999, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t" }, remainingCompletions: 0, agents: [], timedOut: false }) })).await_agent.execute({})],
+    ["invalid path", () => createSubagentTools(fakeToolController({ awaitReady: async () => ({ completion: undefined, remainingCompletions: 0, agents: [{ agentId: "agent-a", state: "stopped", transcriptPath: "relative/secret" }], timedOut: false }) })).await_agent.execute({})],
     ["invalid canonical model reference", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "unqualified-model", thinkingLevel: "high", tools: [] }) })).spawn_agent.execute({ task: "work" })],
     ["invalid canonical model components", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider /luna", thinkingLevel: "high", tools: [] }) })).spawn_agent.execute({ task: "work" })],
     ["overlong warning", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider/luna", thinkingLevel: "high", tools: [], warning: "x".repeat(100_000) }) })).spawn_agent.execute({ task: "work" })],
     ["overlong tool value", () => createSubagentTools(fakeToolController({ spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running", model: "mock-provider/luna", thinkingLevel: "high", tools: ["x".repeat(1_000)] }) })).spawn_agent.execute({ task: "work" })],
-    ["invalid diagnostics path", () => createSubagentTools(fakeToolController({ receive: async () => ({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "failed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "relative/secret" } }], agents: [], timedOut: false }) })).receive_agent.execute({})],
+    ["invalid diagnostics path", () => createSubagentTools(fakeToolController({ awaitReady: async () => ({ completion: { agentId: "agent-a", runId: "deadbeef", state: "failed", output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false }, outputPath: "/tmp/o", transcriptPath: "/tmp/t", error: { code: "protocol_error", message: "child process protocol error", diagnosticsPath: "relative/secret" } }, remainingCompletions: 0, agents: [], timedOut: false }) })).await_agent.execute({})],
   ] as const)("maps invalid child-derived %s internal DTO to a bounded error", async (_name, execute) => {
     await expect(execute()).rejects.toThrow("internal_error: internal agent result is invalid");
   });
@@ -464,26 +454,29 @@ describe("exact tool contracts", () => {
     expect(controller.runs.snapshot(session.agentId)?.state).toBe(AgentState.Running);
   });
 
-  test("receive times out at the tool boundary and dequeues nothing", async () => {
+  test("await times out at the tool boundary and dequeues nothing", async () => {
     const completions = new CompletionService();
     completions.upsertAgent({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), currentRunId: runId("deadbeef") });
     const controller = new SubagentController({ completions });
-    const receive = createSubagentTools(controller).receive_agent;
+    const awaitTool = createSubagentTools(controller).await_agent;
 
-    const result = await receive.execute({ timeoutMs: 5 });
+    const result = await awaitTool.execute({ timeoutMs: 5 });
 
-    expect(result.details).toEqual({ completions: [], agents: [{ agentId: "agent-a", state: "running", transcriptPath: "/tmp/pi-subagents-test/a.jsonl", currentRunId: "deadbeef" }], timedOut: true });
+    expect(result.details).toEqual({ completions: [], remainingCompletions: 0, inventory: {
+      total: 1, omitted: 0, remaining: 0,
+      agents: [{ agentId: "agent-a", state: "running", transcriptPath: "/tmp/pi-subagents-test/a.jsonl", currentRunId: "deadbeef" }],
+    }, timedOut: true });
     expect(controller.completions.queuedCount()).toBe(0);
   });
 
-  test("receive cancellation rethrows the host abort and dequeues no completion", async () => {
+  test("await cancellation rethrows the host abort and dequeues no completion", async () => {
     const completions = new CompletionService();
     completions.upsertAgent({ agentId: agentId("agent-a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl"), currentRunId: runId("deadbeef") });
     const controller = new SubagentController({ completions });
-    const receive = createSubagentTools(controller).receive_agent;
+    const awaitTool = createSubagentTools(controller).await_agent;
     const abort = new AbortController();
 
-    const pending = receive.execute({}, abort.signal).catch((error: Error) => error);
+    const pending = awaitTool.execute({}, abort.signal).catch((error: Error) => error);
     await new Promise<void>((resolve) => setImmediate(resolve));
     abort.abort();
     const failure = await pending;
@@ -494,7 +487,7 @@ describe("exact tool contracts", () => {
     await controller.publish({ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: CompletionState.Completed,
       output: truncateUtf8("done", utf8Bytes(50_000)), outputPath: testCommittedOutputPath({ workDir: testAbsolutePath("/tmp/pi-subagents-test/output/agent-a"), runId: runId("deadbeef") }), transcriptPath: testSessionPath("/tmp/pi-subagents-test/a.jsonl") });
     expect(controller.completions.queuedCount()).toBe(1);
-    expect((await receive.execute({})).details).toMatchObject({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed" }] });
+    expect((await awaitTool.execute({})).details).toMatchObject({ completions: [{ agentId: "agent-a", runId: "deadbeef", state: "completed" }] });
   });
 
   for (const operation of ["spawn", "send"] as const) {
@@ -556,12 +549,13 @@ describe("exact tool contracts", () => {
       spawn: async () => ({ agentId: "agent-a", runId: "deadbeef", state: "running",
         model: "mock-provider/family/luna", thinkingLevel: "off", tools: [], message: secret, process: { secret } }),
       sendInput: async () => ({ agentId: "agent-a", runId: "cafebabe", state: "running", message: secret, client: { secret } }),
-      receive: async () => ({
-        completions: [{
+      awaitReady: async () => ({
+        completion: {
           agentId: "agent-a", runId: "deadbeef", state: CompletionState.Failed,
           output: truncateUtf8(secret, utf8Bytes(50_000)), outputPath: "/tmp/out.md", transcriptPath: "/tmp/session.jsonl",
           error: { code: "protocol_error", message: secret },
-        }],
+        },
+        remainingCompletions: 0,
         agents: [{
           agentId: "agent-a", state: AgentState.Stopped, transcriptPath: "/tmp/session.jsonl",
           latestCompletionState: CompletionState.Failed, latestOutputPath: "/tmp/out.md",
@@ -579,13 +573,13 @@ describe("exact tool contracts", () => {
     const results = await Promise.all([
       tools.spawn_agent.execute({ task: "prompt-secret" }),
       tools.send_input.execute({ agentId: "agent-a", message: "message-secret" }),
-      tools.receive_agent.execute({}),
+      tools.await_agent.execute({}),
       tools.stop_agent.execute({ agentIds: ["agent-a"] }),
     ]);
     const rendered = [
       tools.spawn_agent.renderResult!(results[0]!),
       tools.send_input.renderResult!(results[1]!),
-      tools.receive_agent.renderResult!(results[2]!),
+      tools.await_agent.renderResult!(results[2]!),
       tools.stop_agent.renderResult!(results[3]!),
     ];
 
@@ -608,7 +602,7 @@ describe("exact tool contracts", () => {
     expect(rendered[2]).not.toContain("/tmp/session.jsonl");
     expect(results[2]!.details).toMatchObject({
       completions: [{ transcriptPath: "/tmp/session.jsonl" }],
-      agents: [{ transcriptPath: "/tmp/session.jsonl" }],
+      inventory: { agents: [{ transcriptPath: "/tmp/session.jsonl" }] },
     });
     expect(results[2]!.content).toContain('"transcriptPath":"/tmp/session.jsonl"');
     expect(rendered[3]).toContain("outcomes=1");
@@ -623,127 +617,21 @@ describe("exact tool contracts", () => {
     }
   });
 
-  test("receive renderer bounds a large inventory without displaying transcript paths", async () => {
+  test("await renderer bounds a large inventory without displaying transcript paths", async () => {
     const agents = Array.from({ length: 1_000 }, (_, index) => ({
       agentId: `agent-${index}`,
       state: AgentState.Stopped,
       transcriptPath: `/tmp/${"path/".repeat(500)}${index}.jsonl`,
     }));
-    const controller = fakeToolController({ receive: async () => ({ completions: [], agents, timedOut: false }) });
-    const receive = createSubagentTools(controller).receive_agent;
+    const controller = fakeToolController({ awaitReady: async () => ({ completion: undefined, remainingCompletions: 0, agents, timedOut: false }) });
+    const awaitTool = createSubagentTools(controller).await_agent;
 
-    const rendered = receive.renderResult!(await receive.execute({}));
+    const rendered = awaitTool.renderResult!(await awaitTool.execute({}));
 
-    expect(rendered).toStartWith("completions=0 agents=1000 timedOut=false");
+    expect(rendered).toMatch(/^completions=0 agents=\d+ timedOut=false/);
     expect(rendered).not.toContain("transcriptPath");
     expect(rendered).not.toContain("/tmp/path/");
-    expect(new TextEncoder().encode(rendered).byteLength).toBe(8_192);
-  });
-
-  test("receive_agent fairly admits a small output beside an oversized output at the provider boundary", async () => {
-    const source = receiveFixture(["a".repeat(50_000), "b".repeat(2_000)]);
-    source.completions[0]!.output.originalBytes = 60_000;
-    source.completions[0]!.output.truncated = true;
-    const before = JSON.stringify(source);
-    const receive = createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent;
-
-    const result = await receive.execute({});
-    const contentDetails = receiveContentDetails(result.content);
-
-    expect(result.details).toEqual(source);
-    expect(contentDetails.completions[1]!.output.text).toBe("b".repeat(2_000));
-    expect(contentDetails.completions[1]!.output.retainedBytes).toBe(2_000);
-    expect(contentDetails.completions[0]!.output.originalBytes).toBe(60_000);
-    expect(contentDetails.completions[0]!.output.truncated).toBeTrue();
-    expect(contentDetails.completions[0]!.output.retainedBytes).toBeGreaterThan(40_000);
-    expectProviderBoundedResult(source, result);
-    expect(JSON.stringify(source)).toBe(before);
-    expect(receive.renderResult!(result)).not.toContain("a".repeat(100));
-  });
-
-  test("receive_agent applies deterministic fair queue remainder to mixed small and large outputs", async () => {
-    const source = receiveFixture(["a".repeat(50_000), "small", "b".repeat(50_000)]);
-    const receive = createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent;
-
-    const first = await receive.execute({});
-    const second = await receive.execute({});
-    const bounded = receiveContentDetails(first.content);
-    const firstLarge = bounded.completions[0]!.output.retainedBytes;
-    const secondLarge = bounded.completions[2]!.output.retainedBytes;
-
-    expect(bounded.completions[1]!.output.text).toBe("small");
-    expect(Math.abs(firstLarge - secondLarge)).toBeLessThanOrEqual(1);
-    expect(firstLarge).toBeGreaterThanOrEqual(secondLarge);
-    expect(second.content).toBe(first.content);
-    expectProviderBoundedResult(source, first);
-  });
-
-  test("receive_agent costs emoji and escaped control text as final JSON while retaining complete prefixes", async () => {
-    const source = receiveFixture(["😀".repeat(12_500), "\n\u0000\\\"".repeat(12_500)]);
-    const result = await createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent.execute({});
-    const bounded = receiveContentDetails(result.content);
-
-    expect(bounded.completions[0]!.output.text.endsWith("😀")).toBeTrue();
-    expect(bounded.completions[1]!.output.text.length).toBeGreaterThan(0);
-    expectProviderBoundedResult(source, result);
-  });
-
-  test("receive_agent preserves prior truncation metadata and does not mutate provider inputs", async () => {
-    const source = receiveFixture(["x".repeat(50_000), "y".repeat(1_000)]);
-    source.completions[0]!.output.originalBytes = 60_000;
-    source.completions[0]!.output.truncated = true;
-    const before = structuredClone(source);
-
-    const result = await createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent.execute({});
-    const bounded = receiveContentDetails(result.content);
-
-    expect(bounded.completions[0]!.output.originalBytes).toBe(60_000);
-    expect(bounded.completions[0]!.output.truncated).toBeTrue();
-    expect(source).toEqual(before);
-    expectProviderBoundedResult(source, result);
-  });
-
-  test("receive_agent compacts only provider content inventory metadata and preserves full renderer details", async () => {
-    const source = receiveFixture(["a".repeat(50_000)]);
-    source.agents = Array.from({ length: 500 }, (_, index) => ({
-      agentId: `agent-${index}`,
-      state: AgentState.Stopped,
-      transcriptPath: `/tmp/pi-subagents-test/${index}/${"path/".repeat(8)}session.jsonl`,
-      latestCompletionState: CompletionState.Completed,
-      latestOutputPath: `/tmp/pi-subagents-test/${index}/${"path/".repeat(8)}output.md`,
-    }));
-    const fullProjectedDetails = structuredClone(source);
-    const receive = createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent;
-
-    const result = await receive.execute({});
-    const contentDetails = receiveContentDetails(result.content);
-
-    expect(result.details).toEqual(fullProjectedDetails);
-    expect(contentDetails.agents).toHaveLength(500);
-    expect(contentDetails.agents[0]).toEqual({
-      agentId: "agent-0", state: AgentState.Stopped, latestCompletionState: CompletionState.Completed,
-    });
-    const fullAgents = (result.details as ReceiveBoundaryContent).agents;
-    expect(fullAgents[0]).toMatchObject({
-      transcriptPath: expect.stringContaining("session.jsonl"),
-      latestOutputPath: expect.stringContaining("output.md"),
-    });
-    expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
-    expect(result.content).toBe(JSON.stringify(contentDetails));
-    expect(receive.renderResult!(result)).toContain("latestOutputPath=");
-    expectProviderBoundedResult(source, result);
-  });
-
-  test("receive_agent fails closed when compact zero-text inventory metadata exceeds the cap", async () => {
-    const source = receiveFixture([]);
-    source.agents = Array.from({ length: 2_000 }, (_, index) => ({
-      agentId: `agent-${index}-${"x".repeat(30)}`,
-      state: AgentState.Stopped,
-      transcriptPath: `/tmp/pi-subagents-test/${index}.jsonl`,
-    }));
-
-    await expect(createSubagentTools(fakeToolController({ receive: async () => source })).receive_agent.execute({}))
-      .rejects.toThrow("internal_error: internal agent result is invalid");
+    expect(new TextEncoder().encode(rendered).byteLength).toBeLessThanOrEqual(8_192);
   });
 
   test("stop projects each successful public outcome without injected fields", async () => {
@@ -814,7 +702,7 @@ describe("exact tool contracts", () => {
       const controller = fakeToolController({
         spawn: async () => Object.defineProperty({}, "state", { get: () => { throw new Error(secret); } }),
         sendInput: async () => Object.defineProperty({}, "state", { get: () => { throw new Error(secret); } }),
-        receive: async () => Object.defineProperty({}, "completions", { get: () => { throw new Error(secret); } }),
+        awaitReady: async () => Object.defineProperty({}, "completions", { get: () => { throw new Error(secret); } }),
         stop: async () => Object.defineProperty({}, "state", { get: () => { throw new Error(secret); } }),
       });
       const tools = createSubagentTools(controller);
@@ -891,327 +779,15 @@ describe("exact tool contracts", () => {
   });
 });
 
-describe("fair prefix cost tables", () => {
-  test.each([
-    ["ASCII", "A"],
-    ["multibyte", "é"],
-    ["surrogate pair", "😀"],
-    ["quote", '"'],
-    ["backslash", "\\"],
-    ["newline", "\n"],
-    ["NUL", "\0"],
-  ])("fair prefix accounts exactly for %s", (_name, text) => {
-    const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
-    const table = buildFairOutputTable(text, retainedBytes, false);
-    const zero = projectedFairCompletion("", retainedBytes, false);
-
-    expect(table).toEqual(expect.objectContaining({
-      text,
-      originalRetainedBytes: retainedBytes,
-      previouslyTruncated: false,
-    }));
-    expect(table.prefixes[0] as unknown).toEqual({ endOffset: 0, retainedBytes: 0, serialisedDeltaBytes: 0 });
-    expect(Number(table.prefixes.at(-1)?.endOffset)).toBe(text.length);
-    expect(table.prefixes.at(-1)?.retainedBytes).toBe(retainedBytes);
-
-    for (const prefix of table.prefixes) {
-      const prefixText = text.slice(0, prefix.endOffset);
-      expect(Buffer.byteLength(prefixText, "utf8")).toBe(Number(prefix.retainedBytes));
-      expect(Buffer.byteLength(JSON.stringify(projectedFairCompletion(prefixText, retainedBytes, false)), "utf8")
-        - Buffer.byteLength(JSON.stringify(zero), "utf8")).toBe(Number(prefix.serialisedDeltaBytes));
-    }
-
-    expect(table.prefixes.slice(1).every((prefix, index) =>
-      prefix.retainedBytes > table.prefixes[index]!.retainedBytes)).toBeTrue();
-  });
-
-  test("distinguishes UTF-16 offsets from retained UTF-8 bytes across a surrogate pair", () => {
-    const text = "A£😀";
-    const table = buildFairOutputTable(text, utf8Bytes(7), false);
-
-    expect(table.prefixes.map((prefix) => Number(prefix.endOffset))).toEqual([0, 1, 2, 4]);
-    expect(table.prefixes.map((prefix) => Number(prefix.retainedBytes))).toEqual([0, 1, 3, 7]);
-    expect(text.slice(0, table.prefixes.at(-1)!.endOffset)).toBe(text);
-  });
-
-  test("fair prefix tracks mixed complete boundaries across decimal byte lengths", () => {
-    const text = "12345678ab😀é";
-    const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
-    const table = buildFairOutputTable(text, retainedBytes, false);
-    const zero = projectedFairCompletion("", retainedBytes, false);
-
-    expect(table.prefixes).toHaveLength(13);
-    expect(table.prefixes.map((prefix) => Number(prefix.endOffset))).toEqual([
-      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13,
-    ]);
-    expect(table.prefixes.map((prefix) => Number(prefix.retainedBytes))).toEqual([
-      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 16,
-    ]);
-    expect(table.prefixes.slice(1).every((prefix, index) =>
-      prefix.retainedBytes > table.prefixes[index]!.retainedBytes)).toBeTrue();
-
-    for (const prefix of table.prefixes) {
-      const prefixText = text.slice(0, prefix.endOffset);
-      const measuredDelta = Buffer.byteLength(JSON.stringify(projectedFairCompletion(prefixText, retainedBytes, false)), "utf8")
-        - Buffer.byteLength(JSON.stringify(zero), "utf8");
-      expect(measuredDelta).toBe(Number(prefix.serialisedDeltaBytes));
-    }
-  });
-
-  test("fair prefix preserves prior truncation when costing boolean metadata", () => {
-    const table = buildFairOutputTable("A", utf8Bytes(1), true);
-    const final = table.prefixes.at(-1)!;
-    const zero = projectedFairCompletion("", 1, true);
-
-    expect(Number(final.serialisedDeltaBytes)).toBe(
-      Buffer.byteLength(JSON.stringify(projectedFairCompletion("A", 1, true)), "utf8")
-        - Buffer.byteLength(JSON.stringify(zero), "utf8"),
-    );
-  });
-
-  test("fair prefix rejects retained-byte metadata that does not match complete input", () => {
-    expect(() => buildFairOutputTable("é", utf8Bytes(1), false)).toThrow(CodedError);
-    expect(() => buildFairOutputTable("é", utf8Bytes(1), false)).toThrow("internal_error");
-  });
-});
-
-describe("nominal max-min allocation", () => {
-  const zeroTextSerialisedBytes = utf8Bytes(1_000);
-
-  test("fully admits a 2 KB output and redistributes its unused share to a 60 KB output", () => {
-    const tables = [fairTable("a".repeat(60_000)), fairTable("b".repeat(2_000))];
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 10_000);
-
-    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-
-    expect(allocation.prefixIndices[1]).toBe(tables[1]!.prefixes.length - 1);
-    expect(Number(allocation.retainedBytes[1])).toBe(2_000);
-    expect(allocation.serialisedBytes).toBe(cap);
-    expect(allocation.retainedBytes[0]).toBeGreaterThan(5_000);
-    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-
-  test("gives the first equally large ASCII output the nominal remainder byte", () => {
-    const tables = [fairTable("a".repeat(1_000)), fairTable("b".repeat(1_000))];
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 101);
-
-    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-    const deltas = selectedDeltas(allocation.prefixIndices, tables);
-
-    expect(deltas).toEqual([51, 50]);
-    expect(Math.abs(deltas[0]! - deltas[1]!)).toBeLessThanOrEqual(1);
-    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-
-  test("removes every demand below the waterline before redividing among large outputs", () => {
-    const tables = [fairTable("a".repeat(2)), fairTable("b".repeat(8)), fairTable("c".repeat(100)), fairTable("d".repeat(100))];
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 50);
-
-    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-    const deltas = selectedDeltas(allocation.prefixIndices, tables);
-
-    expect(allocation.prefixIndices.slice(0, 2)).toEqual([
-      tables[0]!.prefixes.length - 1,
-      tables[1]!.prefixes.length - 1,
-    ]);
-    expect(deltas).toEqual([3, 9, 19, 19]);
-    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-
-  test("selects complete emoji and multibyte prefixes when a nominal share ends inside a code point", () => {
-    const tables = [fairTable("😀".repeat(10)), fairTable("é".repeat(10))];
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 11);
-
-    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-
-    expect(allocation.prefixIndices).toEqual([1, 3]);
-    expect(allocation.retainedBytes.map(Number)).toEqual([4, 6]);
-    expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([4, 6]);
-    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-
-  test("uses exact escaped JSON cost rather than raw UTF-8 size", () => {
-    const tables = [fairTable("\n".repeat(100))];
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 11);
-
-    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-
-    expect(allocation.prefixIndices).toEqual([5]);
-    expect(allocation.retainedBytes.map(Number)).toEqual([5]);
-    expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([10]);
-    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-
-  test("offers pooled unusable complete-prefix slack in queue order and restarts", () => {
-    const tables = [fairTable("😀".repeat(10)), fairTable("😀".repeat(10)), fairTable("😀".repeat(10))];
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 17);
-
-    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-
-    expect(allocation.prefixIndices).toEqual([2, 1, 1]);
-    expect(selectedDeltas(allocation.prefixIndices, tables)).toEqual([8, 4, 4]);
-    expect(allocation.serialisedBytes).toBe(utf8Bytes(zeroTextSerialisedBytes + 16));
-    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-
-  test("keeps previous truncation metadata after full admission", () => {
-    const table = buildFairOutputTable("abc", utf8Bytes(3), true);
-    const cap = utf8Bytes(zeroTextSerialisedBytes + table.prefixes.at(-1)!.serialisedDeltaBytes);
-
-    const allocation = allocateFairOutputs([table], zeroTextSerialisedBytes, cap);
-
-    expect(allocation.prefixIndices).toEqual([table.prefixes.length - 1]);
-    expect(allocation.retainedBytes.map(Number)).toEqual([3]);
-    expect(projectedFairCompletion("abc", 3, true)).toMatchObject({ output: { truncated: true } });
-    expectFairAllocationWithinCap(allocation.prefixIndices, [table], zeroTextSerialisedBytes, cap);
-  });
-
-  test("is deterministic across repeated calls and does not mutate inputs", () => {
-    const tables = [fairTable("😀".repeat(10)), fairTable("x".repeat(100)), fairTable("")];
-    const before = JSON.stringify(tables);
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 31);
-
-    const first = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-    const second = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap);
-
-    expect(second).toEqual(first);
-    expect(JSON.stringify(tables)).toBe(before);
-    expectFairAllocationWithinCap(first.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-
-  test("returns zero-text bytes unchanged for zero outputs and empty outputs", () => {
-    const emptyTable = fairTable("");
-
-    const noOutputs = allocateFairOutputs([], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
-    const emptyOutput = allocateFairOutputs([emptyTable], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
-
-    expect(noOutputs).toEqual({ prefixIndices: [], retainedBytes: [], serialisedBytes: zeroTextSerialisedBytes });
-    expect(emptyOutput as unknown).toEqual({ prefixIndices: [0], retainedBytes: [0], serialisedBytes: zeroTextSerialisedBytes });
-    expectFairAllocationWithinCap(noOutputs.prefixIndices, [], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
-    expectFairAllocationWithinCap(emptyOutput.prefixIndices, [emptyTable], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes + 10));
-  });
-
-  test("throws stable internal_error when zero text exceeds the cap", () => {
-    expect(() => allocateFairOutputs([], zeroTextSerialisedBytes, utf8Bytes(zeroTextSerialisedBytes - 1)))
-      .toThrow("internal_error: internal agent result is invalid");
-  });
-
-  test("reports bounded full checks, searches, and admitted slack transitions", () => {
-    const tables = [fairTable("a"), fairTable(""), fairTable("😀".repeat(20)), fairTable("é".repeat(20)), fairTable("z".repeat(100))];
-    const stats: FairAllocationStats = { fullAdmissionChecks: 0, prefixSearches: 0, slackTransitions: 0 };
-    const cap = utf8Bytes(zeroTextSerialisedBytes + 32);
-
-    const allocation = allocateFairOutputs(tables, zeroTextSerialisedBytes, cap, stats);
-
-    expect(allocation.prefixIndices[0]).toBe(tables[0]!.prefixes.length - 1);
-    expect(stats.fullAdmissionChecks).toBeLessThanOrEqual(tables.length * tables.length);
-    expect(stats.prefixSearches).toBe(3);
-    expect(stats.slackTransitions).toBeLessThanOrEqual(
-      tables.reduce((total, table) => total + table.prefixes.length, 0),
-    );
-    expectFairAllocationWithinCap(allocation.prefixIndices, tables, zeroTextSerialisedBytes, cap);
-  });
-});
-
-interface ReceiveBoundaryOutput {
-  text: string;
-  originalBytes: number;
-  retainedBytes: number;
-  truncated: boolean;
+function testRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("expected test record");
+  return value as Record<string, unknown>;
 }
 
-interface ReceiveBoundaryCompletion {
-  agentId: string;
-  runId: string;
-  state: CompletionState;
-  output: ReceiveBoundaryOutput;
-  outputPath: string;
-  transcriptPath: string;
-}
-
-interface ReceiveBoundaryFixture {
-  completions: ReceiveBoundaryCompletion[];
-  agents: Array<Record<string, unknown>>;
-  timedOut: boolean;
-}
-
-interface ReceiveBoundaryContent {
-  completions: ReceiveBoundaryCompletion[];
-  agents: Array<Record<string, unknown>>;
-  timedOut: boolean;
-}
-
-function receiveFixture(texts: readonly string[]): ReceiveBoundaryFixture {
-  return {
-    completions: texts.map((text, index) => {
-      const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
-      return {
-        agentId: `agent-${index}`,
-        runId: (index + 1).toString(16).padStart(8, "0"),
-        state: CompletionState.Completed,
-        output: { text, originalBytes: retainedBytes, retainedBytes, truncated: false },
-        outputPath: `/tmp/pi-subagents-test/${index}.output.md`,
-        transcriptPath: `/tmp/pi-subagents-test/${index}.session.jsonl`,
-      };
-    }),
-    agents: [],
-    timedOut: false,
-  };
-}
-
-function receiveContentDetails(content: string): ReceiveBoundaryContent {
-  return JSON.parse(content) as ReceiveBoundaryContent;
-}
-
-function expectProviderBoundedResult(
-  source: ReceiveBoundaryFixture,
-  result: { content: string; details: object },
-): void {
-  const bounded = receiveContentDetails(result.content);
-  expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
-  expect(result.content).toBe(JSON.stringify(bounded));
-  expect(bounded.completions).toHaveLength(source.completions.length);
-  for (const [index, selected] of bounded.completions.entries()) {
-    const input = source.completions[index]!;
-    expect(input.output.text.startsWith(selected.output.text)).toBeTrue();
-    expect(selected.output.retainedBytes).toBe(Buffer.byteLength(selected.output.text, "utf8"));
-    expect(selected.output.originalBytes).toBe(input.output.originalBytes);
-    expect(selected.output.truncated).toBe(
-      input.output.truncated || selected.output.retainedBytes < input.output.retainedBytes,
-    );
-    if (selected.output.truncated) expect(selected.outputPath).toBe(input.outputPath);
-  }
-}
-
-function fairTable(text: string, previouslyTruncated = false) {
-  return buildFairOutputTable(text, utf8Bytes(Buffer.byteLength(text, "utf8")), previouslyTruncated);
-}
-
-function selectedDeltas(prefixIndices: readonly number[], tables: readonly ReturnType<typeof fairTable>[]): number[] {
-  return prefixIndices.map((prefixIndex, index) => tables[index]!.prefixes[prefixIndex]!.serialisedDeltaBytes);
-}
-
-function expectFairAllocationWithinCap(
-  prefixIndices: readonly number[],
-  tables: readonly ReturnType<typeof fairTable>[],
-  zeroTextSerialisedBytes: Utf8Bytes,
-  cap: Utf8Bytes,
-): void {
-  const measured = zeroTextSerialisedBytes
-    + selectedDeltas(prefixIndices, tables).reduce((total, delta) => total + delta, 0);
-  expect(measured).toBeLessThanOrEqual(cap);
-}
-
-function projectedFairCompletion(text: string, originalRetainedBytes: number, previouslyTruncated: boolean): object {
-  const retainedBytes = utf8Bytes(Buffer.byteLength(text, "utf8"));
-  return {
-    output: {
-      text,
-      originalBytes: originalRetainedBytes,
-      retainedBytes,
-      truncated: previouslyTruncated || retainedBytes < originalRetainedBytes,
-    },
-  };
+function testString(value: Record<string, unknown>, key: string): string {
+  const item = value[key];
+  if (typeof item !== "string") throw new Error(`expected test string ${key}`);
+  return item;
 }
 
 function schemaDescription(schema: object): string | undefined {
@@ -1232,9 +808,9 @@ function executeTool(tools: SubagentToolRegistry, name: SubagentToolName, input:
     case "send_input":
       // Deliberately malformed hostile input: this cast crosses the public-tool trust boundary.
       return tools.send_input.execute(input as SendInputInput);
-    case "receive_agent":
+    case "await_agent":
       // Deliberately malformed hostile input: this cast crosses the public-tool trust boundary.
-      return tools.receive_agent.execute(input as ReceiveAgentInput);
+      return tools.await_agent.execute(input as AwaitAgentInput);
     case "stop_agent":
       // Deliberately malformed hostile input: this cast crosses the public-tool trust boundary.
       return tools.stop_agent.execute(input as StopAgentInput);
@@ -1245,7 +821,7 @@ function executeTool(tools: SubagentToolRegistry, name: SubagentToolName, input:
 const HOSTILE_TOOL_CASES = {
   spawn_agent: { validInput: { task: "x" }, inputKey: "task" },
   send_input: { validInput: { agentId: "agent-a", message: "x" }, inputKey: "agentId" },
-  receive_agent: { validInput: {}, inputKey: "timeoutMs" },
+  await_agent: { validInput: {}, inputKey: "timeoutMs" },
   stop_agent: { validInput: { agentIds: ["agent-a"] }, inputKey: "agentIds" },
 } as const satisfies Record<SubagentToolName, { validInput: object; inputKey: string }>;
 

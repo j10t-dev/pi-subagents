@@ -10,7 +10,7 @@ import { delegationDepth, type AbsolutePath, type DelegationDepth } from "./src/
 import { createProductionController } from "./src/pi-composition.ts";
 import { absolutePath } from "./src/paths.ts";
 import { loadSubagentSettings, readGlobalMaxDepth, readSubagentSettingsFiles, type SubagentSettingsResolved } from "./src/settings.ts";
-import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
+import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
 
 const STATUS_KEY = "pi-subagents";
 type ToolRegistrationSpec<K extends SubagentToolName> = {
@@ -28,15 +28,15 @@ type ToolRegistrationSpecs = {
 const TOOL_SPECS = {
   spawn_agent: {
     label: "Spawn agent",
-    description: "Start a persistent child assignment asynchronously; collect completion with receive_agent.",
+    description: "Start a persistent child assignment asynchronously; collect completion with await_agent.",
     parameters: spawnAgentSchema,
     promptSnippet: "Delegate a fresh persistent assignment with spawn_agent",
     promptGuidelines: [
-      "When delegation is requested, call spawn_agent directly, then use receive_agent to collect completion.",
+      "When delegation is requested, call spawn_agent directly, then use await_agent to collect completion.",
     ],
   },
   send_input: { label: "Send input", description: "Start a literal assignment on a stopped child agent.", parameters: sendInputSchema },
-  receive_agent: { label: "Receive agent", description: "Receive ready completions and the complete owned-agent inventory.", parameters: receiveAgentSchema },
+  await_agent: { label: "Await agent", description: "Await one ready completion and page the owned-agent inventory.", parameters: awaitAgentSchema },
   stop_agent: { label: "Stop agent", description: "Stop one or more owned child agents.", parameters: stopAgentSchema },
 } satisfies ToolRegistrationSpecs;
 
@@ -94,7 +94,7 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
     const resolveCurrent = (): ExtensionController | undefined => current;
     registerSubagentTool(pi, "spawn_agent", TOOL_SPECS.spawn_agent, resolveCurrent, refreshAfterTool);
     registerSubagentTool(pi, "send_input", TOOL_SPECS.send_input, resolveCurrent, refreshAfterTool);
-    registerSubagentTool(pi, "receive_agent", TOOL_SPECS.receive_agent, resolveCurrent, refreshAfterTool);
+    registerSubagentTool(pi, "await_agent", TOOL_SPECS.await_agent, resolveCurrent, refreshAfterTool);
     registerSubagentTool(pi, "stop_agent", TOOL_SPECS.stop_agent, resolveCurrent, refreshAfterTool);
 
     pi.on("session_start", (_event, context) => serialiseLifecycle(async () => {

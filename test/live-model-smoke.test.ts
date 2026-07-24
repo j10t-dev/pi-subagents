@@ -25,7 +25,7 @@ if (prerequisiteFailure !== undefined) {
       cwd: process.cwd(),
       provider: MODEL_PROVIDER,
       model: MODEL_ID,
-      args: ["--approve", "--tools", "spawn_agent,receive_agent,web_fetch"],
+      args: ["--approve", "--tools", "spawn_agent,await_agent,web_fetch"],
     });
     try {
       await client.start();
@@ -43,16 +43,16 @@ if (prerequisiteFailure !== undefined) {
         state: "running", model: `${MODEL_PROVIDER}/${MODEL_ID}`, tools: ["web_fetch"],
       });
 
-      const receiveIndex = parentCalls.findIndex((call) => call.name === "receive_agent");
-      expect(receiveIndex).toBeGreaterThan(parentCalls.indexOf(spawn!));
-      const receiveResult = toolResults(parentEntries).find((result) => {
-        if (result.name !== "receive_agent" || !isRecord(result.details)) return false;
+      const awaitIndex = parentCalls.findIndex((call) => call.name === "await_agent");
+      expect(awaitIndex).toBeGreaterThan(parentCalls.indexOf(spawn!));
+      const awaitResult = toolResults(parentEntries).find((result) => {
+        if (result.name !== "await_agent" || !isRecord(result.details)) return false;
         return Array.isArray(result.details.completions) && result.details.completions.length > 0;
       });
-      const receiveDetails = requireRecord(receiveResult?.details);
-      expect(Array.isArray(receiveDetails.completions)).toBeTrue();
-      expect(receiveDetails.completions).not.toHaveLength(0);
-      const completion = requireRecord((receiveDetails.completions as readonly unknown[])[0]);
+      const awaitDetails = requireRecord(awaitResult?.details);
+      expect(Array.isArray(awaitDetails.completions)).toBeTrue();
+      expect(awaitDetails.completions).not.toHaveLength(0);
+      const completion = requireRecord((awaitDetails.completions as readonly unknown[])[0]);
       expect(completion.state).toBe("completed");
 
       const transcriptPath = completion.transcriptPath;

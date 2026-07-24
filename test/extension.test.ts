@@ -6,7 +6,7 @@ import { withProductionContainmentPreflight } from "../src/pi-composition.ts";
 import type { ContainmentBackend } from "../src/containment.ts";
 import { delegationDepth, runCapacity, type AbsolutePath } from "../src/domain.ts";
 import { absolutePath } from "../src/paths.ts";
-import { receiveAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
+import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
 import { deferred } from "./support/async.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
 import { testAbsolutePath } from "./support/brands.ts";
@@ -64,7 +64,7 @@ function controller(log: string[]): ExtensionController {
     tools: () => ({
       spawn_agent: { name: "spawn_agent", description: "spawn_agent", parameters: spawnAgentSchema, execute: async () => ({ content: "spawn_agent", details: { name: "spawn_agent" } }), renderResult: () => "spawn_agent" },
       send_input: { name: "send_input", description: "send_input", parameters: sendInputSchema, execute: async () => ({ content: "send_input", details: { name: "send_input" } }), renderResult: () => "send_input" },
-      receive_agent: { name: "receive_agent", description: "receive_agent", parameters: receiveAgentSchema, execute: async () => ({ content: "receive_agent", details: { name: "receive_agent" } }), renderResult: () => "receive_agent" },
+      await_agent: { name: "await_agent", description: "await_agent", parameters: awaitAgentSchema, execute: async () => ({ content: "await_agent", details: { name: "await_agent" } }), renderResult: () => "await_agent" },
       stop_agent: { name: "stop_agent", description: "stop_agent", parameters: stopAgentSchema, execute: async () => ({ content: "stop_agent", details: { name: "stop_agent" } }), renderResult: () => "stop_agent" },
     }),
   };
@@ -83,11 +83,11 @@ describe("Pi subagents extension", () => {
     })(extensionApiForTest(h.api));
 
     expect(log).toEqual([]);
-    expect(h.tools.map((tool) => tool.name)).toEqual(["spawn_agent", "send_input", "receive_agent", "stop_agent"]);
+    expect(h.tools.map((tool) => tool.name)).toEqual(["spawn_agent", "send_input", "await_agent", "stop_agent"]);
     expect(h.tools.every((tool) => typeof tool.renderCall === "function" && typeof tool.renderResult === "function")).toBe(true);
     expect(h.tools[0]?.parameters).toBe(spawnAgentSchema);
     expect(h.tools[1]?.parameters).toBe(sendInputSchema);
-    expect(h.tools[2]?.parameters).toBe(receiveAgentSchema);
+    expect(h.tools[2]?.parameters).toBe(awaitAgentSchema);
     expect(h.tools[3]?.parameters).toBe(stopAgentSchema);
     expect([...h.handlers.keys()]).toEqual([
       "session_start", "session_before_tree", "session_before_switch", "session_before_fork", "session_shutdown",
@@ -120,11 +120,11 @@ describe("Pi subagents extension", () => {
         const registry = base.tools();
         return {
           ...registry,
-          receive_agent: {
-            ...registry.receive_agent,
+          await_agent: {
+            ...registry.await_agent,
             execute: async () => {
               await gate.promise;
-              return { content: "receive_agent", details: { name: "receive_agent" } };
+              return { content: "await_agent", details: { name: "await_agent" } };
             },
           },
         };
@@ -135,7 +135,7 @@ describe("Pi subagents extension", () => {
       createController: () => slow, diagnostic: () => {},
     })(extensionApiForTest(h.api));
     await h.emit("session_start", { type: "session_start", reason: "startup" });
-    const tool = h.tools.find((entry) => entry.name === "receive_agent") as {
+    const tool = h.tools.find((entry) => entry.name === "await_agent") as {
       execute(id: string, input: object, signal?: AbortSignal): Promise<{ details: object }>;
     };
 
@@ -144,7 +144,7 @@ describe("Pi subagents extension", () => {
     await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
     gate.resolve();
 
-    expect(await pending).toMatchObject({ details: { name: "receive_agent" } });
+    expect(await pending).toMatchObject({ details: { name: "await_agent" } });
   });
 
   test("spawn registration gives one non-duplicated asynchronous delegation guideline", () => {
@@ -158,11 +158,11 @@ describe("Pi subagents extension", () => {
     const spawn = h.tools.find((tool) => tool.name === "spawn_agent");
 
     expect(spawn?.description).toBe(
-      "Start a persistent child assignment asynchronously; collect completion with receive_agent.",
+      "Start a persistent child assignment asynchronously; collect completion with await_agent.",
     );
     expect(spawn?.promptSnippet).toBe("Delegate a fresh persistent assignment with spawn_agent");
     expect(spawn?.promptGuidelines).toEqual([
-      "When delegation is requested, call spawn_agent directly, then use receive_agent to collect completion.",
+      "When delegation is requested, call spawn_agent directly, then use await_agent to collect completion.",
     ]);
     for (const tool of h.tools.filter((candidate) => candidate.name !== "spawn_agent")) {
       expect(tool.promptGuidelines).toBeUndefined();

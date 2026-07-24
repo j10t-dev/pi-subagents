@@ -41,6 +41,10 @@ import {
 } from "../src/domain.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
+function completionArray<T>(result: { readonly completion?: T }): T[] {
+  return result.completion === undefined ? [] : [result.completion];
+}
+
 const TEST_STATE_ROOT = testAbsolutePath("/tmp");
 
 describe("restoration evidence collection", () => {
@@ -968,7 +972,7 @@ describe("branch restoration", () => {
     const c = new SubagentController({ restoration: port([spawned()], true, []) });
     await c.restore();
     expect(c.runs.snapshots()).toMatchObject([{ state: "stopped" }]);
-    expect((await c.receive()).completions).toEqual([]);
+    expect(completionArray(await c.awaitReady())).toEqual([]);
   });
 
   test("receipt-gates interrupted runs, persists one failure, and reconstructs capacity", async () => {
@@ -977,9 +981,9 @@ describe("branch restoration", () => {
     const c = new SubagentController({ capacity: runCapacity(1), restoration: port(branch, true, writes) });
     await c.restore();
     expect(c.runs.activeCount()).toBe(0);
-    const received = await c.receive();
-    expect(received.completions[0]?.runId as string | undefined).toBe("deadbeef");
-    expect(received.completions[0]?.state).toBe("failed");
+    const received = await c.awaitReady();
+    expect(completionArray(received)[0]?.runId as string | undefined).toBe("deadbeef");
+    expect(completionArray(received)[0]?.state).toBe("failed");
     expect(writes).toHaveLength(1);
   });
 
@@ -1023,12 +1027,12 @@ describe("branch restoration", () => {
     expect(c.runs.snapshot(testAgentId("agent-a"))?.state).toBe("settling");
     expect(c.runs.activeCount()).toBe(1);
     expect(writes).toEqual([]);
-    expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
+    expect(completionArray(await c.awaitReady({ timeoutMs: testMilliseconds(1) }))).toEqual([]);
 
     await c.stop(testAgentId("agent-a"));
     expect(c.runs.activeCount()).toBe(0);
     expect(writes).toHaveLength(1);
-    expect((await c.receive()).completions).toHaveLength(1);
+    expect(completionArray(await c.awaitReady())).toHaveLength(1);
   });
 
   test("unresolved v1 launch retains historical responsibility without inspecting native identity", async () => {
@@ -1102,8 +1106,8 @@ describe("branch restoration", () => {
     const writes: unknown[] = [];
     const c = new SubagentController({ restoration: port([spawned(), launch()], true, writes, testRunId("cafebabe")) });
     await c.restore();
-    const received = await c.receive();
-    expect(received.completions[0]?.runId as string | undefined).toBe("cafebabe");
+    const received = await c.awaitReady();
+    expect(completionArray(received)[0]?.runId as string | undefined).toBe("cafebabe");
     expect(writes).toHaveLength(2);
   });
 
@@ -1123,7 +1127,7 @@ describe("branch restoration", () => {
       const writes: unknown[] = [];
       const c = new SubagentController({ restoration: port([spawned(), launch(), started(), stopping(reason)], true, writes) });
       await c.restore();
-      expect((await c.receive()).completions).toMatchObject([{ state: "cancelled", reason }]);
+      expect(completionArray(await c.awaitReady())).toMatchObject([{ state: "cancelled", reason }]);
       expect(writes).toHaveLength(1);
       expect(c.runs.activeCount()).toBe(0);
     });
@@ -1134,7 +1138,7 @@ describe("branch restoration", () => {
     const branch = [spawned(), launch(), started(), completed("deadbeef"), launch("attempt-2"), started("feedface", "attempt-2"), completed("feedface")];
     const c = new SubagentController({ restoration: port(branch, true, []), parent: { isBusy: () => false, sendMessage: async (_text, options) => { pings.push(options); } } });
     await c.restore();
-    expect((await c.receive()).completions.map((value) => value.runId as string)).toEqual(["feedface"]);
+    expect(completionArray(await c.awaitReady()).map((value) => value.runId as string)).toEqual(["feedface"]);
     expect(pings).toEqual([]);
   });
 
@@ -1143,7 +1147,7 @@ describe("branch restoration", () => {
     const c = new SubagentController({ capacity: runCapacity(1), restoration: port([spawned(), launch(), started(), completed()], false, []), parent: { isBusy: () => false, sendMessage: async () => {}, warn: (message) => warnings.push(message) } });
     await c.restore();
     expect(c.runs.activeCount()).toBe(1);
-    expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
+    expect(completionArray(await c.awaitReady({ timeoutMs: testMilliseconds(1) }))).toEqual([]);
     expect(warnings[0]).toContain("containment_failed");
   });
 
@@ -1194,7 +1198,7 @@ describe("branch restoration", () => {
 
     expect(c.runs.activeCount()).toBe(1);
     expect(c.runs.snapshot(testAgentId("agent-a"))?.state).toBe("settling");
-    expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
+    expect(completionArray(await c.awaitReady({ timeoutMs: testMilliseconds(1) }))).toEqual([]);
     let resumed = false;
     await expect(c.runs.launch(testAgentId("agent-a"), async () => {
       resumed = true;
@@ -1215,14 +1219,14 @@ describe("branch restoration", () => {
     expect(writes).toEqual([]);
     expect(releases).toBe(1);
     expect(c.runs.activeCount()).toBe(0);
-    const restored = await c.receive();
-    expect(restored.completions).toMatchObject([{
+    const restored = await c.awaitReady();
+    expect(completionArray(restored)).toMatchObject([{
       agentId: testAgentId("agent-a"),
       runId: testRunId("deadbeef"),
       state: CompletionState.Completed,
       output: { text: "", originalBytes: 0, retainedBytes: 0, truncated: false },
     }]);
-    expect((await c.receive()).completions).toEqual([]);
+    expect(completionArray(await c.awaitReady())).toEqual([]);
   });
 
   test("receipt validation errors retain nonterminal state", async () => {
@@ -1248,7 +1252,7 @@ describe("branch restoration", () => {
     expect(c.runs.snapshots()).toMatchObject([{ agentId: testAgentId("agent-a"), state: "stopped", transcriptPath: "/tmp/pi-subagents-test/a.jsonl" }]);
     expect(c.runs.activeCount()).toBe(0);
     expect(writes).toEqual([]);
-    expect((await c.receive()).completions).toEqual([]);
+    expect(completionArray(await c.awaitReady())).toEqual([]);
   });
 
   test("receipt-false-then-true reconciles a historical pre-native cursor and releases capacity", async () => {
@@ -1292,7 +1296,7 @@ describe("branch restoration", () => {
       AgentEventType.RunStarted,
       AgentEventType.RunCompleted,
     ]);
-    expect((await c.receive()).completions).toMatchObject([{ state: "failed", runId: "cafebabe" }]);
+    expect(completionArray(await c.awaitReady())).toMatchObject([{ state: "failed", runId: "cafebabe" }]);
   });
 
   test("a later valid receipt finalises a restored settling run exactly once", async () => {
@@ -1307,7 +1311,7 @@ describe("branch restoration", () => {
     valid = true;
     expect(await c.stop(testAgentId("agent-a"))).toMatchObject({ state: "already_stopped" });
     expect(writes).toHaveLength(1);
-    expect((await c.receive()).completions).toMatchObject([{ state: "failed", runId: "deadbeef" }]);
+    expect(completionArray(await c.awaitReady())).toMatchObject([{ state: "failed", runId: "deadbeef" }]);
     expect(c.runs.activeCount()).toBe(0);
   });
 
@@ -1361,7 +1365,7 @@ describe("branch restoration", () => {
     await c.restore();
     expect(writes).toHaveLength(1);
     expect(c.runs.activeCount()).toBe(0);
-    expect((await c.receive()).completions).toMatchObject([{ agentId: testAgentId(), runId: testRunId("deadbeef") }]);
+    expect(completionArray(await c.awaitReady())).toMatchObject([{ agentId: testAgentId(), runId: testRunId("deadbeef") }]);
     expect(pings).toEqual([]);
   });
 
@@ -1403,7 +1407,8 @@ describe("branch restoration", () => {
 
     await c.restore();
     expect(pings).toEqual([]);
-    expect((await c.receive()).completions.map((value) => value.runId)).toEqual([testRunId("feedface"), testRunId("cafebabe")]);
+    expect((await c.awaitReady()).completion?.runId).toBe(testRunId("feedface"));
+    expect((await c.awaitReady()).completion?.runId).toBe(testRunId("cafebabe"));
   });
 
   test("a second restore caller joins the in-flight receipt decision and shares one durable record, reservation, and completion", async () => {
@@ -1449,7 +1454,7 @@ describe("branch restoration", () => {
     await c.restore();
     expect(writes).toHaveLength(2);
     expect(writes.map((value) => (value as { eventType: string }).eventType)).toEqual([AgentEventType.RunStarted, AgentEventType.RunCompleted]);
-    expect((await c.receive()).completions).toHaveLength(1);
+    expect(completionArray(await c.awaitReady())).toHaveLength(1);
   });
 
   for (const decisions of [[true, false], [false, true]] as const) {
@@ -1470,7 +1475,7 @@ describe("branch restoration", () => {
         await expect(c.restore()).rejects.toThrow("disk unavailable");
         await c.stop(testAgentId("agent-a"));
         expect(writes.map((value) => (value as { eventType: string }).eventType)).toEqual([AgentEventType.RunStarted, AgentEventType.RunCompleted]);
-        expect((await c.receive()).completions).toHaveLength(1);
+        expect(completionArray(await c.awaitReady())).toHaveLength(1);
       } else {
         await c.restore();
         expect(writes).toEqual([]);
@@ -1550,10 +1555,10 @@ describe("branch restoration", () => {
       expect(calls).toBe(1);
       if (decisions[0]) {
         expect(c.runs.activeCount()).toBe(0);
-        expect((await c.receive()).completions).toHaveLength(1);
+        expect(completionArray(await c.awaitReady())).toHaveLength(1);
       } else {
         expect(c.runs.activeCount()).toBe(1);
-        expect((await c.receive({ timeoutMs: testMilliseconds(1) })).completions).toEqual([]);
+        expect(completionArray(await c.awaitReady({ timeoutMs: testMilliseconds(1) }))).toEqual([]);
       }
     });
   }

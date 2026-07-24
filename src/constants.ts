@@ -44,8 +44,8 @@ export const CONTAINMENT_TIMEOUT_MS = milliseconds(10_000);
 /** Maximum UTF-8 bytes retained in a stderr tail. */
 export const MAX_STDERR_TAIL_BYTES = utf8Bytes(50_000);
 
-/** Maximum final provider-visible serialised JSON bytes from one `receive_agent` call. */
-export const MAX_AGGREGATE_RECEIVE_BYTES = utf8Bytes(50_000);
+/** Maximum final provider-visible serialised JSON bytes from one `await_agent` call. */
+export const MAX_AGGREGATE_AWAIT_BYTES = utf8Bytes(50_000);
 
 /** Maximum size of one ordinary RPC record before it is discarded through the next LF. */
 export const MAX_RPC_RECORD_BYTES = utf8Bytes(16 * 1024 * 1024);

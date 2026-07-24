@@ -11,6 +11,10 @@ import {
   testMilliseconds,
 } from "./support/brands.ts";
 
+function completionArray<T>(result: { readonly completion?: T }): T[] {
+  return result.completion === undefined ? [] : [result.completion];
+}
+
 const AGENT = testAgentId("agent-1");
 const OTHER_AGENT = testAgentId("agent-2");
 const RUN = testRunId("deadbeef");
@@ -40,35 +44,38 @@ function running(agentId = AGENT): AgentSummary {
   return { agentId, state: AgentState.Running, transcriptPath: SESSION_PATH, currentRunId: RUN };
 }
 
-describe("CompletionService.receive", () => {
+describe("CompletionService.await", () => {
   test("returns immediately with an empty batch when nothing is queued and no run is active", async () => {
     const service = new CompletionService();
-    const result = await service.receive();
-    expect(result.completions).toEqual([]);
+    const result = await service.awaitReady();
+    expect(completionArray(result)).toEqual([]);
     expect(result.timedOut).toBe(false);
   });
 
-  test("drains everything queued immediately", async () => {
+  test("awaitReady drains one completion and reports the exact remainder", async () => {
     const service = new CompletionService();
     await service.publish(completion());
     await service.publish(completion({ agentId: OTHER_AGENT }));
 
-    const result = await service.receive();
-    expect(result.completions.length).toBe(2);
-    expect(result.timedOut).toBe(false);
+    const first = await service.awaitReady({ timeoutMs: testMilliseconds(0) });
+    expect(first.completion?.agentId).toBe(AGENT);
+    expect(Number(first.remainingCompletions)).toBe(1);
+    const second = await service.awaitReady({ timeoutMs: testMilliseconds(0) });
+    expect(second.completion?.agentId).toBe(OTHER_AGENT);
+    expect(Number(second.remainingCompletions)).toBe(0);
   });
 
   test("rejects a second receiver that would block without disturbing the first", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    const first = service.receive();
-    const second = service.receive();
+    const first = service.awaitReady();
+    const second = service.awaitReady();
 
     await expect(second).rejects.toThrow("invalid_state: agent is not in a valid state for this operation");
     await service.publish(completion());
     await expect(first).resolves.toMatchObject({
-      completions: [expect.objectContaining({ runId: RUN })],
+      completion: expect.objectContaining({ runId: RUN }),
       timedOut: false,
     });
     expect(service.queuedCount()).toBe(0);
@@ -78,50 +85,50 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    const waiting = service.receive();
-    await expect(service.receive({ timeoutMs: testMilliseconds(0) })).resolves.toMatchObject({
-      completions: [],
+    const waiting = service.awaitReady();
+    await expect(service.awaitReady({ timeoutMs: testMilliseconds(0) })).resolves.toMatchObject({
+      remainingCompletions: 0,
       timedOut: true,
     });
 
     await service.publish(completion());
-    await expect(waiting).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    await expect(waiting).resolves.toMatchObject({ completion: expect.any(Object), timedOut: false });
   });
 
   test("queued completions still drain while another caller is blocked only after publication", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
-    const waiting = service.receive();
+    const waiting = service.awaitReady();
 
     await service.publish(completion());
     const delivered = await waiting;
 
-    expect(delivered.completions).toHaveLength(1);
-    await expect(service.receive()).resolves.toMatchObject({ completions: [], timedOut: false });
+    expect(completionArray(delivered)).toHaveLength(1);
+    await expect(service.awaitReady()).resolves.toMatchObject({ remainingCompletions: 0, timedOut: false });
   });
 
   test("times out and returns an empty, timed-out batch without consuming later arrivals", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    const result = await service.receive({ timeoutMs: testMilliseconds(10) });
-    expect(result.completions).toEqual([]);
+    const result = await service.awaitReady({ timeoutMs: testMilliseconds(10) });
+    expect(completionArray(result)).toEqual([]);
     expect(result.timedOut).toBe(true);
 
     await service.publish(completion());
-    const next = await service.receive();
-    expect(next.completions.length).toBe(1);
+    const next = await service.awaitReady();
+    expect(completionArray(next).length).toBe(1);
   });
 
   test("timeout cannot clear a later waiter", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    await expect(service.receive({ timeoutMs: testMilliseconds(1) })).resolves.toMatchObject({ timedOut: true });
-    const later = service.receive();
+    await expect(service.awaitReady({ timeoutMs: testMilliseconds(1) })).resolves.toMatchObject({ timedOut: true });
+    const later = service.awaitReady();
     await service.publish(completion());
 
-    await expect(later).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    await expect(later).resolves.toMatchObject({ completion: expect.any(Object), timedOut: false });
   });
 
   test("an aborted waiter cannot clear the waiter installed after it", async () => {
@@ -129,13 +136,13 @@ describe("CompletionService.receive", () => {
     service.upsertAgent(running());
     const controller = new AbortController();
 
-    const first = service.receive({ signal: controller.signal });
+    const first = service.awaitReady({ signal: controller.signal });
     controller.abort();
     await expect(first).rejects.toBeInstanceOf(Error);
 
-    const later = service.receive();
+    const later = service.awaitReady();
     await service.publish(completion());
-    await expect(later).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    await expect(later).resolves.toMatchObject({ completion: expect.any(Object), timedOut: false });
     expect(service.queuedCount()).toBe(0);
   });
 
@@ -143,10 +150,10 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    const waiting = service.receive({ timeoutMs: testMilliseconds(10) });
+    const waiting = service.awaitReady({ timeoutMs: testMilliseconds(10) });
     await service.publish(completion());
 
-    await expect(waiting).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    await expect(waiting).resolves.toMatchObject({ completion: expect.any(Object), timedOut: false });
     expect(service.queuedCount()).toBe(0);
   });
 
@@ -154,10 +161,10 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    await expect(service.receive({ timeoutMs: testMilliseconds(1) })).resolves.toMatchObject({ completions: [], timedOut: true });
+    await expect(service.awaitReady({ timeoutMs: testMilliseconds(1) })).resolves.toMatchObject({ remainingCompletions: 0, timedOut: true });
     await service.publish(completion());
 
-    await expect(service.receive()).resolves.toMatchObject({ completions: [expect.any(Object)] });
+    await expect(service.awaitReady()).resolves.toMatchObject({ completion: expect.any(Object) });
   });
 
   test("publication before abort delivers exactly one completion and leaves none queued", async () => {
@@ -166,27 +173,27 @@ describe("CompletionService.receive", () => {
     const controller = new AbortController();
     const removeAbortListener = spyOn(controller.signal, "removeEventListener");
 
-    const waiting = service.receive({ signal: controller.signal });
+    const waiting = service.awaitReady({ signal: controller.signal });
     await service.publish(completion());
     controller.abort();
 
-    await expect(waiting).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    await expect(waiting).resolves.toMatchObject({ completion: expect.any(Object), timedOut: false });
     expect(removeAbortListener).toHaveBeenCalledWith("abort", expect.any(Function));
     expect(service.queuedCount()).toBe(0);
   });
 
-  test("abort rejects only that waiter and leaves the completion for the next receive", async () => {
+  test("abort rejects only that waiter and leaves the completion for the next await", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
     const controller = new AbortController();
-    const waiting = service.receive({ signal: controller.signal });
+    const waiting = service.awaitReady({ signal: controller.signal });
 
     controller.abort();
     await expect(waiting).rejects.toBeInstanceOf(Error);
     await service.publish(completion());
     expect(service.queuedCount()).toBe(1);
 
-    await expect(service.receive()).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    await expect(service.awaitReady()).resolves.toMatchObject({ completion: expect.any(Object), timedOut: false });
     expect(service.queuedCount()).toBe(0);
   });
 
@@ -196,11 +203,11 @@ describe("CompletionService.receive", () => {
     const controller = new AbortController();
     controller.abort();
 
-    await expect(service.receive({ signal: controller.signal })).rejects.toBeInstanceOf(Error);
-    const later = service.receive();
+    await expect(service.awaitReady({ signal: controller.signal })).rejects.toBeInstanceOf(Error);
+    const later = service.awaitReady();
     await service.publish(completion());
 
-    await expect(later).resolves.toMatchObject({ completions: [expect.any(Object)], timedOut: false });
+    await expect(later).resolves.toMatchObject({ completion: expect.any(Object), timedOut: false });
     expect(service.queuedCount()).toBe(0);
   });
 
@@ -208,7 +215,7 @@ describe("CompletionService.receive", () => {
     const service = new CompletionService();
     const original = completion({ output: truncateUtf8("x".repeat(60_000), utf8Bytes(50_000)) });
     await service.publish(original);
-    const [drained] = (await service.receive()).completions;
+    const [drained] = completionArray(await service.awaitReady());
     expect(drained).not.toBe(original);
     expect(drained?.output).not.toBe(original.output);
     expect(drained?.output).toEqual(original.output);
@@ -229,7 +236,7 @@ describe("CompletionService.receive", () => {
     };
     await service.publish(original);
 
-    const [drained] = (await service.receive()).completions;
+    const [drained] = completionArray(await service.awaitReady());
     if (drained?.state !== "failed") throw new Error("expected failed completion");
     expect(drained).not.toBe(original);
     expect(drained.error).not.toBe(original.error);
@@ -266,14 +273,15 @@ describe("CompletionService back-ping notification", () => {
   test("same native run ID from two agents is independently published", async () => {
     const service = new CompletionService();
     await Promise.all([service.publish(completion()), service.publish(completion({ agentId: OTHER_AGENT }))]);
-    expect((await service.receive()).completions).toHaveLength(2);
+    expect((await service.awaitReady()).completion?.agentId).toBe(AGENT);
+    expect((await service.awaitReady()).completion?.agentId).toBe(OTHER_AGENT);
   });
   test("publishing the same run is idempotent", async () => {
     const service = new CompletionService();
     await service.publish(completion());
     await service.publish(completion());
     expect(service.queuedCount()).toBe(1);
-    expect((await service.receive()).completions).toHaveLength(1);
+    expect(completionArray(await service.awaitReady())).toHaveLength(1);
   });
   test("notifies on an empty-to-non-empty transition with no active receiver", async () => {
     const service = new CompletionService();
@@ -292,7 +300,7 @@ describe("CompletionService back-ping notification", () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
-    const receivePromise = service.receive();
+    const receivePromise = service.awaitReady();
     const result = await service.publish(completion());
 
     expect(result.shouldNotify).toBe(false);
@@ -302,7 +310,7 @@ describe("CompletionService back-ping notification", () => {
   test("draining the queue allows the next empty-to-non-empty transition to notify again", async () => {
     const service = new CompletionService();
     await service.publish(completion());
-    await service.receive();
+    await service.awaitReady();
 
     const result = await service.publish(completion({ agentId: OTHER_AGENT }));
     expect(result.shouldNotify).toBe(true);
@@ -312,7 +320,7 @@ describe("CompletionService back-ping notification", () => {
 describe("CompletionService.restore", () => {
   test("restore is sealed once live completion operations begin", async () => {
     const service = new CompletionService();
-    await service.receive();
+    await service.awaitReady();
     expect(() => service.restore([])).toThrow("invalid_state");
   });
   test("re-queues each agent's latest completion for duplicate-visibility delivery", async () => {
@@ -333,8 +341,8 @@ describe("CompletionService.restore", () => {
     ])).toBeUndefined();
 
     expect(service.queuedCount()).toBe(1);
-    const result = await service.receive();
-    expect(result.completions).toMatchObject([{ agentId: AGENT, runId: RUN }]);
+    const result = await service.awaitReady();
+    expect(completionArray(result)).toMatchObject([{ agentId: AGENT, runId: RUN }]);
     expect(result.agents.map((a) => a.agentId).sort()).toEqual([AGENT, OTHER_AGENT].sort());
   });
 });

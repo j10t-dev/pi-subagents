@@ -8,7 +8,7 @@ import { createPiSubagentsExtension, type ExtensionController } from "../index.t
 import { CompletionService } from "../src/completion-service.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport } from "../src/controller.ts";
 import {
-  MAX_AGGREGATE_RECEIVE_BYTES,
+  MAX_AGGREGATE_AWAIT_BYTES,
   MAX_COMPLETION_OUTPUT_BYTES,
   MAX_ERROR_MESSAGE_BYTES,
   MAX_RPC_RECORD_BYTES,
@@ -57,7 +57,7 @@ describe("context safety", () => {
     expect(decoder.pendingBytes).toBe(utf8Bytes(0));
   });
 
-  test("receive_agent provider content retains at most 50 KB and the service remains usable", async () => {
+  test("await_agent provider content retains at most 50 KB and the service remains usable", async () => {
     const service = new CompletionService();
     for (const [index, id] of ["deadbeef", "cafebabe"].entries()) {
       await service.publish({ agentId: testAgentId(`context-${index}`), runId: runId(id), state: CompletionState.Completed,
@@ -68,16 +68,15 @@ describe("context safety", () => {
         }),
         transcriptPath: testSessionPath(`/tmp/pi-subagents-test/sessions/${id}.jsonl`) });
     }
-    const receive = createSubagentTools(new SubagentController({ completions: service })).receive_agent;
-    const first = await receive.execute({});
-    const details = receiveDetails(first.details);
-    const providerDetails = receiveDetails(requireRecord(JSON.parse(first.content)));
-    expect(Buffer.byteLength(first.content)).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
+    const awaitTool = createSubagentTools(new SubagentController({ completions: service })).await_agent;
+    const first = await awaitTool.execute({});
+    const details = awaitDetails(first.details);
+    const providerDetails = awaitDetails(requireRecord(JSON.parse(first.content)));
+    expect(Buffer.byteLength(first.content)).toBeLessThanOrEqual(MAX_AGGREGATE_AWAIT_BYTES);
     expect(first.content).toBe(JSON.stringify(JSON.parse(first.content)));
-    expect(details.completions.reduce((bytes, item) => bytes + outputBytes(item), 0)).toBe(2 * MAX_COMPLETION_OUTPUT_BYTES);
+    expect(details.completions.reduce((bytes, item) => bytes + outputBytes(item), 0)).toBe(MAX_COMPLETION_OUTPUT_BYTES);
     const providerBytes = providerDetails.completions.map(outputBytes);
-    expect(providerBytes).toHaveLength(2);
-    expect(Math.abs(providerBytes[0]! - providerBytes[1]!)).toBeLessThanOrEqual(1);
+    expect(providerBytes).toHaveLength(1);
     for (const completion of providerDetails.completions) {
       const output = requireRecord(completion.output);
       const text = requireString(output, "text");
@@ -87,7 +86,8 @@ describe("context safety", () => {
       expect(output.truncated).toBeTrue();
       expect(requireString(completion, "outputPath")).toStartWith("/tmp/pi-subagents-test/output/");
     }
-    expect(receiveDetails((await receive.execute({})).details).completions).toEqual([]);
+    expect(awaitDetails((await awaitTool.execute({})).details).completions).toHaveLength(1);
+    expect(awaitDetails((await awaitTool.execute({})).details).completions).toEqual([]);
   });
 
   test("published safety limits retain their exact operator contract", () => {
@@ -139,7 +139,7 @@ describe("context safety", () => {
     } finally { await fixture.close(); }
   }, 30_000);
 
-  test("hostile child failures remain durable through controller receive and do not brick parent tools or later children", async () => {
+  test("hostile child failures remain durable through controller await and do not brick parent tools or later children", async () => {
     const fixture = hostileController();
     const provider = await providerHarness(fixture.controller);
     try {
@@ -147,17 +147,17 @@ describe("context safety", () => {
         const started = await fixture.controller.spawn({ task: scenario });
         expect(started.state).toBe(AgentState.Running);
         if (!("runId" in started)) throw new Error("hostile child did not acquire a run identity");
-        const received = await provider.dispatch("receive_agent", { timeoutMs: 10_000 });
+        const received = await provider.dispatch("await_agent", { timeoutMs: 10_000 });
         expect(received.content).toHaveLength(1);
         const modelText = received.content[0]!.text;
-        expect(Buffer.byteLength(modelText)).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
-        const modelDetails = receiveDetails(requireRecord(JSON.parse(modelText)));
+        expect(Buffer.byteLength(modelText)).toBeLessThanOrEqual(MAX_AGGREGATE_AWAIT_BYTES);
+        const modelDetails = awaitDetails(requireRecord(JSON.parse(modelText)));
         expect(modelDetails.completions).toMatchObject([{ agentId: started.agentId, runId: started.runId,
           state: CompletionState.Failed }]);
-        const details = receiveDetails(received.details);
+        const details = awaitDetails(received.details);
         expect(details.completions).toHaveLength(1);
         expect(details.completions.reduce((bytes, item) => bytes + outputBytes(item), 0))
-          .toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
+          .toBeLessThanOrEqual(MAX_AGGREGATE_AWAIT_BYTES);
         const failed = details.completions[0]!;
         expect(failed).toMatchObject({ agentId: started.agentId, runId: started.runId, state: CompletionState.Failed });
         expect(existsSync(requireString(failed, "outputPath"))).toBeTrue();
@@ -176,12 +176,12 @@ describe("context safety", () => {
 
       const healthy = await fixture.controller.spawn({ task: "normal" });
       if (!("runId" in healthy)) throw new Error("healthy child did not acquire a run identity");
-      const after = await provider.dispatch("receive_agent", { timeoutMs: 10_000 });
-      expect(Buffer.byteLength(after.content[0]!.text)).toBeLessThanOrEqual(MAX_AGGREGATE_RECEIVE_BYTES);
-      const afterDetails = receiveDetails(after.details);
+      const after = await provider.dispatch("await_agent", { timeoutMs: 10_000 });
+      expect(Buffer.byteLength(after.content[0]!.text)).toBeLessThanOrEqual(MAX_AGGREGATE_AWAIT_BYTES);
+      const afterDetails = awaitDetails(after.details);
       expect(afterDetails.completions).toMatchObject([{ agentId: healthy.agentId, runId: healthy.runId, state: CompletionState.Completed }]);
       expect(requireRecord(afterDetails.completions[0]!.output).text).toBe("hello world");
-      expect(receiveDetails((await provider.dispatch("receive_agent", {})).details).completions).toEqual([]);
+      expect(awaitDetails((await provider.dispatch("await_agent", {})).details).completions).toEqual([]);
     } finally { await provider.close(); await fixture.close(); }
   }, 30_000);
 });
@@ -302,9 +302,9 @@ async function providerHarness(controller: SubagentController): Promise<{
   };
 }
 
-function receiveDetails(value: object): { completions: Record<string, unknown>[] } {
+function awaitDetails(value: object): { completions: Record<string, unknown>[] } {
   const record = requireRecord(value);
-  if (!Array.isArray(record.completions) || !record.completions.every(isRecord)) throw new Error("invalid receive details");
+  if (!Array.isArray(record.completions) || !record.completions.every(isRecord)) throw new Error("invalid await details");
   return { completions: record.completions };
 }
 

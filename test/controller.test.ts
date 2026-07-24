@@ -17,6 +17,10 @@ import { completedEntry, launchEntry, spawnedEntry, startedEntry, testRestoratio
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
 /** Post-native-identity seams, each of which must own settlement against a stop/shutdown contender. */
+function completionArray<T>(result: { readonly completion?: T }): T[] {
+  return result.completion === undefined ? [] : [result.completion];
+}
+
 const postIdentitySeams = ["bindRun", "persistRunStarted", "waitSettled"] as const;
 
 const TEST_SELECTION = Object.freeze({
@@ -109,7 +113,10 @@ describe("parent lifecycle wiring", () => {
     expect(failure.message).not.toContain("HOSTILE_PREPARATION_SECRET");
     expect(counters).toEqual({ reserve: 0, createSession: 0, persistSpawned: 0, createLaunch: 0, watchdog: 0, launch: 0 });
     expect(c.runs.activeCount()).toBe(0);
-    expect(await c.receive()).toEqual({ completions: [], agents: [], timedOut: false });
+    const empty = await c.awaitReady();
+    expect(Number(empty.remainingCompletions)).toBe(0);
+    expect(empty.agents).toEqual([]);
+    expect(empty.timedOut).toBeFalse();
   });
 
   test("a preparation CodedError diagnostics path survives publicError into the spawn rejection", async () => {
@@ -182,7 +189,7 @@ describe("parent lifecycle wiring", () => {
       } });
 
       await expect(c.restore()).resolves.toBeUndefined();
-      expect((await c.receive()).completions).toEqual([]);
+      expect(completionArray(await c.awaitReady())).toEqual([]);
       expect(warnings).toEqual([
         `Restored completion for agent ${testAgentId()} remains unavailable: output proof unavailable`,
       ]);
@@ -191,7 +198,7 @@ describe("parent lifecycle wiring", () => {
       expect(proofAttempts).toBe(2);
       expect(readFileSync(committed, "utf8")).toBe("reconstructed");
       expect(pings).toEqual([]);
-      expect((await c.receive()).completions).toMatchObject([{
+      expect(completionArray(await c.awaitReady())).toMatchObject([{
         agentId: testAgentId(),
         runId: testRunId(),
         state: CompletionState.Completed,
@@ -267,9 +274,9 @@ describe("parent lifecycle wiring", () => {
       expect(retryFailure).toBeUndefined();
       expect(readFileSync(committedA, "utf8")).toBe("reconstructed A");
       expect(readFileSync(committedB, "utf8")).toBe("reconstructed B");
-      const received = await c.receive();
-      expect(received.completions).toHaveLength(2);
-      expect(received.completions).toMatchObject([
+      const first = await c.awaitReady();
+      const second = await c.awaitReady();
+      expect([first.completion, second.completion]).toMatchObject([
         { agentId: agentA, runId: runA, output: { text: "reconstructed A" } },
         { agentId: agentB, runId: runB, output: { text: "reconstructed B" } },
       ]);
@@ -1322,9 +1329,9 @@ describe("parent lifecycle wiring", () => {
       await c.stop(session.agentId);
       expect(c.runs.snapshot(session.agentId)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
       expect(c.runs.activeCount()).toBe(0);
-      const received = await c.receive();
-      expect(received.completions).toHaveLength(1);
-      expect(received.completions[0]).toMatchObject({ runId: runId("deadbeef"), state: CompletionState.Failed });
+      const received = await c.awaitReady();
+      expect(completionArray(received)).toHaveLength(1);
+      expect(completionArray(received)[0]).toMatchObject({ runId: runId("deadbeef"), state: CompletionState.Failed });
       expect(trace.filter((item) => item === "completed:deadbeef:failed")).toHaveLength(1);
       expect(trace.indexOf("started:deadbeef")).toBeLessThan(trace.indexOf("completed:deadbeef:failed"));
 
@@ -1368,7 +1375,7 @@ describe("parent lifecycle wiring", () => {
     expect(containments).toBe(1);
     expect(completions).toBe(1);
     expect(trace).toEqual(["started", "contain", "started", "started", "completed"]);
-    expect((await c.receive()).completions).toHaveLength(1);
+    expect(completionArray(await c.awaitReady())).toHaveLength(1);
   });
 
   test("permanent post-identity RunStarted failure contains once and retains the terminal obligation", async () => {
@@ -1460,7 +1467,7 @@ describe("parent lifecycle wiring", () => {
             : ["started", "contain", "completed:failed"]);
         expect(c.runs.snapshot(id)).toMatchObject({ state: AgentState.Stopped, runId: runId("deadbeef") });
         expect(c.runs.activeCount()).toBe(0);
-        expect((await c.receive()).completions).toEqual([expect.objectContaining({ runId: runId("deadbeef"), state: CompletionState.Failed })]);
+        expect(completionArray(await c.awaitReady())).toEqual([expect.objectContaining({ runId: runId("deadbeef"), state: CompletionState.Failed })]);
       });
     }
   }
@@ -1506,10 +1513,12 @@ describe("parent lifecycle wiring", () => {
     await c.publish(completion("deadbeef"));
     await c.publish(completion("cafebabe"));
     expect(sent).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
-    await c.receive();
+    await c.awaitReady();
+    expect(sent[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
+    await c.awaitReady();
     busy = false;
     await c.publish(completion("facefeed"));
-    expect(sent[1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[2]).toEqual({ deliverAs: "followUp", triggerTurn: true });
   });
 
   test("ping failure does not duplicate queue publication and can be retried", async () => {
@@ -1535,8 +1544,8 @@ describe("parent lifecycle wiring", () => {
 
     await controller.restore();
     expect(sent).toEqual([]);
-    const result = await controller.receive();
-    expect(result.completions).toMatchObject([{ agentId: A, runId: R1 }]);
+    const result = await controller.awaitReady();
+    expect(completionArray(result)).toMatchObject([{ agentId: A, runId: R1 }]);
   });
 
   test("tree blocks active ownership and switch/fork warn", async () => {

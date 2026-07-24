@@ -7,6 +7,8 @@ import {
   type AgentCompletion,
   type AgentId,
   type AgentRunKey,
+  agentCount,
+  type AgentCount,
   type CommittedOutputPath,
   type Milliseconds,
   type RunId,
@@ -28,15 +30,16 @@ export interface AgentSummary {
   latestOutputPath?: CommittedOutputPath;
 }
 
-export interface ReceiveOptions {
-  timeoutMs?: Milliseconds;
-  signal?: AbortSignal;
+export interface AwaitOptions {
+  readonly timeoutMs?: Milliseconds;
+  readonly signal?: AbortSignal;
 }
 
-export interface ReceiveAgentResult {
-  completions: AgentCompletion[];
-  agents: AgentSummary[];
-  timedOut: boolean;
+export interface CompletionAwaitResult {
+  readonly completion?: AgentCompletion;
+  readonly remainingCompletions: AgentCount;
+  readonly agents: readonly AgentSummary[];
+  readonly timedOut: boolean;
 }
 
 export interface PublishResult {
@@ -60,7 +63,7 @@ interface CompletionWaiter {
 }
 
 /**
- * Durable bounded run-outcome queue with batched draining, modelled on a Java completion
+ * Durable bounded run-outcome queue with one-at-a-time delivery, modelled on a Java completion
  * service / Tokio join set. Completion arrival, receiver wake-up, timeout, and cancellation are
  * all arbitrated under one short mutex so a race between them always has exactly one winner.
  */
@@ -121,13 +124,13 @@ export class CompletionService {
    * `Running` or `Stopping`, until a completion arrives, the timeout elapses, or `signal` aborts.
    * Returns an empty, non-timed-out batch immediately when nothing is queued and no run is active.
    */
-  async receive(options: ReceiveOptions = {}): Promise<ReceiveAgentResult> {
+  async awaitReady(options: AwaitOptions = {}): Promise<CompletionAwaitResult> {
     this.liveOperationsStarted = true;
-    let resolveFn!: (result: ReceiveAgentResult) => void;
+    let resolveFn!: (result: CompletionAwaitResult) => void;
     let rejectFn!: (error: unknown) => void;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
-    const promise = new Promise<ReceiveAgentResult>((resolve, reject) => {
+    const promise = new Promise<CompletionAwaitResult>((resolve, reject) => {
       resolveFn = resolve;
       rejectFn = reject;
     });
@@ -138,7 +141,7 @@ export class CompletionService {
       }
       options.signal?.removeEventListener("abort", onAbort);
     };
-    const finish = (result: ReceiveAgentResult): void => {
+    const finish = (result: CompletionAwaitResult): void => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -153,8 +156,10 @@ export class CompletionService {
     const waiter: CompletionWaiter = {
       id: Symbol("completion-receiver"),
       wake: () => {
+        const completion = this.tryDrainLocked();
         finish({
-          completions: this.tryDrainLocked() ?? [],
+          ...(completion === undefined ? {} : { completion }),
+          remainingCompletions: agentCount(this.queue.length),
           agents: this.snapshotAgentsLocked(),
           timedOut: false,
         });
@@ -165,23 +170,23 @@ export class CompletionService {
     };
 
     const outcome = await this.mutex.runExclusive(() => {
-      const drained = this.tryDrainLocked();
-      if (drained !== undefined) return { kind: "immediate" as const, completions: drained };
-      if (!this.hasActiveRunsLocked()) return { kind: "empty" as const };
-      if (options.timeoutMs === 0) return { kind: "poll" as const };
+      const completion = this.tryDrainLocked();
+      if (completion !== undefined) return { kind: "immediate" as const, completion, remainingCompletions: agentCount(this.queue.length), agents: this.snapshotAgentsLocked() };
+      if (!this.hasActiveRunsLocked()) return { kind: "empty" as const, agents: this.snapshotAgentsLocked() };
+      if (options.timeoutMs === 0) return { kind: "poll" as const, agents: this.snapshotAgentsLocked() };
       if (this.waitingReceiver !== undefined) return { kind: "rejected" as const };
       this.waitingReceiver = waiter;
       return { kind: "pending" as const };
     });
 
     if (outcome.kind === "immediate") {
-      return { completions: outcome.completions, agents: this.snapshotAgents(), timedOut: false };
+      return { completion: outcome.completion, remainingCompletions: outcome.remainingCompletions, agents: outcome.agents, timedOut: false };
     }
     if (outcome.kind === "empty") {
-      return { completions: [], agents: this.snapshotAgents(), timedOut: false };
+      return { remainingCompletions: agentCount(0), agents: outcome.agents, timedOut: false };
     }
     if (outcome.kind === "poll") {
-      return { completions: [], agents: this.snapshotAgents(), timedOut: true };
+      return { remainingCompletions: agentCount(0), agents: outcome.agents, timedOut: true };
     }
     if (outcome.kind === "rejected") {
       fail(new CodedError(AgentErrorCode.InvalidState));
@@ -196,7 +201,7 @@ export class CompletionService {
         if (options.timeoutMs !== undefined) {
           timer = setTimeout(() => {
             void this.finishWaitLocked(waiter, () => {
-              finish({ completions: [], agents: this.snapshotAgentsLocked(), timedOut: true });
+              finish({ remainingCompletions: agentCount(this.queue.length), agents: this.snapshotAgentsLocked(), timedOut: true });
             });
           }, options.timeoutMs);
         }
@@ -257,13 +262,11 @@ export class CompletionService {
     return false;
   }
 
-  private tryDrainLocked(): AgentCompletion[] | undefined {
-    if (this.queue.length === 0) {
-      return undefined;
-    }
-    const drained = this.queue.splice(0, this.queue.length);
+  private tryDrainLocked(): AgentCompletion | undefined {
+    const completion = this.queue.shift();
+    if (completion === undefined) return undefined;
     this.notifiedSinceEmpty = false;
-    return drained.map((completion) => ({
+    return {
       ...completion,
       output: { ...completion.output },
       ...(completion.state === CompletionState.Failed ? { error: { ...completion.error } } : {}),
@@ -278,7 +281,7 @@ export class CompletionService {
               },
             },
           }),
-    }));
+    };
   }
 
   private upsertCompletionSummaryLocked(completion: AgentCompletion): void {

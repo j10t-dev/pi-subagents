@@ -6,7 +6,7 @@ Linux-only global extension for Pi. It requires Node 22.19 or newer.
 
 - `spawn_agent({ task, model?, cwd?, tools? })` starts a fresh persistent child session and returns its native Pi session ID as `agentId` and first assignment user-entry ID as `runId`.
 - `send_input({ agentId, message })` resumes an owned child. The child must be stopped; concurrent or pre-emptive input is rejected.
-- `receive_agent({ timeoutMs? })` returns ready completions plus the complete bounded owned-agent inventory. A zero timeout polls.
+- `await_agent({ timeoutMs?, afterAgentId? })` returns at most one newly ready completion plus a lexical page of the current owned-agent inventory. A zero timeout polls. Each page contains at most 100 complete summaries; pass `nextAfterAgentId` back as `afterAgentId` to continue strictly after that native ID. Exact `total`, `omitted`, and `remaining` metadata describes the current page.
 - `stop_agent({ agentIds })` stops one or more owned children and returns one outcome per supplied ID.
 
 Children discover normal global and trusted-project context, extensions, prompts, and skills. Lifecycle tools are suppressed when `PI_SUBAGENT_CHILD=1`; unrelated child extensions remain active. Trust is inherited only when the child's real working directory is within the trusted parent project; external working directories perform Pi's normal trust check.
@@ -62,14 +62,16 @@ Child sessions are stored beneath the extension state directory, partitioned by 
 - stderr tail: 50 KB;
 - persisted completion output: 50 KB;
 - persisted and model-visible error: 10 KB;
-- final provider-visible JSON per `receive_agent`: 50 KB, with nominal provider-visible text bytes allocated by deterministic max-min fair sharing before serialisation;
+- final provider-visible JSON per `await_agent`: 50 KB; the complete envelope, page metadata and cursor, optional completion metadata, and at least one eligible complete summary are reserved first, then the single completion output receives the deterministic residual allowance at a complete UTF-8 code-point boundary;
 - bounded transcript recovery tail: 32 MiB.
 
-Oversized or malformed records are discarded or converted to bounded diagnostics. Full output remains in the sidecar or transcript. A later `receive_agent` and unrelated parent tools remain usable.
+Oversized or malformed records are discarded or converted to bounded diagnostics. Full output remains in the sidecar or transcript. A later `await_agent` and unrelated parent tools remain usable.
 
 ## Lifecycle semantics
 
-Parent shutdown contains every active process group before returning. There is no detached execution: quit, reload, new-session, resume, and fork shutdown paths own cancellation. Version 1 does not persist collection attempts or inspect parent tool-result entries. Restoration re-exposes each owned agent’s latest persisted completion to the next `receive_agent` and may therefore return a completion that was collected before reload or resume. No automatic message is sent on restoration; `agents: … result(s) ready` in the status bar is the passive discovery surface. The stable `runId` identifies duplicate visibility of the same durable outcome. Lifecycle ownership follows persisted parent custom entries and therefore survives compaction; branch navigation is rejected while active children would make ownership ambiguous. Reload closes the old controller before restoring its replacement.
+Human-facing agent ordinals are scoped to one active parent branch. They are stable within that branch, are never recycled there, and are re-derived after branch replacement; they are display identities rather than native IDs.
+
+Parent shutdown contains every active process group before returning. There is no detached execution: quit, reload, new-session, resume, and fork shutdown paths own cancellation. Version 1 does not persist collection attempts or inspect parent tool-result entries. Restoration re-exposes each owned agent’s latest persisted completion to the next `await_agent` and may therefore return a completion that was collected before reload or resume. No automatic message is sent on restoration; `agents: … result(s) ready` in the status bar is the passive discovery surface. The stable `runId` identifies duplicate visibility of the same durable outcome. Lifecycle ownership follows persisted parent custom entries and therefore survives compaction; branch navigation is rejected while active children would make ownership ambiguous. Reload closes the old controller before restoring its replacement.
 
 ## Verification
 
@@ -100,4 +102,4 @@ Run it separately from the default and integration suites:
 bun run test:live-model
 ```
 
-The script sets `PI_SUBAGENTS_LIVE_SMOKE=1`. It requires the current Pi registry to contain `openai-codex/gpt-5.6-luna`, usable `openai-codex` provider credentials, and an active `web_fetch` tool. A missing opt-in, model, or credential is reported as an explicit pre-start skip, not a product pass. Active `web_fetch` is required by the launched allowlist and verified through the child transcript; its absence fails the smoke. The explicit child `tools: ["web_fetch"]` allowlist is why this smoke still asserts no nested Pi command; it is not a universal restriction on children. The smoke covers direct parent `spawn_agent`, child `web_fetch`, parent `receive_agent`, and successful completion. `PI_SUBAGENT_CHILD=1` remains compatibility input for legacy children and suppresses lifecycle tools. Malformed metadata fails closed and emits a warning. Environment metadata is forgeable recursion policy, not security containment. Broader live-model behavioural evaluation is out of scope.
+The script sets `PI_SUBAGENTS_LIVE_SMOKE=1`. It requires the current Pi registry to contain `openai-codex/gpt-5.6-luna`, usable `openai-codex` provider credentials, and an active `web_fetch` tool. A missing opt-in, model, or credential is reported as an explicit pre-start skip, not a product pass. Active `web_fetch` is required by the launched allowlist and verified through the child transcript; its absence fails the smoke. The explicit child `tools: ["web_fetch"]` allowlist is why this smoke still asserts no nested Pi command; it is not a universal restriction on children. The smoke covers direct parent `spawn_agent`, child `web_fetch`, parent `await_agent`, and successful completion. `PI_SUBAGENT_CHILD=1` remains compatibility input for legacy children and suppresses lifecycle tools. Malformed metadata fails closed and emits a warning. Environment metadata is forgeable recursion policy, not security containment. Broader live-model behavioural evaluation is out of scope.

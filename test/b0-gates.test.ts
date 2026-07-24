@@ -18,7 +18,7 @@ import {
   type PiVersionProbeResult,
 } from "../scripts/pi-runtime-target.ts";
 
-test("active B0 spikes receive the selected Pi executable without a local fallback", () => {
+test("active B0 spikes await the selected Pi executable without a local fallback", () => {
   const gateSource = readFileSync(join(import.meta.dir, "..", "scripts", "run-b0-gates.ts"), "utf-8");
   expect(gateSource).not.toContain("LOCAL_CLI");
   expect(gateSource).toContain('"--pi", target.executable');

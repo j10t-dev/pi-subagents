@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { CompletionService, type ReceiveAgentResult, type ReceiveOptions } from "./completion-service.ts";
+import { CompletionService, type AwaitOptions, type CompletionAwaitResult } from "./completion-service.ts";
 import {
   AgentErrorCode,
   agentRunKey,
@@ -147,6 +147,7 @@ export interface SubagentControllerOptions {
   onStatusChange?: () => void;
   identityDeadline?: () => AbortSignal;
   identityDelay?: (milliseconds: Milliseconds, signal: AbortSignal) => Promise<void>;
+  onCompletionDelivered?: (key: ReturnType<typeof agentRunKey>) => void;
 }
 
 interface ControllerOperation {
@@ -178,6 +179,7 @@ export class SubagentController {
   private readonly pendingNotifications = new Set<ReturnType<typeof agentRunKey>>();
   private readonly identityDeadline: () => AbortSignal;
   private readonly identityDelay: (milliseconds: Milliseconds, signal: AbortSignal) => Promise<void>;
+  private readonly onCompletionDelivered: (key: ReturnType<typeof agentRunKey>) => void;
 
   constructor(options: SubagentControllerOptions = {}) {
     this.completions = options.completions ?? new CompletionService();
@@ -187,6 +189,7 @@ export class SubagentController {
     this.trace = options.trace;
     this.identityDeadline = options.identityDeadline ?? (() => AbortSignal.timeout(Number(ASSIGNMENT_IDENTITY_TIMEOUT_MS)));
     this.identityDelay = options.identityDelay ?? delayWithAbort;
+    this.onCompletionDelivered = options.onCompletionDelivered ?? (() => {});
     this.runs = new RunController({
       capacity: options.capacity ?? DEFAULT_MAX_CONCURRENT_RUNS,
       onReserve: () => this.trace?.("reserve"),
@@ -289,7 +292,18 @@ export class SubagentController {
     return { agentId: result.agentId, runId: result.runId, state: AgentState.Running };
   }
 
-  receive(options?: ReceiveOptions): Promise<ReceiveAgentResult> { return this.completions.receive(options); }
+  async awaitReady(options?: AwaitOptions): Promise<CompletionAwaitResult> {
+    const result = await this.completions.awaitReady(options);
+    if (result.completion !== undefined) {
+      try { this.onCompletionDelivered(agentRunKey(result.completion.agentId, result.completion.runId)); }
+      catch { /* observation acknowledgement cannot affect lifecycle delivery */ }
+    }
+    if (result.remainingCompletions > 0 && !this.suppressPings) {
+      try { await this.ping(result.remainingCompletions); }
+      catch { /* the remaining queue stays visible to the next publish or drain */ }
+    }
+    return result;
+  }
 
   async stop(agentIdValue: AgentId, reason: CancellationReason = CancellationReason.StopRequested): Promise<PublicStopOutcome> {
     const result = await this.runs.stop(agentIdValue, reason);
@@ -303,7 +317,7 @@ export class SubagentController {
     if (result.shouldNotify) this.pendingNotifications.add(key);
     if (!this.pendingNotifications.has(key) || this.suppressPings) return;
     // A failed ping keeps the key pending: the queue entry is already durable and visible to the
-    // next `receive_agent`, and a re-publication of the same completion retries the notification.
+    // next `await_agent`, and a re-publication of the same completion retries the notification.
     try {
       await this.ping(result.queueSize);
       this.pendingNotifications.delete(key);
@@ -640,7 +654,7 @@ export class SubagentController {
 
   private async ping(count: number): Promise<void> {
     if (this.parent === undefined) return;
-    const text = `${count} agent completion${count === 1 ? " is" : "s are"} ready. Call receive_agent to collect ${count === 1 ? "it" : "them"}.`;
+    const text = `${count} agent completion${count === 1 ? " is" : "s are"} ready. Call await_agent to collect ${count === 1 ? "it" : "them"}.`;
     await this.parent.sendMessage(text, { deliverAs: "followUp", triggerTurn: !this.parent.isBusy() });
   }
 

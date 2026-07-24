@@ -813,7 +813,7 @@ describe("RpcRunClient", () => {
     await client.shutdown();
   });
 
-  test("two clients sharing a broker serialise extension_ui and receive correlated responses", async () => {
+  test("two clients sharing a broker serialise extension_ui and await correlated responses", async () => {
     const firstEntered = deferred<void>();
     const releaseFirst = deferred<void>();
     const titles: string[] = [];

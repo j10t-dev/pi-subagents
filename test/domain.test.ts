@@ -9,6 +9,18 @@ import {
   AgentState,
   CancellationReason,
   CompletionState,
+  agentCount,
+  agentDepth,
+  agentObservationRevision,
+  agentWidgetRevision,
+  assistantGeneration,
+  contextPercent,
+  directAgentOrdinal,
+  rpcContentIndex,
+  rpcStopReason,
+  rpcToolCallId,
+  transcriptRevision,
+  transcriptSequence,
   agentId,
   assertTransition,
   createRpcRequestId,
@@ -304,6 +316,18 @@ describe("semantic numeric constructors", () => {
     expect(processId(42) as number).toBe(42);
     expect(processGroupId(43) as number).toBe(43);
     expect(observationRevision(0) as number).toBe(0);
+    expect(String(directAgentOrdinal(1))).toBe("A1");
+    expect(Number(agentObservationRevision(0))).toBe(0);
+    expect(Number(agentWidgetRevision(0))).toBe(0);
+    expect(Number(transcriptSequence(0))).toBe(0);
+    expect(Number(transcriptRevision(0))).toBe(0);
+    expect(Number(contextPercent(42.5))).toBe(42.5);
+    expect(Number(agentDepth(8))).toBe(8);
+    expect(Number(agentCount(0))).toBe(0);
+    expect(Number(assistantGeneration(1))).toBe(1);
+    expect(Number(rpcContentIndex(0))).toBe(0);
+    expect(String(rpcToolCallId("call-1"))).toBe("call-1");
+    expect(String(rpcStopReason("future-reason"))).toBe("future-reason");
   });
 
   test.each([

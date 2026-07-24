@@ -20,7 +20,7 @@ import { MAX_ERROR_MESSAGE_BYTES } from "./constants.ts";
 export const LIFECYCLE_TOOL_NAMES: readonly ToolName[] = Object.freeze([
   toolName("spawn_agent"),
   toolName("send_input"),
-  toolName("receive_agent"),
+  toolName("await_agent"),
   toolName("stop_agent"),
 ]);
 

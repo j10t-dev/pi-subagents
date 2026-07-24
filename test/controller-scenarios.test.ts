@@ -47,6 +47,10 @@ import { restoreRuns, testRunController } from "./support/controllers.ts";
 import { extensionApiForTest } from "./support/extension-api.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
+function completionArray<T>(result: { readonly completion?: T }): T[] {
+  return result.completion === undefined ? [] : [result.completion];
+}
+
 const A = agentId("agent-a");
 const B = agentId("agent-b");
 const R1 = runId("deadbeef");
@@ -57,12 +61,12 @@ const _rawOutputStore = new OutputStore({ workDir: "/tmp/raw-output-root" });
 void _rawOutputStore;
 
 describe("controller orchestration scenarios", () => {
-  test("01 spawn one child and receive its completion", async () => {
+  test("01 spawn one child and await its completion", async () => {
     const service = new CompletionService();
     service.upsertAgent(summary(A, AgentState.Running, R1));
-    const waiting = service.receive();
+    const waiting = service.awaitReady();
     await service.publish(completion(A, R1, "one"));
-    expect((await waiting).completions).toEqual([expect.objectContaining({ agentId: A, runId: R1 })]);
+    expect(completionArray(await waiting)).toEqual([expect.objectContaining({ agentId: A, runId: R1 })]);
   });
 
   test("02 B completes first, is received and resumed before A is received", async () => {
@@ -70,18 +74,19 @@ describe("controller orchestration scenarios", () => {
     service.upsertAgent(summary(A, AgentState.Running, R1));
     service.upsertAgent(summary(B, AgentState.Running, R1));
     await service.publish(completion(B, R1, "B1"));
-    expect((await service.receive()).completions.map((item) => item.agentId)).toEqual([B]);
+    expect(completionArray(await service.awaitReady()).map((item) => item.agentId)).toEqual([B]);
     service.upsertAgent(summary(B, AgentState.Running, R2));
     await service.publish(completion(A, R1, "A1"));
-    expect((await service.receive()).completions.map((item) => item.agentId)).toEqual([A]);
+    expect(completionArray(await service.awaitReady()).map((item) => item.agentId)).toEqual([A]);
     expect(service.snapshotAgents().find((item) => item.agentId === B)?.currentRunId).toBe(R2);
   });
 
-  test("03 one receive drains several queued completions", async () => {
+  test("03 repeated awaits drain several queued completions one at a time", async () => {
     const service = new CompletionService();
     await service.publish(completion(A, R1, "A"));
     await service.publish(completion(B, R1, "B"));
-    expect((await service.receive()).completions.map((item) => item.output.text)).toEqual(["A", "B"]);
+    expect((await service.awaitReady()).completion?.output.text).toBe("A");
+    expect((await service.awaitReady()).completion?.output.text).toBe("B");
   });
 
   test("04 stop several running agents", async () => {
@@ -118,7 +123,7 @@ describe("controller orchestration scenarios", () => {
     const service = new CompletionService();
     service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "old") }]);
     expect(service.queuedCount()).toBe(1);
-    expect((await service.receive()).completions[0]?.output.text).toBe("old");
+    expect(completionArray(await service.awaitReady())[0]?.output.text).toBe("old");
     expect(service.queuedCount()).toBe(0);
   });
 
@@ -145,9 +150,13 @@ describe("controller orchestration scenarios", () => {
     expect(classifyTerminal({ kind: "process_exited" })).toEqual({ kind: "failed", cause: expect.objectContaining({ code: AgentErrorCode.ProcessExited }) });
   });
 
-  test("10 empty receive returns immediately", async () => {
-    const outcome = await Promise.race([new CompletionService().receive(), Bun.sleep(100).then(() => "timeout")]);
-    expect(outcome).toEqual({ completions: [], agents: [], timedOut: false });
+  test("10 empty await returns immediately", async () => {
+    const outcome = await Promise.race([new CompletionService().awaitReady(), Bun.sleep(100).then(() => "timeout")]);
+    expect(outcome).not.toBe("timeout");
+    if (typeof outcome === "string") throw new Error("await timed out");
+    expect(Number(outcome.remainingCompletions)).toBe(0);
+    expect(outcome.agents).toEqual([]);
+    expect(outcome.timedOut).toBeFalse();
   });
 
   test("11 send_input rejects running, settling and stopping without mutating runs", async () => {
@@ -162,7 +171,7 @@ describe("controller orchestration scenarios", () => {
   test("12 compaction-safe restoration recovers pre-compaction inventory and completion", async () => {
     const service = new CompletionService();
     service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "before compaction") }]);
-    expect((await service.receive())).toMatchObject({ completions: [{ agentId: A, runId: R1 }], agents: [{ agentId: A }] });
+    expect((await service.awaitReady())).toMatchObject({ completion: { agentId: A, runId: R1 }, agents: [{ agentId: A }] });
   });
 
   test("13 switch, fork, clone, reload and new-session boundaries cancel ownership without shutdown pings", async () => {
@@ -200,7 +209,7 @@ describe("controller orchestration scenarios", () => {
       expect(contained).toBe(1);
       expect(host.runs.activeCount()).toBe(0);
       expect(pings).toEqual([]);
-      expect((await host.receive()).completions).toMatchObject([{ agentId: A, runId: R1, state: CompletionState.Cancelled,
+      expect(completionArray(await host.awaitReady())).toMatchObject([{ agentId: A, runId: R1, state: CompletionState.Cancelled,
         reason: CancellationReason.ParentShutdown }]);
       expect(entries.map((entry) => (entry.data as { eventType: string }).eventType)).toEqual([
         AgentEventType.Spawned, AgentEventType.RunLaunchRequested, AgentEventType.RunStarted,
@@ -208,7 +217,7 @@ describe("controller orchestration scenarios", () => {
       ]);
       const replacement = new SubagentController({ restoration: restorationPort(entries, appender) });
       await replacement.restore();
-      expect((await replacement.receive()).completions).toMatchObject([{ agentId: A, runId: R1,
+      expect(completionArray(await replacement.awaitReady())).toMatchObject([{ agentId: A, runId: R1,
         state: CompletionState.Cancelled, reason: CancellationReason.ParentShutdown }]);
       expect(foldAgentEvents(entries, testAbsolutePath("/tmp")).agents.get(A)).toMatchObject({ state: AgentState.Stopped,
         completion: { payload: { runId: R1, reason: CancellationReason.ParentShutdown } } });
@@ -230,20 +239,21 @@ describe("controller orchestration scenarios", () => {
     const service = new CompletionService();
     await service.publish(completion(A, R1, "1234"));
     await service.publish(completion(B, R1, "later"));
-    const received = await service.receive();
-    expect(received.completions.map((item) => item.output.text)).toEqual(["1234", "later"]);
-    expect(String(received.completions[1]?.outputPath)).toBe(
+    const first = await service.awaitReady();
+    const second = await service.awaitReady();
+    expect([first.completion?.output.text, second.completion?.output.text]).toEqual(["1234", "later"]);
+    expect(String(second.completion?.outputPath)).toBe(
       "/tmp/pi-subagents-test/output/agent-b/deadbeef.committed",
     );
   });
 
-  test("16 receive inventory rediscovers IDs hidden by compaction", async () => {
+  test("16 await inventory rediscovers IDs hidden by compaction", async () => {
     const service = new CompletionService();
     service.restore([
       { agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: completion(A, R1, "done") },
       { agentId: B, state: AgentState.Running, sessionPath: testSessionPath("/tmp/pi-subagents-test/b"), currentRunId: R2 },
     ]);
-    expect((await service.receive()).agents.map((item) => item.agentId).sort()).toEqual([A, B].sort());
+    expect((await service.awaitReady()).agents.map((item) => item.agentId).sort()).toEqual([A, B].sort());
   });
 
   test("17 external cwd does not inherit parent project trust", () => {
@@ -258,9 +268,9 @@ describe("controller orchestration scenarios", () => {
 
   test("18 restoration can expose a persisted completion again with the stable run ID", async () => {
     const persisted = completion(A, R1, "stable");
-    const first = new CompletionService(); await first.publish(persisted); await first.receive();
+    const first = new CompletionService(); await first.publish(persisted); await first.awaitReady();
     const restored = new CompletionService(); restored.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: persisted }]);
-    expect((await restored.receive()).completions[0]?.runId).toBe(R1);
+    expect(completionArray(await restored.awaitReady())[0]?.runId).toBe(R1);
   });
 
   test("19 stop versus settlement with failed containment retains one stopping terminal obligation", async () => {
@@ -301,13 +311,13 @@ describe("controller orchestration scenarios", () => {
       .rejects.toThrow("capacity_exceeded:");
     expect(persistedTerminal).toBe(0);
     expect(acceptedV2Receipts).toBe(0);
-    expect((await completions.receive()).completions).toEqual([]);
+    expect(completionArray(await completions.awaitReady())).toEqual([]);
 
     killOrEmptyProofFails = false;
     expect((await runs.stop(A, CancellationReason.StopRequested)).status).toBe("stopped");
     expect(acceptedV2Receipts).toBe(1);
     expect(persistedTerminal).toBe(1);
-    expect((await completions.receive()).completions).toMatchObject([{ agentId: A, runId: R1 }]);
+    expect(completionArray(await completions.awaitReady())).toMatchObject([{ agentId: A, runId: R1 }]);
     expect(runs.activeCount()).toBe(0);
     expect((await runs.launch(B, async () => ({ status: "accepted", runId: R2, runtime: runtime() }))).status).toBe("running");
   });
@@ -336,7 +346,7 @@ describe("controller orchestration scenarios", () => {
     const restored = new SubagentController({ restoration: restorationPort(entries, appender) });
     await restored.restore();
     expect(restored.runs.activeCount()).toBe(0);
-    expect((await restored.receive()).completions).toMatchObject([{ agentId: A, runId: R1,
+    expect(completionArray(await restored.awaitReady())).toMatchObject([{ agentId: A, runId: R1,
       state: CompletionState.Cancelled, reason: CancellationReason.ParentShutdown }]);
     expect(entries.map((entry) => (entry.data as { eventType: string }).eventType).at(-1)).toBe(AgentEventType.RunCompleted);
     } finally {
@@ -348,7 +358,7 @@ describe("controller orchestration scenarios", () => {
     const service = new CompletionService(); const persisted = completion(A, R1, "stable");
     service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: persisted }]);
     service.restore([{ agentId: A, state: AgentState.Stopped, sessionPath: testSessionPath("/tmp/pi-subagents-test/a"), latestCompletion: persisted }]);
-    expect((await service.receive()).completions.map((item) => item.runId)).toEqual([R1]);
+    expect(completionArray(await service.awaitReady()).map((item) => item.runId)).toEqual([R1]);
   });
 
   test("22 partial assistant output is discarded and prior committed output remains authoritative", () => {
@@ -382,7 +392,7 @@ describe("controller orchestration scenarios", () => {
     const persistedTools = [
       testToolName("read"),
       testToolName("spawn_agent"),
-      testToolName("receive_agent"),
+      testToolName("await_agent"),
     ];
     let captured: BuildRpcLaunchOptions | undefined;
     let preparedAttempts = 0;
@@ -459,7 +469,7 @@ describe("controller orchestration scenarios", () => {
       expect(persistedTools).toEqual([
         testToolName("read"),
         testToolName("spawn_agent"),
-        testToolName("receive_agent"),
+        testToolName("await_agent"),
       ]);
     } finally {
       state.cleanup();
