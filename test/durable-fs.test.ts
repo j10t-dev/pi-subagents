@@ -3,6 +3,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -65,6 +66,7 @@ function retrySyncAdapter(failedParent: string, trace: string[]): DurableFileSys
     },
     rename: renameSync,
     unlink: unlinkSync,
+    lstat: lstatSync,
     readFile: readFileSync,
     realpath: realpathSync,
   };
@@ -98,6 +100,7 @@ function adapter(trace: string[] = [], fail?: string, cleanupFail = false): Dura
       if (cleanupFail) throw new Error("cleanup failed");
       unlinkSync(path);
     },
+    lstat: lstatSync,
     readFile: readFileSync,
     realpath: realpathSync,
   };

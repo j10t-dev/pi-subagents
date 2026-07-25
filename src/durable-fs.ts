@@ -2,6 +2,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -16,7 +17,8 @@ import { dirname, join, resolve } from "node:path";
 export interface DurableFileSystem {
   exists(path: string): boolean;
   mkdir(path: string, mode: number): void;
-  open(path: string, flags: string, mode?: number): number;
+  open(path: string, flags: string | number, mode?: number): number;
+  lstat(path: string): { isDirectory(): boolean; isSymbolicLink(): boolean };
   write(fd: number, data: string | Uint8Array): void;
   sync(fd: number): void;
   close(fd: number): void;
@@ -36,6 +38,7 @@ export const systemDurableFileSystem: DurableFileSystem = {
   exists: existsSync,
   mkdir: (path, mode) => mkdirSync(path, { mode }),
   open: openSync,
+  lstat: lstatSync,
   write: (fd, data) => writeFileSync(fd, data),
   sync: fsyncSync,
   close: closeSync,

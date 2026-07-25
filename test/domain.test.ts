@@ -5,6 +5,8 @@ import {
   AgentErrorCode,
   CodedError,
   MAX_WIDGET_ROW_COUNT,
+  MAX_AGENT_ORDINAL_BYTES,
+  agentOrdinal,
   codedErrorToAgentError,
   AgentEventType,
   AgentState,
@@ -27,8 +29,10 @@ import {
   createRpcRequestId,
   createRunAttemptId,
   delegationDepth,
+  incarnationId,
   isLegalTransition,
   milliseconds,
+  newIncarnationId,
   nextDelegationDepth,
   observationRevision,
   processCount,
@@ -51,6 +55,7 @@ import {
   truncateUtf8,
   retainUtf8Tail,
   toolName,
+  tryAgentOrdinal,
   uiRequestId,
   utf8Bytes,
   type AgentCompletion,
@@ -75,6 +80,7 @@ import {
   type UIRequestId,
   type WidgetRowCount,
   type AgentCount,
+  type IncarnationId,
 } from "../src/domain.ts";
 import { absolutePath, diagnosticsPath, outputPath, sessionPath } from "../src/paths.ts";
 import {
@@ -211,6 +217,32 @@ describe("agentId", () => {
 
   test("rejects an unbounded native session id", () => {
     expect(() => agentId("a".repeat(257))).toThrow("invalid_agent:");
+  });
+});
+
+describe("incarnationId", () => {
+  test("accepts the relay incarnation alphabet and round-trips generated values", () => {
+    expect(incarnationId("Ab_c-9") as string).toBe("Ab_c-9");
+    const generated: IncarnationId = newIncarnationId();
+    expect(incarnationId(generated) as string).toBe(generated as string);
+  });
+
+  test.each(["", "a".repeat(65), "has space", "has/slash", "has\u0000control"])(
+    "rejects invalid incarnation ID %#",
+    (value) => expect(() => incarnationId(value)).toThrow(`invalid incarnation id: ${JSON.stringify(value)}`),
+  );
+});
+
+describe("agentOrdinal", () => {
+  test("tryAgentOrdinal and agentOrdinal share the complete bounded grammar", () => {
+    const valid = "A1.2.3";
+    expect(tryAgentOrdinal(valid) as string).toBe(valid);
+    expect(agentOrdinal(valid) as string).toBe(valid);
+
+    for (const invalid of ["A1.0", `A${"1".repeat(Number(MAX_AGENT_ORDINAL_BYTES))}`]) {
+      expect(tryAgentOrdinal(invalid)).toBeUndefined();
+      expect(() => agentOrdinal(invalid)).toThrow(/invalid agent ordinal/);
+    }
   });
 });
 

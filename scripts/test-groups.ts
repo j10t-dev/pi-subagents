@@ -61,6 +61,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "extension.test.ts",
     "restoration-planner.test.ts",
     "restoration.test.ts",
+    "observation-relay.test.ts",
     "run-controller.test.ts",
     "tool-presentation.test.ts",
     "tools.test.ts",

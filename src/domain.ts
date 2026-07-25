@@ -44,6 +44,7 @@ export type ProcessId = Brand<number, "ProcessId">;
 export type ProcessGroupId = Brand<number, "ProcessGroupId">;
 export type ObservationRevision = Brand<number, "ObservationRevision">;
 export type AgentOrdinal = Brand<string, "HierarchicalAgentOrdinal">;
+export type IncarnationId = Brand<string, "ObservationRelayIncarnationId">;
 export type AgentObservationRevision = Brand<number, "AgentObservationRevision">;
 export type AgentWidgetRevision = Brand<number, "AgentWidgetRevision">;
 export type TranscriptSequence = Brand<number, "TranscriptSequence">;
@@ -80,6 +81,7 @@ const MAX_SESSION_ID_BYTES = 256;
 /** Pi generates entry IDs as `randomUUID().slice(0, 8)`: 8 lowercase hex characters. */
 const SESSION_ENTRY_ID_PATTERN = /^[0-9a-f]{8}$/;
 const AGENT_ORDINAL_PATTERN = /^A[1-9][0-9]*(?:\.[1-9][0-9]*)*$/;
+export const MAX_AGENT_ORDINAL_BYTES = utf8Bytes(128);
 const DISPLAY_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 /** Brands a native `SessionManager.getSessionId()` value, matching Pi's own lexical rule. */
@@ -269,11 +271,28 @@ export function observationRevision(value: number): ObservationRevision {
   return value as ObservationRevision;
 }
 
-export function agentOrdinal(value: string): AgentOrdinal {
-  if (!AGENT_ORDINAL_PATTERN.test(value) || new TextEncoder().encode(value).byteLength > 128) {
-    throw new Error(`invalid_input: invalid agent ordinal: ${JSON.stringify(value)}`);
+export function tryAgentOrdinal(value: string): AgentOrdinal | undefined {
+  if (!AGENT_ORDINAL_PATTERN.test(value) || new TextEncoder().encode(value).byteLength > MAX_AGENT_ORDINAL_BYTES) {
+    return undefined;
   }
   return value as AgentOrdinal;
+}
+
+export function agentOrdinal(value: string): AgentOrdinal {
+  const ordinal = tryAgentOrdinal(value);
+  if (ordinal === undefined) throw new Error(`invalid_input: invalid agent ordinal: ${JSON.stringify(value)}`);
+  return ordinal;
+}
+
+export function incarnationId(value: string): IncarnationId {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(value)) {
+    throw new Error(`invalid incarnation id: ${JSON.stringify(value)}`);
+  }
+  return value as IncarnationId;
+}
+
+export function newIncarnationId(): IncarnationId {
+  return incarnationId(randomUUID());
 }
 
 export function directAgentOrdinal(position: number): AgentOrdinal {
