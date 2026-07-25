@@ -1,32 +1,84 @@
-import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
-import type { ObservationChange, SubagentObservationPort } from "../src/agent-observation.ts";
+import type { AgentDisplayState, ObservationChange, SubagentObservationPort } from "../src/agent-observation.ts";
 import { createAgentWidgetSource } from "../src/agent-widget/source.ts";
-import { MAX_WIDGET_ROWS } from "../src/constants.ts";
+import { INDEX_REFRESH_WINDOW_MS, MAX_WIDGET_ROWS } from "../src/constants.ts";
 import {
+  AgentState,
+  CompletionState,
   agentCount,
+  agentDepth,
   agentId,
   agentObservationRevision,
   agentOrdinal,
   directAgentOrdinal,
+  incarnationId,
   modelSpec,
+  observationRevision,
+  runId,
 } from "../src/domain.ts";
+import {
+  encodeObservationSnapshot,
+  observationSlotDirectory,
+  observationSnapshotPath,
+  type ObservationRow,
+} from "../src/observation-snapshot-path.ts";
 import { testAbsolutePath, testSessionPath } from "./support/brands.ts";
 
-const AGENT_DIR = testAbsolutePath("/tmp/pi-subagents-test");
-const flush = () => Promise.resolve().then(() => Promise.resolve());
+const AGENT_DIR = testAbsolutePath(mkdtempSync(join(tmpdir(), "agent-widget-source-")));
+const waitForIndexRefresh = () => Bun.sleep(Number(INDEX_REFRESH_WINDOW_MS) + 40);
+
+afterEach(() => {
+  rmSync(AGENT_DIR, { recursive: true, force: true });
+  mkdirSync(AGENT_DIR, { recursive: true });
+});
+afterAll(() => { rmSync(AGENT_DIR, { recursive: true, force: true }); });
+
+function writePublished(owner: string, agents: readonly {
+  readonly ordinal: string;
+  readonly sessionId: string;
+  readonly state?: AgentDisplayState;
+}[]): void {
+  const sessionId = agentId(owner);
+  const rows: ObservationRow[] = agents.map((agent) => ({
+    ordinal: agentOrdinal(agent.ordinal),
+    sessionId: agentId(agent.sessionId),
+    model: "luna:h" as ObservationRow["model"],
+    context: "42%" as ObservationRow["context"],
+    taskLabel: agent.ordinal as ObservationRow["taskLabel"],
+    state: agent.state ?? CompletionState.Completed,
+  }));
+  const encoded = encodeObservationSnapshot({
+    sessionId,
+    incarnation: incarnationId("source-test"),
+    revision: observationRevision(1),
+    total: agentCount(rows.length),
+    omitted: agentCount(0),
+    degraded: false,
+    agents: rows,
+  });
+  if (!encoded.ok) throw new Error("snapshot fixture exceeded codec bound");
+  mkdirSync(observationSlotDirectory(AGENT_DIR, sessionId), { recursive: true });
+  writeFileSync(observationSnapshotPath(AGENT_DIR, sessionId), encoded.text);
+}
 
 function register(store: AgentObservationStore, name: string, position: number, assignment: string): void {
+  const id = agentId(name);
+  const sessionPath = testSessionPath(`/tmp/pi-subagents-test/${name}.jsonl`);
   store.registerSpawned({
-    agentId: agentId(name),
+    agentId: id,
     ordinal: directAgentOrdinal(position),
     assignment,
-    sessionPath: testSessionPath(`/tmp/pi-subagents-test/${name}.jsonl`),
+    sessionPath,
     cwd: AGENT_DIR,
     model: modelSpec("mock-provider/luna"),
     thinkingLevel: "high",
   });
+  store.updateLifecycle({ agentId: id, runId: runId("deadbeef"), state: AgentState.Running, transcriptPath: sessionPath });
 }
 
 function sourceOver(store: AgentObservationStore, maxRows = MAX_WIDGET_ROWS) {
@@ -68,7 +120,10 @@ describe("createAgentWidgetSource", () => {
     register(store, "agent-b", 2, "Review findings");
     register(store, "agent-c", 3, "Summarise");
     expect(source.snapshot().revision).toBe(first);
-    await flush();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(source.snapshot().revision).toBe(first);
+    await waitForIndexRefresh();
 
     expect(Number(source.snapshot().revision)).toBeGreaterThan(Number(first));
     expect(source.snapshot().rows).toHaveLength(3);
@@ -76,13 +131,81 @@ describe("createAgentWidgetSource", () => {
     source.dispose();
   });
 
-  test("resolves a rendered ordinal to its owning transcript source and nothing else", () => {
+  test("resolves only direct rendered ordinals to their owning transcript source", () => {
     const store = new AgentObservationStore();
     register(store, "agent-a", 1, "Research terminal UX");
+    writePublished("agent-a", [{ ordinal: "A1", sessionId: "published-child" }]);
     const source = sourceOver(store);
     expect(source.transcriptSource(agentOrdinal("A1"))).toBe(store.transcriptSource(agentId("agent-a")));
+    expect(source.transcriptSource(agentOrdinal("A1.1"))).toBeUndefined();
     expect(source.transcriptSource(agentOrdinal("A9"))).toBeUndefined();
     source.dispose();
+  });
+
+  test("populates the recursive projection synchronously without a later source event", () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Root task");
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-b", state: AgentState.Running }]);
+    writePublished("agent-b", [{ ordinal: "A3", sessionId: "agent-c" }]);
+
+    const source = sourceOver(store);
+
+    expect(source.snapshot().rows.map((row) => row.ordinal)).toEqual([
+      agentOrdinal("A1"), agentOrdinal("A1.2"), agentOrdinal("A1.2.3"),
+    ]);
+    expect(source.snapshot().rows.map((row) => Number(row.depth))).toEqual([0, 1, 2]);
+    expect(Number(source.snapshot().total)).toBe(3);
+    expect(source.snapshot().degraded).toBe(false);
+    source.dispose();
+  });
+
+  test("degrades active roots with absent slots but not terminal roots", () => {
+    const activeStore = new AgentObservationStore();
+    register(activeStore, "active-root", 1, "Still running");
+    const active = sourceOver(activeStore);
+    expect(active.snapshot().degraded).toBe(true);
+    active.dispose();
+
+    const terminalStore = new AgentObservationStore();
+    register(terminalStore, "terminal-root", 1, "Finished");
+    const direct = terminalStore.directSnapshot();
+    if (direct.kind !== "snapshot") throw new Error("expected snapshot fixture");
+    const port: SubagentObservationPort = {
+      observation: (id) => terminalStore.observation(id),
+      directSnapshot: () => ({
+        ...direct,
+        entries: direct.entries.map((entry) => ({
+          ...entry,
+          observation: { ...entry.observation, lifecycleState: AgentState.Stopped, displayState: CompletionState.Completed },
+          row: { ...entry.row, state: CompletionState.Completed },
+        })),
+      }),
+      transcriptSource: (id) => terminalStore.transcriptSource(id),
+      subscribe: (listener) => terminalStore.subscribe(listener),
+    };
+    const terminal = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    expect(terminal.snapshot().degraded).toBe(false);
+    terminal.dispose();
+  });
+
+  test("refreshes from snapshot-watcher changes and stops watching after disposal", async () => {
+    const store = new AgentObservationStore();
+    register(store, "watch-root", 1, "Root task");
+    mkdirSync(observationSlotDirectory(AGENT_DIR, agentId("watch-root")), { recursive: true });
+    const source = sourceOver(store);
+    await waitForIndexRefresh();
+    const before = source.snapshot().revision;
+
+    writePublished("watch-root", [{ ordinal: "A1", sessionId: "watched-child" }]);
+    await waitForIndexRefresh();
+
+    expect(Number(source.snapshot().revision)).toBeGreaterThan(Number(before));
+    expect(source.snapshot().rows.map((row) => row.ordinal)).toEqual([agentOrdinal("A1"), agentOrdinal("A1.1")]);
+    const atDisposal = source.snapshot().revision;
+    source.dispose();
+    writePublished("watch-root", [{ ordinal: "A2", sessionId: "ignored-child" }]);
+    await waitForIndexRefresh();
+    expect(source.snapshot().revision).toBe(atDisposal);
   });
 
   test("honours maxRows by dropping the tail and counting it as omitted", () => {
@@ -144,9 +267,9 @@ describe("createAgentWidgetSource", () => {
 
     projectionFails = true;
     register(store, "agent-b", 2, "Review findings");
-    await flush();
+    await waitForIndexRefresh();
     register(store, "agent-c", 3, "Summarise");
-    await flush();
+    await waitForIndexRefresh();
 
     expect(source.snapshot().rows).toEqual(lastGood.rows);
     expect(Number(source.snapshot().revision)).toBeGreaterThan(Number(lastGood.revision));
@@ -181,7 +304,7 @@ describe("createAgentWidgetSource", () => {
 
     live = false;
     for (const listener of notify) listener(change);
-    await flush();
+    await waitForIndexRefresh();
 
     const after = source.snapshot();
     expect(after.rows).toEqual(before);
@@ -200,9 +323,9 @@ describe("createAgentWidgetSource", () => {
     source.subscribe(() => { healthyCalls += 1; });
 
     register(store, "agent-b", 2, "Review findings");
-    await flush();
+    await waitForIndexRefresh();
     register(store, "agent-c", 3, "Summarise");
-    await flush();
+    await waitForIndexRefresh();
 
     expect(throwingCalls).toBe(1);
     expect(healthyCalls).toBe(2);
@@ -262,7 +385,7 @@ describe("createAgentWidgetSource", () => {
     const at = source.snapshot().revision;
     source.dispose();
     register(store, "agent-b", 2, "Review findings");
-    await flush();
+    await waitForIndexRefresh();
     expect(source.snapshot().revision).toBe(at);
   });
 });

@@ -31,7 +31,12 @@ export interface SnapshotWatchClock {
 export interface SnapshotWatcherDependencies {
   readonly agentDir: AbsolutePath;
   readonly onChange: () => void;
-  readonly diagnostic: (code: WidgetDiagnosticCodeValue) => void;
+  /** Preferred bounded diagnostic adapter. */
+  readonly onDiagnostic?: (code: WidgetDiagnosticCodeValue) => void;
+  /** Backwards-compatible bounded diagnostic adapter. */
+  readonly diagnostic?: (code: WidgetDiagnosticCodeValue) => void;
+  readonly retryInterval?: Milliseconds;
+  readonly maxRetryInterval?: Milliseconds;
   readonly watchFactory?: SnapshotWatchFactory;
   readonly clock?: SnapshotWatchClock;
 }
@@ -73,6 +78,9 @@ export function createSnapshotWatcher(dependencies: SnapshotWatcherDependencies)
 class ManagedSnapshotWatcher implements SnapshotWatcher {
   private readonly watchFactory: SnapshotWatchFactory;
   private readonly clock: SnapshotWatchClock;
+  private readonly retryInterval: Milliseconds;
+  private readonly maxRetryInterval: Milliseconds;
+  private readonly onDiagnostic: (code: WidgetDiagnosticCodeValue) => void;
   private readonly slots = new Map<AgentId, SlotState>();
   private cancelInterval: (() => void) | undefined;
   private unavailableReported = false;
@@ -81,6 +89,9 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
   constructor(private readonly dependencies: SnapshotWatcherDependencies) {
     this.watchFactory = dependencies.watchFactory ?? productionWatchFactory;
     this.clock = dependencies.clock ?? productionClock;
+    this.retryInterval = dependencies.retryInterval ?? WATCH_FALLBACK_INTERVAL_MS;
+    this.maxRetryInterval = dependencies.maxRetryInterval ?? MAX_WATCH_RETRY_INTERVAL_MS;
+    this.onDiagnostic = dependencies.onDiagnostic ?? dependencies.diagnostic ?? (() => {});
   }
 
   track(sessionIds: readonly AgentId[]): void {
@@ -139,7 +150,7 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
   private attachFailed(sessionId: AgentId, prior: SlotState | undefined, error: unknown): void {
     if (this.disposed) return;
     if (isMissing(error)) {
-      const delay = prior?.kind === "pending" ? doubledDelay(prior.delay) : WATCH_FALLBACK_INTERVAL_MS;
+      const delay = prior?.kind === "pending" ? doubledDelay(prior.delay, this.maxRetryInterval) : this.retryInterval;
       this.slots.set(sessionId, { kind: "pending", delay, dueAt: this.clock.now() + Number(delay) });
     } else {
       this.slots.set(sessionId, { kind: "unavailable" });
@@ -157,7 +168,7 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
   private failedLiveHandle(sessionId: AgentId, handle: SnapshotWatchHandle): void {
     const state = this.slots.get(sessionId);
     if (this.disposed || state?.kind !== "watching" || state.handle !== handle) return;
-    const delay = WATCH_FALLBACK_INTERVAL_MS;
+    const delay = this.retryInterval;
     this.slots.set(sessionId, { kind: "pending", delay, dueAt: this.clock.now() + Number(delay) });
     this.close(handle);
     this.updateInterval();
@@ -178,7 +189,7 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
     if (requiresInterval && this.cancelInterval === undefined) {
       this.cancelInterval = this.clock.setInterval(() => {
         try { this.tick(); } catch { /* a later interval must remain usable */ }
-      }, WATCH_FALLBACK_INTERVAL_MS);
+      }, this.retryInterval);
     } else if (!requiresInterval && this.cancelInterval !== undefined) {
       this.cancelInterval();
       this.cancelInterval = undefined;
@@ -193,7 +204,7 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
   private reportUnavailable(): void {
     if (this.unavailableReported) return;
     this.unavailableReported = true;
-    try { this.dependencies.diagnostic(WidgetDiagnosticCode.WatchUnavailable); } catch { /* diagnostic boundary */ }
+    try { this.onDiagnostic(WidgetDiagnosticCode.WatchUnavailable); } catch { /* diagnostic boundary */ }
   }
 
   private close(handle: SnapshotWatchHandle): void {
@@ -201,8 +212,8 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
   }
 }
 
-function doubledDelay(delay: Milliseconds): Milliseconds {
-  return Math.min(Number(delay) * 2, Number(MAX_WATCH_RETRY_INTERVAL_MS)) as Milliseconds;
+function doubledDelay(delay: Milliseconds, maximum: Milliseconds): Milliseconds {
+  return Math.min(Number(delay) * 2, Number(maximum)) as Milliseconds;
 }
 
 function isMissing(error: unknown): boolean {

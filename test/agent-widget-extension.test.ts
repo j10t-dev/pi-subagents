@@ -90,6 +90,7 @@ function harness(options: {
   registryUnsubscribeFailures?: number;
   notifyThrows?: boolean;
   createSourceThrows?: boolean;
+  sourceDiagnostic?: string;
   createCoalescer?: NonNullable<AgentWidgetDeps["createCoalescer"]>;
   editorThrowsOn?: "getEditorComponent" | "getText" | "inherited" | "setFocus" | "requestRender";
   trace?: (event: string) => void;
@@ -159,8 +160,9 @@ function harness(options: {
   const handlers = new Map<string, Handler>();
   const pi = { on: (name: string, handler: Handler) => { handlers.set(name, handler); } };
   const queue = [...(options.sources ?? [fakeSource()])];
-  const createSource = () => {
+  const createSource: NonNullable<AgentWidgetDeps["createSource"]> = (_port, onDiagnostic) => {
     if (options.createSourceThrows) throw new Error("source constructor boom");
+    if (options.sourceDiagnostic !== undefined) onDiagnostic(options.sourceDiagnostic);
     return (queue.shift() ?? fakeSource()).source;
   };
   createAgentWidgetExtension(pi as never, {
@@ -412,6 +414,16 @@ describe("failure boundaries", () => {
   test("an editor accessor failure installs nothing and never reaches the registry", () => { const h = harness({ editorThrowsOn: "getEditorComponent" }); publish(); expect(h.widgets).toHaveLength(0); expect(h.notices.some((n) => n.type === "warning")).toBe(true); });
   test("a throwing source constructor mounts a stale header without escaping the registry", () => { const h = harness({ createSourceThrows: true }); expect(() => publish()).not.toThrow(); expect(h.widgets.at(-1)?.content).toBeDefined(); expect(h.lines()[0]).toBe("Subagents 0/0 · stale — source error"); expect(h.notices.some((n) => n.type === "warning")).toBe(true); });
   test("a source that throws on its first read mounts header-only with the stale suffix", () => { const feed = fakeSource({ onSnapshot: () => { throw new Error("read boom"); } }); const h = harness({ sources: [feed] }); publish(); expect(h.widgets.at(-1)?.content).toBeDefined(); expect(h.lines()[0]).toBe("Subagents 0/0 · stale — source error"); expect(h.notices.some((n) => n.type === "warning")).toBe(true); });
+  test("maps watch_unavailable directly instead of collapsing it to source_failed", () => {
+    const h = harness({ sourceDiagnostic: "watch_unavailable" });
+    publish();
+    expect(h.notices).toEqual([{ message: "Agent observation file watching is unavailable.", type: "warning" }]);
+  });
+  test("preserves projection-failed as the source_failed diagnostic", () => {
+    const h = harness({ sourceDiagnostic: "projection-failed" });
+    publish();
+    expect(h.notices).toEqual([{ message: "Subagent widget data unavailable (source_failed).", type: "warning" }]);
+  });
   test("a subscribe that throws is a source error, and a late callback cannot clear it", () => { const feed = fakeSource({ subscribeThrows: true }); const h = harness({ sources: [feed] }); publish(); expect(h.lines()[0]).toContain("stale — source error"); feed.emit(snapshotOf(4)); expect(h.lines()[0]).toContain("stale — source error"); expect(h.lines()[0]).not.toContain("4/4"); });
   test("a setWidget that throws leaves mounted false, the lease unheld, and reports its failure class once", () => {
     const feed = fakeSource(); setAmbientStatus("2 running"); const ambient = ambientRecorder();

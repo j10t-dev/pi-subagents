@@ -62,6 +62,12 @@ const productionCreateSource = (port: SubagentObservationPort, onDiagnostic: (co
 
 const productionDeps: AgentWidgetDeps = { createSource: productionCreateSource };
 
+function sourceDiagnosticCode(code: string): WidgetDiagnosticCodeValue {
+  return code === WidgetDiagnosticCode.WatchUnavailable
+    ? WidgetDiagnosticCode.WatchUnavailable
+    : WidgetDiagnosticCode.SourceFailed;
+}
+
 type AgentWidgetExtensionFactory = ExtensionFactory & ((pi: ExtensionAPI, deps?: AgentWidgetDeps) => void);
 type WidgetCleanup = () => boolean;
 
@@ -458,7 +464,7 @@ function startAggregator(
       if (!rowsReleased || !sourceReleased || !widgetReleased || port === undefined) return;
       const createSource = deps.createSource ?? productionCreateSource;
       const source = guard(
-        () => createSource(port, (_code) => report(WidgetDiagnosticCode.SourceFailed)),
+        () => createSource(port, (code) => report(sourceDiagnosticCode(code))),
         WidgetDiagnosticCode.SourceFailed,
       );
       currentSource = source;
