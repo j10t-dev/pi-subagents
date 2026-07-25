@@ -157,6 +157,16 @@ describe("resolveIntegrationCli", () => {
     expect(calls).toEqual(["path", "realpath:/usr/local/bin/pi"]);
   });
 
+  test("excludes package-local node_modules bins from the global PATH fallback", () => {
+    let searchedPath: string | undefined;
+    resolveIntegrationCli(
+      { PATH: "/repo/node_modules/.bin:/home/bin:/nested/node_modules/.bin:/usr/bin" },
+      runtime({ resolveOnPath: (path) => { searchedPath = path; return "/home/bin/pi"; } }),
+    );
+
+    expect(searchedPath).toBe("/home/bin:/usr/bin");
+  });
+
   test("prints the selected path and version in one report", () => {
     const output: string[] = [];
     const integrationRuntime = runtime({

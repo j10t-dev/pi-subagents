@@ -25,9 +25,33 @@ import { CONFIG_DIR_NAME, RpcClient, SessionManager, type SessionEntry } from "@
 
 import { createProductionController, launchAfterSurrender } from "../src/pi-composition.ts";
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
-import type { TranscriptItem } from "../src/agent-observation.ts";
-import { AgentEventType, AgentState, CompletionState, agentId, contextPercent, delegationDepth, milliseconds, runCapacity, type AgentId, type RunId } from "../src/domain.ts";
+import {
+  deriveTaskLabel,
+  directAgentRow,
+  unknownModelLabel,
+  type AgentObservation,
+  type SubagentObservationPort,
+  type TranscriptItem,
+} from "../src/agent-observation.ts";
+import { MAX_WIDGET_ROWS } from "../src/constants.ts";
+import {
+  AgentEventType,
+  AgentState,
+  CompletionState,
+  agentCount,
+  agentId,
+  agentObservationRevision,
+  agentOrdinal,
+  contextPercent,
+  delegationDepth,
+  milliseconds,
+  runCapacity,
+  type AgentId,
+  type RunId,
+} from "../src/domain.ts";
+import { readKnownChildSnapshots, type ObservationSnapshot } from "../src/observation-snapshot-path.ts";
 import { absolutePath } from "../src/paths.ts";
+import { createRecursiveAgentIndex, type RecursiveAgentIndex } from "../src/recursive-agent-index.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
 import {
@@ -681,6 +705,105 @@ describe("deterministic network-free real-Pi matrix", () => {
     });
   }, 40_000);
 
+  test("05aa live nested descendants publish production slots composed by the recursive index", async () => {
+    await withFixture("nested-relay-hold", async ({ client, childLaunchDir, agentDir }) => {
+      let heldChildId: AgentId | undefined;
+      let index: RecursiveAgentIndex | undefined;
+      try {
+        await client.promptAndWait("CALL_SPAWN_TASK|NESTED_RELAY_HOLD", undefined, 20_000);
+        const decodedChild = decodeStartResult(await client.getLastAssistantText());
+        const childId = agentId(decodedChild.agentId);
+        heldChildId = childId;
+
+        const childSnapshot = await waitForPublishedSnapshot(
+          agentDir,
+          childId,
+          (snapshot) => snapshot.agents.some((row) => row.state === AgentState.Running),
+          "running grandchild row",
+        );
+        const grandchildRow = childSnapshot.agents.find((row) => row.state === AgentState.Running);
+        if (grandchildRow === undefined) throw new Error("child publication lost its running grandchild row");
+        const grandchildId = grandchildRow.sessionId;
+        await waitForPublishedSnapshot(
+          agentDir,
+          grandchildId,
+          (snapshot) => Number(snapshot.total) === 0 && Number(snapshot.omitted) === 0 && snapshot.agents.length === 0,
+          "empty grandchild direct snapshot",
+        );
+
+        const livePids = childLaunchPids(childLaunchDir);
+        expect(livePids).toHaveLength(2);
+        expect(livePids.every((pid) => !processAbsent(pid))).toBeTrue();
+
+        const rootObservation: AgentObservation = {
+          agentId: childId,
+          ordinal: agentOrdinal("A1"),
+          taskLabel: deriveTaskLabel("nested relay child", {
+            knownAgentIds: new Set(),
+            knownRunIds: new Set(),
+            knownInternalPaths: new Set(),
+          }),
+          modelLabel: unknownModelLabel(),
+          context: { kind: "unavailable" },
+          lifecycleState: AgentState.Running,
+          displayState: AgentState.Running,
+          activity: { kind: "idle" },
+          completionPendingDelivery: false,
+          revision: agentObservationRevision(1),
+        };
+        const rootPort: SubagentObservationPort = {
+          observation: (id) => id === childId ? rootObservation : undefined,
+          directSnapshot: () => ({
+            kind: "snapshot",
+            revision: agentObservationRevision(1),
+            health: { kind: "healthy" },
+            total: agentCount(1),
+            omitted: agentCount(0),
+            omittedActive: agentCount(0),
+            entries: [{
+              agentId: childId,
+              observation: rootObservation,
+              row: directAgentRow(rootObservation),
+            }],
+          }),
+          transcriptSource: () => undefined,
+          subscribe: () => () => {},
+        };
+        index = createRecursiveAgentIndex(rootPort, {
+          agentDir: absolutePath(agentDir),
+          maxRows: MAX_WIDGET_ROWS,
+          onChange: () => {},
+        });
+        index.refresh();
+
+        expect(index.snapshot().rows.map((row) => String(row.ordinal))).toEqual(["A1", "A1.1"]);
+        expect(index.snapshot().degraded).toBe(false);
+        expect(readKnownChildSnapshots(absolutePath(agentDir), [childId]).snapshots.get(childId)).toBeDefined();
+        expect(readKnownChildSnapshots(absolutePath(agentDir), [grandchildId]).snapshots.get(grandchildId)).toMatchObject({
+          total: agentCount(0), omitted: agentCount(0), agents: [],
+        });
+        expect(livePids.every((pid) => !processAbsent(pid))).toBeTrue();
+      } finally {
+        index?.dispose();
+        if (heldChildId !== undefined) {
+          try {
+            await client.promptAndWait(`CALL_STOP|${heldChildId}`, undefined, 20_000);
+          } finally {
+            await waitUntilAllProcessesExit(childLaunchDir, 10_000);
+            expect(childLaunchPids(childLaunchDir).every(processAbsent)).toBeTrue();
+          }
+        }
+      }
+    }, process.env, undefined, ({ agentDir }) => {
+      writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+        defaultProvider: "mock-provider",
+        defaultModel: "mock-model",
+        defaultThinkingLevel: "high",
+        subagents: { maxConcurrentRuns: 2, maxDepth: 2 },
+      }));
+    });
+  }, 50_000);
+
   test("05b child model selection does not change Pi's global defaults", async () => {
     await withFixture("model-defaults", async ({ client, agentDir }) => {
       const settingsPath = join(agentDir, "settings.json");
@@ -1246,6 +1369,7 @@ function findChildTranscript(agentDir: string, childId: string): string {
   const state = join(agentDir, "pi-subagents");
   for (const parent of requireDirectoryNames(state)) {
     const sessions = join(state, parent, "sessions");
+    if (!existsSync(sessions)) continue;
     for (const name of requireDirectoryNames(sessions)) if (name.includes(childId)) return join(sessions, name);
   }
   throw new Error(`missing child transcript for ${childId}`);
@@ -1430,6 +1554,36 @@ function hashFile(path: string): string {
     closeSync(descriptor);
   }
   return hash.digest("hex");
+}
+
+async function waitForPublishedSnapshot(
+  agentDir: string,
+  id: AgentId,
+  accept: (snapshot: ObservationSnapshot) => boolean,
+  expected: string,
+): Promise<ObservationSnapshot> {
+  const deadline = Date.now() + 10_000;
+  let last: string = "not read";
+  while (Date.now() < deadline) {
+    const result = readKnownChildSnapshots(absolutePath(agentDir), [id]);
+    const snapshot = result.snapshots.get(id);
+    if (snapshot !== undefined) {
+      if (accept(snapshot)) return snapshot;
+      last = JSON.stringify(snapshot);
+    } else {
+      last = `skip=${result.skipped.get(id) ?? "none"}`;
+    }
+    await Bun.sleep(20);
+  }
+  throw new Error(`publication for ${id} did not reach ${expected}: ${last}`);
+}
+
+async function waitUntilAllProcessesExit(root: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (childLaunchPids(root).every(processAbsent)) return;
+    await Bun.sleep(20);
+  }
 }
 
 function childLaunchPids(root: string): number[] {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /** Real-Pi Gate B relay-startup + snapshot-discovery spike in --mode rpc. */
 import { spawn } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,16 +9,22 @@ import { createInterface } from "node:readline";
 
 import { agentId, milliseconds, type Milliseconds } from "../src/domain.ts";
 import { absolutePath } from "../src/paths.ts";
-import { readKnownChildSnapshots, type ObservationSnapshotV1 } from "../src/observation-snapshot-path.ts";
+import { readKnownChildSnapshots, type ObservationSnapshot } from "../src/observation-snapshot-path.ts";
 import { runtimeEvidenceLine } from "./b0-orchestration.ts";
 import { detectPiRuntime, piExecutable } from "./pi-runtime-target.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_DIR = join(HERE, "..", "test", "fixtures", "relay-spike-extension");
+const PACKAGE_DIR = join(HERE, "..");
 
 function argValue(flag: string, fallback: string): string {
   const index = process.argv.indexOf(flag);
   return index === -1 ? fallback : (process.argv[index + 1] ?? fallback);
+}
+
+function relayUnsupported(reason: string): never {
+  const message = `RPC_RELAY_UNSUPPORTED: ${reason}`;
+  console.log(message);
+  throw new Error(message);
 }
 
 async function main(): Promise<void> {
@@ -27,11 +33,10 @@ async function main(): Promise<void> {
   const workDir = mkdtempSync(join(tmpdir(), "pi-relay-spike-"));
   const agentDir = absolutePath(join(workDir, "agent"));
   const sessionDir = join(workDir, "session");
-  const extDir = join(agentDir, "extensions", "relay-spike");
-  mkdirSync(extDir, { recursive: true });
+  const extensionsDir = join(agentDir, "extensions");
+  mkdirSync(extensionsDir, { recursive: true });
   mkdirSync(sessionDir, { recursive: true });
-  // The fixture is self-contained (no src import), so copy only the fixture into the autoload dir.
-  cpSync(FIXTURE_DIR, extDir, { recursive: true });
+  symlinkSync(PACKAGE_DIR, join(extensionsDir, "pi-subagents"));
 
   const args = [
     "--mode", "rpc", "--session-dir", sessionDir,
@@ -71,7 +76,7 @@ async function main(): Promise<void> {
     await sleep(milliseconds(1_000));
     child.stdin.write(`${JSON.stringify({ type: "get_state" })}\n`);
     await waitUntil(() => sessionId !== undefined, milliseconds(10_000));
-    if (sessionId === undefined) { console.log(`RPC_RELAY_UNSUPPORTED: no sessionId from get_state; stderr=${stderr.slice(0, 300)}`); return; }
+    if (sessionId === undefined) relayUnsupported(`no sessionId from get_state; stderr=${stderr.slice(0, 300)}`);
 
     // revision 1 is written from session_start and needs no model turn: it alone proves autoload
     // + RPC non-tool init. Prompt to attempt the revision-2 (turn_end) bump; offline may refuse a
@@ -79,7 +84,7 @@ async function main(): Promise<void> {
     child.stdin.write(`${JSON.stringify({ type: "prompt", message: "reply with the single word ok" })}\n`);
 
     const childId = agentId(sessionId);
-    let best: ObservationSnapshotV1 | undefined;
+    let best: ObservationSnapshot | undefined;
     let lastSkip: string | undefined;
     const deadline = Date.now() + milliseconds(30_000);
     while (Date.now() < deadline) {
@@ -89,15 +94,20 @@ async function main(): Promise<void> {
       else lastSkip = result.skipped.get(childId);
       await sleep(milliseconds(100));
     }
-    if (best === undefined) { console.log(`RPC_RELAY_UNSUPPORTED: relay did not publish a discoverable snapshot for ${sessionId} (last skip reason: ${lastSkip ?? "none"})`); return; }
+    if (best === undefined) {
+      relayUnsupported(`relay did not publish a discoverable snapshot for ${sessionId} (last skip reason: ${lastSkip ?? "none"})`);
+    }
     // Negative control: an unknown session id must NOT be discovered.
     if (readKnownChildSnapshots(agentDir, [agentId("definitely-not-a-child")]).snapshots.size !== 0) {
-      console.log(`RPC_RELAY_UNSUPPORTED: discovery returned an unknown-id snapshot`); return;
+      relayUnsupported("discovery returned an unknown-id snapshot");
     }
     const snapshotWire = {
-      version: best.version,
       sessionId: best.sessionId,
+      incarnation: best.incarnation,
       revision: best.revision,
+      total: best.total,
+      omitted: best.omitted,
+      degraded: best.degraded,
       agents: best.agents,
     };
     process.stderr.write(`relay snapshot: ${JSON.stringify(snapshotWire)}\n`);

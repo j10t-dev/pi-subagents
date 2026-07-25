@@ -105,13 +105,23 @@ function scripted(model: Model<Api>, context: Context): ReturnType<typeof create
   if (providerCapturePath !== undefined) appendFileSync(providerCapturePath, `${JSON.stringify(context.messages)}\n`);
   const prompt = lastUserText(context.messages);
   const result = lastToolResultText(context.messages);
-  if (process.env.PI_SUBAGENT_CHILD === "1" && prompt.includes("NESTED_DELEGATION")) {
+  const nestedDelegation = prompt.includes("NESTED_DELEGATION");
+  const nestedRelayHold = prompt.includes("NESTED_RELAY_HOLD");
+  if (process.env.PI_SUBAGENT_CHILD === "1" && (nestedDelegation || nestedRelayHold)) {
     const toolResultCount = context.messages.filter((item) => item.role === "toolResult").length;
     if (toolResultCount === 0) {
-      emitTool(stream, model.id, "spawn_agent", { task: "REPORT_TOOLS" });
+      emitTool(stream, model.id, "spawn_agent", {
+        task: nestedRelayHold ? "CHILD_HANG" : "REPORT_TOOLS",
+      });
     } else if (toolResultCount === 1) {
-      emitTool(stream, model.id, "await_agent", { timeoutMs: 10_000 });
+      // The hold path cannot time out during the integration gate; the test releases it by stopping
+      // the intermediate child after observing and composing both live publications.
+      emitTool(stream, model.id, "await_agent", {
+        timeoutMs: nestedRelayHold ? 3_600_000 : 10_000,
+      });
     } else {
+      // Keep the existing NESTED_DELEGATION completion branch unchanged. The relay-hold test stops
+      // the child before this branch is reached, after it has observed both live publications.
       emitText(stream, model.id, JSON.stringify({
         childTools: context.tools?.map((tool) => tool.name).sort() ?? [],
         grandchildReceive: parseFixtureProtocolRecord(result ?? "{}"),

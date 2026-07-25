@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { delimiter, isAbsolute } from "node:path";
 
 export interface ParentPiEnvironmentInput {
   readonly agentDir: string;
@@ -11,7 +11,7 @@ export interface ParentPiEnvironmentInput {
 }
 
 export interface IntegrationCliRuntime {
-  resolveOnPath(): string;
+  resolveOnPath(searchPath: string | undefined): string;
   canonicalise(path: string): string;
   version(path: string): string;
   write(message: string): void;
@@ -25,7 +25,10 @@ const MANAGED_CHILD_ENV = [
 ] as const;
 
 const SYSTEM_RUNTIME: IntegrationCliRuntime = {
-  resolveOnPath: () => execFileSync("sh", ["-c", "command -v pi"], { encoding: "utf8" }),
+  resolveOnPath: (searchPath) => execFileSync("sh", ["-c", "command -v pi"], {
+    encoding: "utf8",
+    env: { ...process.env, ...(searchPath === undefined ? {} : { PATH: searchPath }) },
+  }),
   canonicalise: (path) => realpathSync(path),
   version: (path) => execFileSync(path, ["--version"], { encoding: "utf8" }),
   write: (message) => { process.stdout.write(message); },
@@ -68,7 +71,10 @@ export function resolveIntegrationCli(
   }
   if (environment.CI !== undefined) throw new Error("CI requires PI_INTEGRATION_CLI");
 
-  const located = runtime.resolveOnPath().trim();
+  const searchPath = environment.PATH?.split(delimiter)
+    .filter((entry) => !/(?:^|[/\\])node_modules[/\\]\.bin[/\\]?$/u.test(entry))
+    .join(delimiter);
+  const located = runtime.resolveOnPath(searchPath).trim();
   if (!isAbsolute(located)) throw new Error("local integration requires an absolute pi executable on PATH");
   return runtime.canonicalise(located);
 }

@@ -39,6 +39,15 @@ function processResult(overrides: Partial<SpikeProcessResult> = {}): SpikeProces
   };
 }
 
+test("relay unsupported diagnostics throw rather than let the spike exit successfully", () => {
+  const source = readFileSync(join(import.meta.dir, "..", "scripts", "run-relay-spike.ts"), "utf-8");
+  expect(source).toContain('function relayUnsupported(reason: string): never');
+  expect(source.match(/relayUnsupported\(/g)).toHaveLength(4);
+  expect(source).not.toContain("RPC_RELAY_UNSUPPORTED: no sessionId from get_state; stderr=${stderr.slice(0, 300)}`); return");
+  expect(source).not.toContain("RPC_RELAY_UNSUPPORTED: relay did not publish a discoverable snapshot for ${sessionId} (last skip reason: ${lastSkip ?? \"none\"})`); return");
+  expect(source).not.toContain("RPC_RELAY_UNSUPPORTED: discovery returned an unknown-id snapshot`); return");
+});
+
 test("a non-zero spike cannot supply supported evidence", () => {
   const execution = spikeExecutionFromResult(processResult({
     status: 1,
