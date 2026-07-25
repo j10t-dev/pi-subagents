@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
+import createAgentWidgetExtension from "./agent-widget.ts";
 import { canDelegateFrom, parseExtensionLaunchContext, type DelegationLimits } from "./src/delegation-policy.ts";
 import { onAmbientStatus, setAmbientStatus } from "./src/ambient-status-lease.ts";
 import { SubagentController } from "./src/controller.ts";
@@ -17,6 +18,8 @@ import { loadSubagentSettings, readGlobalMaxDepth, readSubagentSettingsFiles, ty
 import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
 
 const STATUS_KEY = "pi-subagents";
+const ANSI_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/gu;
 type ToolRegistrationSpec<K extends SubagentToolName> = {
   readonly label: string;
   readonly description: string;
@@ -65,6 +68,18 @@ export interface PiSubagentsExtensionOptions {
   registration: ExtensionRegistration;
   createController(context: ExtensionContext, api: ExtensionAPI, refreshStatus: () => void): ExtensionController;
   diagnostic(message: string): void;
+  /** Installs the TUI widget. Omitted by unit tests; supplied at the production call site. */
+  startWidget?(pi: ExtensionAPI): void;
+}
+
+function presentationError(error: unknown): string {
+  try {
+    const value = error instanceof Error ? error.message : String(error);
+    const sanitised = String(value).replace(ANSI_SEQUENCE, "").replace(CONTROL_CHARACTERS, " ").replace(/\s+/gu, " ").trim();
+    return sanitised === "" ? "unknown error" : sanitised;
+  } catch {
+    return "unknown error";
+  }
 }
 
 export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions): ExtensionFactory {
@@ -83,6 +98,22 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
         pi.on("session_start", (_event, context) => { context.ui.notify(diagnostic, "warning"); });
       }
       return;
+    }
+
+    // The widget is no longer an optional install, so this is the boundary that keeps a broken
+    // widget from taking the session's tools and child lifecycle with it. `diagnostic` is stderr
+    // and fires now, at load time, before any TUI exists; the notify surfaces it to a user who
+    // does get one. Same two-channel shape as the registration diagnostic above.
+    try {
+      options.startWidget?.(pi);
+    } catch (error) {
+      const detail = `Subagent widget unavailable: ${presentationError(error)}`;
+      try { options.diagnostic(detail); } catch { /* startup diagnostic boundary */ }
+      try {
+        pi.on("session_start", (_event, context) => {
+          try { context.ui.notify(detail, "warning"); } catch { /* startup diagnostic boundary */ }
+        });
+      } catch { /* startup notification registration boundary */ }
     }
 
     let current: ExtensionController | undefined;
@@ -229,6 +260,7 @@ const extension = createPiSubagentsExtension({
   platform: process.platform,
   nodeVersion: process.versions.node,
   registration: defaultRegistration,
+  startWidget: createAgentWidgetExtension,
   createController: (context, pi, refreshStatus) => {
     const agentDir = absolutePath(getAgentDir());
     const cwd = absolutePath(context.cwd);

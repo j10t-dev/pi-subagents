@@ -19,6 +19,8 @@ import { absolutePath } from "./src/paths.ts";
 
 const WIDGET_KEY = "pi-subagents-agents";
 const RENDER_COALESCE_MS = 50;
+const ANSI_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/gu;
 
 type WidgetSource = ReturnType<typeof createAgentWidgetSource>;
 type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
@@ -48,9 +50,25 @@ type AgentWidgetExtensionFactory = ExtensionFactory & ((pi: ExtensionAPI, deps?:
 
 const createAgentWidgetExtension: AgentWidgetExtensionFactory = (pi: ExtensionAPI, deps: AgentWidgetDeps = productionDeps) => {
   let stop: (() => void) | undefined;
-  pi.on("session_start", (_event, ctx) => { stop?.(); stop = start(ctx, deps); });
-  pi.on("session_shutdown", () => { stop?.(); stop = undefined; });
+  pi.on("session_shutdown", (_event, ctx) => {
+    const previous = stop;
+    stop = undefined;
+    try { previous?.(); } catch (error) { reportLifecycleError(ctx, error); }
+  });
+  pi.on("session_start", (_event, ctx) => {
+    const previous = stop;
+    stop = undefined;
+    try { previous?.(); stop = start(ctx, deps); } catch (error) { reportLifecycleError(ctx, error); }
+  });
 };
+
+function reportLifecycleError(ctx: ExtensionContext, error: unknown): void {
+  notify(ctx, `Subagent widget error: ${message(error)}`);
+}
+
+function notify(ctx: ExtensionContext, text: string): void {
+  try { ctx.ui.notify(sanitisePresentation(text), "warning"); } catch { /* diagnostic boundary */ }
+}
 
 export default createAgentWidgetExtension;
 
@@ -76,7 +94,7 @@ function start(ctx: ExtensionContext, deps: AgentWidgetDeps): () => void {
   let lease: StatusLease | undefined;
 
   const report = (error: unknown): void => {
-    try { ctx.ui.notify(`Subagent widget error: ${message(error)}`, "warning"); } catch { /* diagnostic boundary */ }
+    notify(ctx, `Subagent widget error: ${message(error)}`);
   };
   const guard = <T>(operation: () => T): T | undefined => {
     try { return operation(); } catch (error) { report(error); return undefined; }
@@ -104,7 +122,7 @@ function start(ctx: ExtensionContext, deps: AgentWidgetDeps): () => void {
     const live = guard(() => ctx.ui.getEditorComponent() === installedFactory) === true;
     if (!live && !navigationLost) {
       navigationLost = true;
-      guard(() => ctx.ui.notify("Subagent widget: another extension replaced the editor; arrow navigation unavailable.", "warning"));
+      guard(() => notify(ctx, "Subagent widget: another extension replaced the editor; arrow navigation unavailable."));
       editorRef = undefined;
       view = { ...view, model: clearSelection(view.model) };
       guard(() => widget?.invalidate());
@@ -217,7 +235,7 @@ function start(ctx: ExtensionContext, deps: AgentWidgetDeps): () => void {
       currentSource = undefined;
       unmount();
       if (port === undefined) return;
-      const source = guard(() => deps.createSource(port, (code) => guard(() => ctx.ui.notify(`Subagent widget: ${code}`, "warning"))));
+      const source = guard(() => deps.createSource(port, (code) => guard(() => notify(ctx, `Subagent widget: ${code}`))));
       currentSource = source;
       if (source === undefined) {
         view = { ...view, sourceError: true };
@@ -252,5 +270,10 @@ function start(ctx: ExtensionContext, deps: AgentWidgetDeps): () => void {
 }
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try { return error instanceof Error ? error.message : String(error); } catch { return "unknown error"; }
+}
+
+function sanitisePresentation(value: string): string {
+  const sanitised = value.replace(ANSI_SEQUENCE, "").replace(CONTROL_CHARACTERS, " ").replace(/\s+/gu, " ").trim();
+  return sanitised === "" ? "unknown error" : sanitised;
 }

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { EditorComponent, TUI } from "@earendil-works/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { createPiSubagentsExtension, type ExtensionController } from "../index.ts";
 import createAgentWidgetExtension from "../agent-widget.ts";
 import type { AgentDisplayState, AgentWidgetSnapshot, AgentWidgetSource, SubagentObservationPort } from "../src/agent-observation.ts";
 import { publishObservationPort } from "../src/observation-registry.ts";
@@ -9,6 +11,8 @@ import {
   AgentState, agentCount, agentDepth, agentObservationRevision, agentOrdinal, agentWidgetRevision,
   type ContextLabel, type ModelLabel, type TaskLabel,
 } from "../src/domain.ts";
+import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
+import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
 
 const DOWN = "\u001b[B";
 const UP = "\u001b[A";
@@ -52,6 +56,8 @@ function fakeSource(options: { onSnapshot?: () => AgentWidgetSnapshot; subscribe
 
 function harness(options: {
   mode?: string;
+  modeError?: unknown;
+  modeThrows?: boolean;
   sources?: ReadonlyArray<ReturnType<typeof fakeSource>>;
   setWidgetThrowsOn?: "mount" | "unmount";
   notifyThrows?: boolean;
@@ -73,7 +79,11 @@ function harness(options: {
     requestRender: () => { if (options.editorThrowsOn === "requestRender") throw new Error("render boom"); },
   } as TUI;
   const ctx = {
-    mode: options.mode ?? "tui",
+    get mode(): string {
+      if (options.modeError !== undefined) throw options.modeError;
+      if (options.modeThrows) throw new Error("mode boom");
+      return options.mode ?? "tui";
+    },
     ui: {
       setWidget: (key: string, content: WidgetFactory | undefined) => {
         const removing = content === undefined;
@@ -116,6 +126,7 @@ function harness(options: {
     component: () => component, setEditorText: (value: string) => { editorText = value; },
     replaceEditorFactory: () => { editorFactory = (() => ({ render: () => [], invalidate: () => {}, getText: () => "", setText: () => {}, handleInput: () => {} })) as EditorFactory; },
     lines: () => (component?.render as ((width: number) => string[]) | undefined)?.(120) ?? [],
+    start: () => handlers.get("session_start")?.({}, ctx),
     shutdown: () => handlers.get("session_shutdown")?.({}, ctx),
   };
 }
@@ -165,6 +176,36 @@ describe("failure boundaries", () => {
   test("a setWidget that throws leaves mounted false, the lease unheld, and remounts next update", () => { const feed = fakeSource(); setAmbientStatus("2 running"); const ambient = ambientRecorder(); const h = harness({ sources: [feed], setWidgetThrowsOn: "mount" }); publish(); feed.emit(snapshotOf(2)); expect(ambient.text).toBe("2 running"); expect(h.notices.some((n) => n.type === "warning")).toBe(true); expect(() => feed.emit(snapshotOf(3))).not.toThrow(); });
   test("a throwing diagnostic presenter cannot escape a guarded widget failure", () => { const feed = fakeSource(); harness({ sources: [feed], setWidgetThrowsOn: "mount", notifyThrows: true }); publish(); expect(() => feed.emit(snapshotOf(2))).not.toThrow(); });
   test("an unmount whose setWidget throws still releases the lease and clears the view", () => { const feed = fakeSource(); setAmbientStatus("2 running"); const ambient = ambientRecorder(); const h = harness({ sources: [feed], setWidgetThrowsOn: "unmount" }); publish(); feed.emit(snapshotOf(2)); expect(() => feed.emit(snapshotOf(0, 0))).not.toThrow(); expect(ambient.text).toBe("2 running"); });
+  test("a session start callback contains a widget start failure", () => { expect(() => harness({ modeThrows: true })).not.toThrow(); });
+  test("sanitises thrown widget errors before notifying", () => {
+    const h = harness({ modeError: new Error("widget \u001b[31mboom\u001b[0m\u0000") });
+    expect(h.notices).toEqual([{ message: "Subagent widget error: widget boom", type: "warning" }]);
+  });
+  test("a session shutdown callback contains a widget stop failure", () => {
+    const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(2));
+    let throwOnFocus = true;
+    Object.defineProperty(h.component()!, "focused", { get: () => {
+      if (throwOnFocus) throw new Error("focused boom");
+      return false;
+    } });
+    expect(() => h.shutdown()).not.toThrow();
+    throwOnFocus = false;
+    h.shutdown();
+  });
+  test("a failed shutdown registration leaves no resource-creating start handler", () => {
+    const handlers = new Map<string, Array<LifecycleHandler<StartupContext>>>();
+    let registrations = 0;
+    const pi = {
+      on: lifecycleOn(handlers, () => {
+        registrations += 1;
+        if (registrations === 2) throw new Error("registration boom");
+      }),
+    } satisfies Pick<ExtensionAPI, "on">;
+
+    // The widget uses only `on`; this is the one structural adaptation to its public Pi boundary.
+    expect(() => createAgentWidgetExtension(pi as ExtensionAPI)).toThrow("registration boom");
+    expect([...handlers.keys()]).toEqual(["session_shutdown"]);
+  });
 });
 
 describe("handover and generations", () => {
@@ -183,4 +224,174 @@ describe("editor composition and focus", () => {
   test("the latched suffix survives an unmount and remount, and the diagnostic still fires once", () => { const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(2)); h.replaceEditorFactory(); h.lines(); feed.emit(snapshotOf(0, 0)); feed.emit(snapshotOf(2)); expect(h.lines()[0]).toContain("arrow navigation unavailable"); expect(h.notices.filter((n) => n.message.includes("arrow")).length).toBe(1); });
   test("Up from the widget's first row returns focus to the same editor instance", () => { const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(2)); h.editor!.handleInput(DOWN); (h.component()!.handleInput as (data: string) => void)(UP); expect(h.focusCalls.at(-1)).toBe(h.editor); });
   test("editor interception contains every widget-owned dependency failure", () => { for (const failure of ["getText", "inherited", "setFocus", "requestRender"] as const) { const feed = fakeSource(); const h = harness({ sources: [feed], editorThrowsOn: failure }); const token = publish(); feed.emit(snapshotOf(2)); if (failure === "inherited") h.setEditorText("hello"); expect(() => h.editor!.handleInput(DOWN)).not.toThrow(); expect(h.notices.some((n) => n.type === "warning")).toBe(true); token.clear(); h.shutdown(); } });
+});
+
+interface StartupContext {
+  notices: string[];
+  ui: { setStatus(): void; notify(message: string): void };
+}
+
+function startupController(): ExtensionController {
+  return {
+    restore: async () => {}, shutdown: async () => {}, status: () => "0 running · 0 ready",
+    tools: () => ({
+      spawn_agent: { name: "spawn_agent", description: "spawn_agent", parameters: spawnAgentSchema, execute: async () => ({ content: "spawn_agent", details: { name: "spawn_agent" } }), renderResult: () => "spawn_agent" },
+      send_input: { name: "send_input", description: "send_input", parameters: sendInputSchema, execute: async () => ({ content: "send_input", details: { name: "send_input" } }), renderResult: () => "send_input" },
+      await_agent: { name: "await_agent", description: "await_agent", parameters: awaitAgentSchema, execute: async () => ({ content: "await_agent", details: { name: "await_agent" } }), renderResult: () => "await_agent" },
+      stop_agent: { name: "stop_agent", description: "stop_agent", parameters: stopAgentSchema, execute: async () => ({ content: "stop_agent", details: { name: "stop_agent" } }), renderResult: () => "stop_agent" },
+    }),
+  };
+}
+
+function startupHarness(options: {
+  // This option mirrors PiSubagentsExtensionOptions; startup always receives ExtensionAPI.
+  startWidget?: (pi: ExtensionAPI) => void;
+  platform?: string;
+  registration?: { readonly enabled: true } | { readonly enabled: false; readonly diagnostic?: string };
+  diagnosticThrows?: boolean;
+  onThrowsOnce?: boolean;
+  omitStartWidget?: boolean;
+} = {}) {
+  const log: string[] = [];
+  const diagnostics: string[] = [];
+  const registered: Array<Record<string, unknown>> = [];
+  const handlers = new Map<string, Array<LifecycleHandler<StartupContext>>>();
+  let onThrew = false;
+  const api: ExtensionApiPort = {
+    // The host accepts generic ToolDefinition values; this fake records only their observable fields.
+    // ToolDefinition has no string index signature, so the fake receives object and narrows locally.
+    registerTool: ((tool: object) => {
+      const entry = tool as Record<string, unknown>;
+      log.push(`tool:${String(entry.name)}`);
+      registered.push(entry);
+    }) as ExtensionApiPort["registerTool"],
+    on: lifecycleOn(handlers, () => {
+      if (options.onThrowsOnce === true && !onThrew) {
+        onThrew = true;
+        throw new Error("registration boom");
+      }
+    }),
+    appendEntry: () => {}, sendMessage: () => {},
+    getThinkingLevel: () => "high", getActiveTools: () => [],
+  };
+  const base = {
+    platform: options.platform ?? "linux",
+    nodeVersion: "22.19.0",
+    registration: options.registration ?? { enabled: true },
+    createController: () => startupController(),
+    diagnostic: (message: string) => {
+      diagnostics.push(message);
+      if (options.diagnosticThrows) throw new Error("diagnostic boom");
+    },
+  };
+  const factory = options.omitStartWidget === true
+    ? createPiSubagentsExtension(base)
+    : createPiSubagentsExtension({
+        ...base,
+        startWidget: (pi: ExtensionAPI) => { log.push("startWidget"); options.startWidget?.(pi); },
+      });
+  factory(extensionApiForTest(api));
+  const ctx: StartupContext = {
+    notices: [],
+    ui: { setStatus: () => {}, notify: (message: string) => { ctx.notices.push(message); } },
+  };
+  return {
+    log, diagnostics, registered, ctx,
+    tools: () => log.filter((entry) => entry.startsWith("tool:")),
+    handlerNames: () => [...handlers].flatMap(([name, list]) => list.map(() => name)),
+    start: async () => { for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx); },
+  };
+}
+
+describe("startup integration", () => {
+  test("installs widget startup exactly once, before any tool is registered", () => {
+    const h = startupHarness();
+    expect(h.log.filter((entry) => entry === "startWidget")).toHaveLength(1);
+    expect(h.log[0]).toBe("startWidget");
+    expect(h.tools()).toEqual(["tool:spawn_agent", "tool:send_input", "tool:await_agent", "tool:stop_agent"]);
+  });
+
+  test("installs no widget on an unsupported platform", () => {
+    const h = startupHarness({ platform: "darwin" });
+    expect(h.log).toHaveLength(0);
+    expect(h.diagnostics).toHaveLength(1);
+  });
+
+  test("installs no widget when registration is disabled", () => {
+    const h = startupHarness({ registration: { enabled: false, diagnostic: "depth exhausted" } });
+    expect(h.log).toHaveLength(0);
+  });
+
+  test("a throwing startup is reported on both channels and costs no tool or lifecycle handler", async () => {
+    const h = startupHarness({ startWidget: () => { throw new Error("widget boom"); } });
+    expect(h.tools()).toHaveLength(4);
+    expect(h.diagnostics).toEqual(["Subagent widget unavailable: widget boom"]);
+    expect(h.ctx.notices).toHaveLength(0);
+    await h.start();
+    expect(h.ctx.notices).toEqual(["Subagent widget unavailable: widget boom"]);
+    // Pi's public ToolDefinition contract requires a raw string toolCallId; no repository brand is compatible.
+    // Recording through ExtensionApiPort erases this concrete tool's schema and context-only parameters.
+    const spawn = h.registered.find((tool) => tool.name === "spawn_agent") as
+      { execute(id: string, input: object, signal: AbortSignal): Promise<{ content: ReadonlyArray<{ text: string }> }> };
+    const result = await spawn.execute("call-1", {}, new AbortController().signal);
+    expect(result.content[0]?.text).toBe("spawn_agent");
+    expect(h.handlerNames()).toEqual([
+      "session_start", "session_start", "session_before_tree", "session_tree",
+      "session_before_switch", "session_before_fork", "session_shutdown",
+    ]);
+  });
+
+  test("sanitises thrown startup errors before diagnostics and notifications", async () => {
+    const h = startupHarness({ startWidget: () => { throw new Error("widget \u001b[31mboom\u001b[0m\u0000"); } });
+    expect(h.diagnostics).toEqual(["Subagent widget unavailable: widget boom"]);
+    await h.start();
+    expect(h.ctx.notices).toEqual(["Subagent widget unavailable: widget boom"]);
+  });
+
+  test("a failed fallback notification registration does not escape core installation", () => {
+    let h: ReturnType<typeof startupHarness> | undefined;
+    expect(() => {
+      h = startupHarness({ startWidget: () => { throw new Error("widget boom"); }, onThrowsOnce: true });
+    }).not.toThrow();
+    expect(h!.tools()).toHaveLength(4);
+    expect(h!.handlerNames()).toEqual([
+      "session_start", "session_before_tree", "session_tree", "session_before_switch", "session_before_fork", "session_shutdown",
+    ]);
+  });
+
+  test("a throwing startup diagnostic leaves tools and lifecycle available", async () => {
+    let h: ReturnType<typeof startupHarness> | undefined;
+    expect(() => {
+      h = startupHarness({ startWidget: () => { throw new Error("widget boom"); }, diagnosticThrows: true });
+    }).not.toThrow();
+    expect(h!.tools()).toHaveLength(4);
+    expect(h!.handlerNames()).toEqual([
+      "session_start", "session_start", "session_before_tree", "session_tree",
+      "session_before_switch", "session_before_fork", "session_shutdown",
+    ]);
+    await expect(h!.start()).resolves.toBeUndefined();
+  });
+
+  test("a startup-failure notification callback contains a throwing UI", async () => {
+    const h = startupHarness({ startWidget: () => { throw new Error("widget boom"); } });
+    h.ctx.ui.notify = () => { throw new Error("notify boom"); };
+    await expect(h.start()).resolves.toBeUndefined();
+  });
+
+  test("omitting the option leaves the factory behaving exactly as before", () => {
+    const h = startupHarness({ omitStartWidget: true });
+    expect(h.log).toEqual(["tool:spawn_agent", "tool:send_input", "tool:await_agent", "tool:stop_agent"]);
+    expect(h.diagnostics).toHaveLength(0);
+  });
+});
+
+describe("lifecycle recovery", () => {
+  test("a failed stop does not block the next session start", () => {
+    const first = fakeSource(); const second = fakeSource(); const h = harness({ sources: [first, second] }); publish(); first.emit(snapshotOf(2));
+    Object.defineProperty(h.component()!, "focused", { get: () => { throw new Error("focused boom"); } });
+    expect(() => h.shutdown()).not.toThrow();
+    expect(() => h.start()).not.toThrow();
+    second.emit(snapshotOf(2));
+    expect(h.widgets).toHaveLength(2);
+  });
 });

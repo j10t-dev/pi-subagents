@@ -13,8 +13,12 @@ export function extensionApiForTest(api: ExtensionApiPort): ExtensionAPI {
 }
 
 /** The tests only dispatch lifecycle events; this narrows Pi's overloaded host callback API once. */
-export function lifecycleOn<Context>(handlers: Map<string, Array<LifecycleHandler<Context>>>): ExtensionApiPort["on"] {
+export function lifecycleOn<Context>(
+  handlers: Map<string, Array<LifecycleHandler<Context>>>,
+  beforeRegister?: (name: string) => void,
+): ExtensionApiPort["on"] {
   const register = (name: string, handler: LifecycleHandler<Context>): void => {
+    beforeRegister?.(name);
     handlers.set(name, [...(handlers.get(name) ?? []), handler]);
   };
   // Pi's `on` is an overload set keyed on event name; no single function type is assignable to it,
