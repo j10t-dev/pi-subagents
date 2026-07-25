@@ -28,6 +28,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "observation-snapshot-path.test.ts",
     "persistence.test.ts",
     "pi-integration-harness.test.ts",
+    "recursive-agent-index.test.ts",
     "paths.test.ts",
     "settings.test.ts",
     "support-barriers.test.ts",

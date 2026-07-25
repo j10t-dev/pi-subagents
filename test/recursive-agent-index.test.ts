@@ -1,0 +1,580 @@
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+
+import type {
+  AgentDisplayState,
+  AgentRow,
+  DirectAgentProjection,
+  DirectAgentSnapshotResult,
+  SubagentObservationPort,
+} from "../src/agent-observation.ts";
+import { MAX_WIDGET_ROWS } from "../src/constants.ts";
+import { AgentState, CompletionState } from "../src/domain.ts";
+import {
+  agentCount,
+  agentDepth,
+  contextPercent,
+  agentId,
+  agentObservationRevision,
+  agentOrdinal,
+  incarnationId,
+  observationRevision,
+  type AbsolutePath,
+  type AgentCount,
+  type AgentId,
+  type ContextLabel,
+  type IncarnationId,
+  type ModelLabel,
+  type TaskLabel,
+} from "../src/domain.ts";
+import { createObservationRelay } from "../src/observation-relay.ts";
+import {
+  encodeObservationSnapshot,
+  MAX_SNAPSHOT_BYTES,
+  observationSlotDirectory,
+  observationSnapshotPath,
+  readKnownChildSnapshots,
+  type KnownChildSnapshots,
+  type ObservationRow,
+  type ObservationSnapshot,
+} from "../src/observation-snapshot-path.ts";
+import { absolutePath } from "../src/paths.ts";
+import {
+  createRecursiveAgentIndex,
+  MAX_WALK_DEPTH,
+  type RecursiveAgentIndexDependencies,
+} from "../src/recursive-agent-index.ts";
+import type { SnapshotWatcher } from "../src/snapshot-watcher.ts";
+
+let agentDir: AbsolutePath;
+
+beforeEach(() => {
+  agentDir = absolutePath(mkdtempSync(join(tmpdir(), "recursive-agent-index-")));
+});
+
+afterEach(() => {
+  rmSync(agentDir, { recursive: true, force: true });
+});
+
+class FakePort implements SubagentObservationPort {
+  result: DirectAgentSnapshotResult;
+  failure: Error | undefined;
+
+  constructor(result: DirectAgentSnapshotResult) {
+    this.result = result;
+  }
+
+  observation(): undefined { return undefined; }
+  directSnapshot(): DirectAgentSnapshotResult {
+    if (this.failure !== undefined) throw this.failure;
+    return this.result;
+  }
+  transcriptSource(): undefined { return undefined; }
+  subscribe(): () => void { return () => {}; }
+}
+
+class FakeWatcher implements SnapshotWatcher {
+  readonly calls: AgentId[][] = [];
+  disposed = false;
+
+  track(sessionIds: readonly AgentId[]): void {
+    this.calls.push([...sessionIds]);
+  }
+
+  dispose(): void {
+    this.disposed = true;
+  }
+}
+
+function displayRow(ordinal: string, state: AgentDisplayState = AgentState.Running, label = ordinal): AgentRow {
+  return {
+    ordinal: agentOrdinal(ordinal),
+    depth: agentDepth(0),
+    model: "model:h" as ModelLabel,
+    context: "42%" as ContextLabel,
+    taskLabel: label as TaskLabel,
+    state,
+  };
+}
+
+function projection(
+  id: string,
+  ordinal: string,
+  state: AgentDisplayState = AgentState.Running,
+  label = ordinal,
+): DirectAgentProjection {
+  const agent = agentId(id);
+  const safeLabel = label as TaskLabel;
+  const lifecycleState = state === AgentState.Running || state === AgentState.Settling ||
+    state === AgentState.Stopping || state === AgentState.Stopped ? state : AgentState.Stopped;
+  return {
+    agentId: agent,
+    observation: {
+      agentId: agent,
+      ordinal: agentOrdinal(ordinal),
+      taskLabel: safeLabel,
+      modelLabel: "model:h" as ModelLabel,
+      context: { kind: "known", percent: contextPercent(42) },
+      lifecycleState,
+      displayState: state,
+      activity: { kind: "idle" },
+      completionPendingDelivery: false,
+      revision: agentObservationRevision(1),
+    },
+    row: displayRow(ordinal, state, label),
+  };
+}
+
+function direct(
+  entries: readonly DirectAgentProjection[],
+  options: {
+    readonly total?: number;
+    readonly omittedActive?: number;
+    readonly degraded?: boolean;
+  } = {},
+): DirectAgentSnapshotResult {
+  const total = options.total ?? entries.length;
+  return {
+    kind: "snapshot",
+    revision: agentObservationRevision(1),
+    health: options.degraded ? { kind: "degraded", codes: ["projection-failed"] } : { kind: "healthy" },
+    total: agentCount(total),
+    omitted: agentCount(total - entries.length),
+    omittedActive: agentCount(options.omittedActive ?? 0),
+    entries,
+  };
+}
+
+function observationRow(
+  ordinal: string,
+  id: string,
+  state: AgentDisplayState = AgentState.Running,
+  label = ordinal,
+): ObservationRow {
+  return {
+    ordinal: agentOrdinal(ordinal),
+    sessionId: agentId(id),
+    model: "model:h" as ModelLabel,
+    context: "42%" as ContextLabel,
+    taskLabel: label as TaskLabel,
+    state,
+  };
+}
+
+function snapshot(
+  owner: AgentId,
+  agents: readonly ObservationRow[],
+  options: {
+    readonly incarnation?: IncarnationId;
+    readonly revision?: number;
+    readonly total?: number;
+    readonly degraded?: boolean;
+  } = {},
+): ObservationSnapshot {
+  const total = options.total ?? agents.length;
+  return {
+    sessionId: owner,
+    incarnation: options.incarnation ?? incarnationId("inc-1"),
+    revision: observationRevision(options.revision ?? 1),
+    total: agentCount(total),
+    omitted: agentCount(total - agents.length),
+    degraded: options.degraded ?? false,
+    agents,
+  };
+}
+
+function writeSnapshot(value: ObservationSnapshot): void {
+  mkdirSync(observationSlotDirectory(agentDir, value.sessionId), { recursive: true });
+  const encoded = encodeObservationSnapshot(value);
+  if (!encoded.ok) throw new Error("snapshot fixture exceeded codec bound");
+  writeFileSync(observationSnapshotPath(agentDir, value.sessionId), encoded.text);
+}
+
+function fixture(
+  result: DirectAgentSnapshotResult,
+  options: {
+    readonly maxRows?: number;
+    readonly readKnownChildSnapshots?: RecursiveAgentIndexDependencies["readKnownChildSnapshots"];
+  } = {},
+) {
+  const port = new FakePort(result);
+  const watcher = new FakeWatcher();
+  const changes: string[] = [];
+  const diagnostics: string[] = [];
+  const dependencies: RecursiveAgentIndexDependencies = {
+    agentDir,
+    maxRows: agentCount(options.maxRows ?? 200),
+    onChange: () => { changes.push("change"); },
+    onDiagnostic: (code) => { diagnostics.push(code); },
+    ...(options.readKnownChildSnapshots === undefined
+      ? {}
+      : { readKnownChildSnapshots: options.readKnownChildSnapshots }),
+  };
+  const index = createRecursiveAgentIndex(port, dependencies);
+  index.setWatcher(watcher);
+  return { index, port, watcher, changes, diagnostics };
+}
+
+function ordinals(rows: readonly AgentRow[]): string[] {
+  return rows.map((row) => String(row.ordinal));
+}
+
+describe("RecursiveAgentIndex", () => {
+  test("composes a real relay-written root, child and grandchild tree", () => {
+    const child = agentId("child");
+    const grandchild = agentId("grandchild");
+    const relay = createObservationRelay({
+      agentDir,
+      sessionId: child,
+      incarnation: incarnationId("relay-inc"),
+      diagnostic: () => {},
+    });
+    relay.setPort(new FakePort(direct([projection(grandchild, "A2", AgentState.Running)])));
+    relay.flush();
+    writeSnapshot(snapshot(grandchild, [observationRow("A1", "great-grandchild", CompletionState.Completed)]));
+
+    const { index } = fixture(direct([projection(child, "A1")]));
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.2", "A1.2.1"]);
+    expect(index.snapshot().rows.map((row) => Number(row.depth))).toEqual([0, 1, 2]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(3), omitted: agentCount(0), degraded: false });
+    relay.dispose();
+  });
+
+  test("admits depth MAX_WALK_DEPTH - 1, cuts MAX_WALK_DEPTH and guards cycles and overlong ordinals", () => {
+    expect(Number(MAX_WALK_DEPTH)).toBe(8);
+    const root = agentId("depth-0");
+    for (let depth = 0; depth < Number(MAX_WALK_DEPTH); depth += 1) {
+      const owner = agentId(`depth-${depth}`);
+      const next = depth === Number(MAX_WALK_DEPTH) - 1 ? "depth-cut" : `depth-${depth + 1}`;
+      writeSnapshot(snapshot(owner, [observationRow("A1", next)]));
+    }
+    const { index, watcher } = fixture(direct([projection(root, "A1")]));
+    index.refresh();
+
+    expect(index.snapshot().rows).toHaveLength(Number(MAX_WALK_DEPTH));
+    expect(index.snapshot().rows.at(-1)?.depth).toBe(agentDepth(Number(MAX_WALK_DEPTH) - 1));
+    expect(index.snapshot()).toMatchObject({ total: agentCount(9), omitted: agentCount(1), degraded: true });
+    expect(watcher.calls.at(-1)).toEqual(Array.from({ length: 8 }, (_, depth) => agentId(`depth-${depth}`)));
+
+    const cycleRoot = agentId("cycle-root");
+    const longRoot = agentId("long-root");
+    writeSnapshot(snapshot(cycleRoot, [observationRow("A1", "cycle-root")]));
+    const longLocalOrdinal = `A${"1".repeat(127)}`;
+    writeSnapshot(snapshot(longRoot, [observationRow(longLocalOrdinal, "too-long")]));
+    const second = fixture(direct([projection(cycleRoot, "A1"), projection(longRoot, "A2")]));
+    second.index.refresh();
+    expect(ordinals(second.index.snapshot().rows)).toEqual(["A1", "A2"]);
+    expect(second.index.snapshot()).toMatchObject({ total: agentCount(4), omitted: agentCount(2), degraded: true });
+    expect(second.watcher.calls.at(-1)).toEqual([cycleRoot, longRoot]);
+  });
+
+  test("selects breadth-first under budget but emits depth-first pre-order", () => {
+    const left = agentId("left");
+    const right = agentId("right");
+    const leftDeep = agentId("left-deep");
+    const rejected = agentId("rejected");
+    writeSnapshot(snapshot(left, [
+      observationRow("A1", leftDeep),
+      observationRow("A2", "left-leaf", CompletionState.Completed),
+    ]));
+    writeSnapshot(snapshot(right, [observationRow("A1", "right-leaf", CompletionState.Completed)]));
+    writeSnapshot(snapshot(leftDeep, [observationRow("A1", rejected)]));
+    writeSnapshot(snapshot(rejected, [observationRow("A1", "must-not-read")]));
+    const readBatches: AgentId[][] = [];
+    const reader: typeof readKnownChildSnapshots = (root, ids) => {
+      readBatches.push([...ids]);
+      return readKnownChildSnapshots(root, ids);
+    };
+    const { index, watcher } = fixture(
+      direct([projection(left, "A1"), projection(right, "A2")]),
+      { maxRows: 5, readKnownChildSnapshots: reader },
+    );
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1", "A1.2", "A2", "A2.1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(6), omitted: agentCount(1), degraded: true });
+    expect(readBatches.flat()).toEqual([left, right, leftDeep]);
+    expect(readBatches.flat()).not.toContain(rejected);
+    expect(watcher.calls.at(-1)).toEqual([left, right, leftDeep]);
+    expect(watcher.calls.at(-1)!.length).toBeLessThanOrEqual(5);
+    expect(new Set(readBatches.flat()).size).toBeLessThanOrEqual(5);
+  });
+
+  test("clamps an oversized dependency budget to MAX_WIDGET_ROWS across admission and retention", () => {
+    const owners = Array.from({ length: Number(MAX_WIDGET_ROWS) + 1 }, (_, index) => agentId(`bounded-${index + 1}`));
+    let phase = 1;
+    const reads: AgentId[] = [];
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => {
+      reads.push(...ids);
+      return {
+        snapshots: new Map(ids.map((owner) => [owner, snapshot(owner, [
+          observationRow("A1", `${owner}-leaf`, CompletionState.Completed, phase === 1 ? "old" : "new"),
+        ], { incarnation: incarnationId("bounded-inc"), revision: phase === 1 ? 5 : 4 })])),
+        skipped: new Map(),
+      };
+    };
+    const { index, port, watcher } = fixture(
+      direct(owners.map((owner, index) => projection(owner, `A${index + 1}`))),
+      { maxRows: Number(MAX_WIDGET_ROWS) + 1, readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+    expect(index.snapshot().rows).toHaveLength(Number(MAX_WIDGET_ROWS));
+    expect(reads).toHaveLength(Number(MAX_WIDGET_ROWS));
+    expect(watcher.calls.at(-1)).toHaveLength(Number(MAX_WIDGET_ROWS));
+    expect(reads).not.toContain(owners.at(-1));
+    expect(watcher.calls.at(-1)).not.toContain(owners.at(-1));
+
+    phase = 2;
+    port.result = direct([projection(owners.at(-1)!, "A1")]);
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("new" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(false);
+  });
+
+  test.each([
+    ["degraded direct health", direct([projection("root", "A1")], { degraded: true })],
+    ["active direct omission", direct([projection("root", "A1")], { total: 2, omittedActive: 1 })],
+  ] as const)("degrades for %s", (_name, result) => {
+    const { index } = fixture(result);
+    index.refresh();
+    expect(index.snapshot().degraded).toBe(true);
+  });
+
+  test("propagates publisher totals and degradation", () => {
+    const root = agentId("root");
+    writeSnapshot(snapshot(root, [observationRow("A1", "leaf", CompletionState.Completed)], {
+      total: 3,
+      degraded: true,
+    }));
+    const { index } = fixture(direct([projection(root, "A1")]));
+    index.refresh();
+    expect(index.snapshot()).toMatchObject({ total: agentCount(4), omitted: agentCount(2), degraded: true });
+  });
+
+  test("saturates count arithmetic and degrades", () => {
+    const root = agentId("root");
+    writeSnapshot(snapshot(root, [], { total: 1 }));
+    const { index } = fixture(direct([projection(root, "A1")], { total: Number.MAX_SAFE_INTEGER }));
+    index.refresh();
+    expect(index.snapshot()).toMatchObject({
+      total: agentCount(Number.MAX_SAFE_INTEGER),
+      omitted: agentCount(Number.MAX_SAFE_INTEGER - 1),
+      degraded: true,
+    });
+  });
+
+  test.each(["missing", "malformed", "unreadable", "oversized", "session-id-mismatch"] as const)(
+    "keeps an active parent without inventing descendants for an unusable %s slot",
+    (failure) => {
+      const root = agentId(`root-${failure}`);
+      const path = observationSnapshotPath(agentDir, root);
+      if (failure !== "missing") mkdirSync(observationSlotDirectory(agentDir, root), { recursive: true });
+      if (failure === "malformed") writeFileSync(path, "{");
+      if (failure === "unreadable") {
+        writeFileSync(path, "{}");
+        chmodSync(path, 0o000);
+      }
+      if (failure === "oversized") writeFileSync(path, "x".repeat(Number(MAX_SNAPSHOT_BYTES) + 1));
+      if (failure === "session-id-mismatch") {
+        const wrong = snapshot(agentId("different-owner"), []);
+        const encoded = encodeObservationSnapshot(wrong);
+        if (!encoded.ok) throw new Error("unexpected fixture encoding failure");
+        writeFileSync(path, encoded.text);
+      }
+      const { index, watcher } = fixture(direct([projection(root, "A1")]));
+      index.refresh();
+      if (failure === "unreadable") chmodSync(path, 0o600);
+
+      expect(ordinals(index.snapshot().rows)).toEqual(["A1"]);
+      expect(index.snapshot()).toMatchObject({ total: agentCount(1), omitted: agentCount(0), degraded: true });
+      expect(watcher.calls.at(-1)).toEqual([root]);
+    },
+  );
+
+  test.each([
+    AgentState.Stopped,
+    CompletionState.Completed,
+    CompletionState.Failed,
+    CompletionState.Cancelled,
+  ] as const)("does not descend, read, watch or degrade terminal state %s", (state) => {
+    const terminal = agentId(`terminal-${state}`);
+    writeSnapshot(snapshot(terminal, [observationRow("A1", "forbidden")]));
+    const reads: AgentId[] = [];
+    const reader: typeof readKnownChildSnapshots = (root, ids) => {
+      reads.push(...ids);
+      return readKnownChildSnapshots(root, ids);
+    };
+    const { index, watcher } = fixture(direct([projection(terminal, "A1", state)]), {
+      readKnownChildSnapshots: reader,
+    });
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1"]);
+    expect(index.snapshot().degraded).toBe(false);
+    expect(reads).toEqual([]);
+    expect(watcher.calls.at(-1)).toEqual([]);
+  });
+
+  test.each([
+    [AgentState.Running, true],
+    [AgentState.Settling, true],
+    [AgentState.Stopping, true],
+    [AgentState.Stopped, false],
+    [CompletionState.Completed, false],
+    [CompletionState.Failed, false],
+    [CompletionState.Cancelled, false],
+  ] as const)("uses exhaustive state semantics for %s", (state, active) => {
+    const child = agentId(`state-${state}`);
+    const reads: AgentId[] = [];
+    const reader = (root: AbsolutePath, ids: readonly AgentId[]): KnownChildSnapshots => {
+      reads.push(...ids);
+      return readKnownChildSnapshots(root, ids);
+    };
+    const { index, watcher } = fixture(direct([projection(child, "A1", state)]), {
+      readKnownChildSnapshots: reader,
+    });
+    index.refresh();
+
+    expect(reads).toEqual(active ? [child] : []);
+    expect(watcher.calls.at(-1)).toEqual(active ? [child] : []);
+    expect(index.snapshot().degraded).toBe(active);
+  });
+
+  test("applies the incarnation and revision matrix without unusable fallback", () => {
+    const owner = agentId("revision-owner");
+    const oldIncarnation = incarnationId("old-inc");
+    const newIncarnation = incarnationId("new-inc");
+    let outcome: KnownChildSnapshots = {
+      snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "old-leaf", CompletionState.Completed, "old")], {
+        incarnation: oldIncarnation,
+        revision: 5,
+      })]]),
+      skipped: new Map(),
+    };
+    const reader: typeof readKnownChildSnapshots = () => outcome;
+    const { index, port } = fixture(direct([projection(owner, "A1")]), { readKnownChildSnapshots: reader });
+
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("old" as TaskLabel);
+
+    outcome = { snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "new-leaf", CompletionState.Completed, "new")], {
+      incarnation: newIncarnation,
+      revision: 1,
+    })]]), skipped: new Map() };
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("new" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(false);
+
+    outcome = { snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "greater-leaf", CompletionState.Completed, "greater")], {
+      incarnation: newIncarnation,
+      revision: 2,
+    })]]), skipped: new Map() };
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("greater" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(false);
+
+    outcome = { snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "equal-leaf", CompletionState.Completed, "equal")], {
+      incarnation: newIncarnation,
+      revision: 2,
+    })]]), skipped: new Map() };
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("equal" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(false);
+
+    outcome = { snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "regressed-leaf", CompletionState.Completed, "regressed")], {
+      incarnation: newIncarnation,
+      revision: 0,
+    })]]), skipped: new Map() };
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("equal" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(true);
+
+    outcome = { snapshots: new Map(), skipped: new Map([[owner, "malformed"]]) };
+    index.refresh();
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(1), omitted: agentCount(0), degraded: true });
+
+    outcome = { snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "first-seen", CompletionState.Completed, "first-seen")], {
+      incarnation: newIncarnation,
+      revision: 0,
+    })]]), skipped: new Map() };
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("first-seen" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(false);
+
+    port.result = direct([projection(owner, "A1", CompletionState.Completed)]);
+    index.refresh();
+    port.result = direct([projection(owner, "A1")]);
+    outcome = { snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "after-prune", CompletionState.Completed, "after-prune")], {
+      incarnation: newIncarnation,
+      revision: 0,
+    })]]), skipped: new Map() };
+    index.refresh();
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("after-prune" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(false);
+  });
+
+  test("resolves ownership for direct rows only", () => {
+    const owner = agentId("owner");
+    writeSnapshot(snapshot(owner, [observationRow("A1", "descendant", CompletionState.Completed)]));
+    const { index } = fixture(direct([projection(owner, "A1")]));
+    index.refresh();
+
+    expect(index.ownerOf(agentOrdinal("A1"))).toBe(owner);
+    expect(index.ownerOf(agentOrdinal("A1.1"))).toBeUndefined();
+    expect(index.ownerOf(agentOrdinal("A9"))).toBeUndefined();
+  });
+
+  test("retains prior roots through unavailable and thrown projection failures", () => {
+    const owner = agentId("owner");
+    const { index, port, diagnostics, changes } = fixture(direct([projection(owner, "A1", CompletionState.Completed)]));
+    index.refresh();
+    const good = index.snapshot();
+
+    port.result = { kind: "unavailable", finalRevision: agentObservationRevision(2) };
+    index.refresh();
+    expect(index.snapshot()).toMatchObject({ rows: good.rows, total: good.total, omitted: good.omitted, degraded: true });
+    expect(Number(index.snapshot().revision)).toBe(Number(good.revision) + 1);
+    expect(diagnostics).toEqual([]);
+
+    port.failure = new Error("projection failed");
+    index.refresh();
+    index.refresh();
+    expect(index.snapshot().rows).toEqual(good.rows);
+    expect(diagnostics).toEqual(["projection-failed"]);
+    expect(changes).toHaveLength(4);
+  });
+
+  test("contains initial projection and callback failures, then disposal makes refresh inert", () => {
+    const port = new FakePort(direct([]));
+    port.failure = new Error("initial projection failed");
+    const diagnostics: string[] = [];
+    const watcher = new FakeWatcher();
+    const index = createRecursiveAgentIndex(port, {
+      agentDir,
+      maxRows: agentCount(2),
+      onChange: () => { throw new Error("callback failed"); },
+      onDiagnostic: (code) => { diagnostics.push(code); throw new Error("diagnostic failed"); },
+    });
+    index.setWatcher(watcher);
+
+    expect(() => index.refresh()).not.toThrow();
+    expect(index.snapshot()).toMatchObject({ rows: [], total: agentCount(0), omitted: agentCount(0), degraded: true });
+    expect(index.snapshot().revision).toBeDefined();
+    expect(diagnostics).toEqual(["projection-failed"]);
+    const at = index.snapshot();
+
+    index.dispose();
+    port.failure = undefined;
+    port.result = direct([projection("later", "A1")]);
+    index.refresh();
+    expect(index.snapshot()).toBe(at);
+    expect(watcher.disposed).toBe(true);
+  });
+});
