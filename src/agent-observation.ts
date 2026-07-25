@@ -132,10 +132,15 @@ export interface FinalAssistantBlock {
   readonly text: TranscriptText;
 }
 
+export type AssistantContentObservationEvent =
+  | { readonly kind: "assistant-content"; readonly contentIndex: RpcContentIndex; readonly contentKind: "text" | "thinking"; readonly phase: "start" }
+  | { readonly kind: "assistant-content"; readonly contentIndex: RpcContentIndex; readonly contentKind: "text" | "thinking"; readonly phase: "delta"; readonly delta: TranscriptText }
+  | { readonly kind: "assistant-content"; readonly contentIndex: RpcContentIndex; readonly contentKind: "text" | "thinking"; readonly phase: "end"; readonly text: TranscriptText };
+
 export type RpcObservationEvent =
   | { readonly kind: "prompt-accepted"; readonly text: TranscriptText }
   | { readonly kind: "assistant-start" }
-  | { readonly kind: "assistant-content"; readonly contentIndex: RpcContentIndex; readonly contentKind: "text" | "thinking"; readonly phase: "start" | "delta" | "end"; readonly text?: TranscriptText }
+  | AssistantContentObservationEvent
   | { readonly kind: "assistant-end"; readonly finalBlocks: readonly FinalAssistantBlock[]; readonly usage: Usage; readonly stopReason: RpcStopReason }
   | { readonly kind: "tool"; readonly toolCallId: RpcToolCallId; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
   | { readonly kind: "turn-end" }
@@ -165,7 +170,8 @@ const PATH_TOKEN_PATTERN = /(?:[A-Za-z]:[\\/]|(?:\.{0,2}|~)?[\\/])\S+|\b\S*[\\/]
 const encoder = new TextEncoder();
 
 export function deriveTaskLabel(assignment: string, context: TaskLabelContext): TaskLabel {
-  const line = assignment.replaceAll("\r\n", "\n").split("\n").map((value) => value.trim()).find((value) => value.length > 0) ?? "";
+  const line = assignment.replaceAll("\r\n", "\n").split("\n")
+    .find((value) => value.trim().length > 0 && !isStandaloneFence(value))?.trim() ?? "";
   const sentence = /^(.+?[.!?])(?:\s|$)/u.exec(line)?.[1] ?? line;
   let value = sentence
     .replace(ANSI_PATTERN, "")
@@ -230,6 +236,9 @@ function boundedPrefix(value: string, maxCodePoints: number, maxBytes: number): 
   let output = ""; let points = 0; let bytes = 0;
   for (const point of value) { const pointBytes = encoder.encode(point).byteLength; if (points === maxCodePoints || bytes + pointBytes > maxBytes) break; output += point; points++; bytes += pointBytes; }
   return output;
+}
+function isStandaloneFence(value: string): boolean {
+  return /^ {0,3}(?:`{3,}[^`]*|~{3,}.*)\s*$/u.test(value);
 }
 function isOpaque(value: string): boolean {
   if (value.length === 0) return true;

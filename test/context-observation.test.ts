@@ -61,7 +61,63 @@ describe("ContextObservationService", () => {
     service.reset(R1); service.observe({ kind: "turn-end" }); await flush();
     service.observe(assistantEnd(reason)); service.observe({ kind: "turn-end" }); await flush();
     expect(calls).toBe(1);
+    expect(values.at(-1)).toEqual({ kind: "known", percent: contextPercent(50.5) });
+  });
+
+  test("prefers validated totalTokens, clamps the shortcut percentage, and avoids polling", async () => {
+    let calls = 0;
+    const values: ContextObservation[] = [];
+    const service = createContextObservationService({ getSessionStats: async () => { calls++; return stats(25); } }, (_run, value) => values.push(value));
+    service.reset(R1); service.observe({ kind: "turn-end" }); await flush();
+    service.observe({ kind: "assistant-end", finalBlocks: [], stopReason: rpcStopReason("stop"), usage: {
+      input: 300, output: 200, cacheRead: 100, cacheWrite: 50, totalTokens: 250,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    } });
+    service.observe({ kind: "turn-end" }); await flush();
+    expect(calls).toBe(1);
+    expect(values.at(-1)).toEqual({ kind: "known", percent: contextPercent(100) });
+  });
+
+  test("falls back to all token components when totalTokens is zero", async () => {
+    let calls = 0;
+    const values: ContextObservation[] = [];
+    const service = createContextObservationService({ getSessionStats: async () => { calls++; return stats(25); } }, (_run, value) => values.push(value));
+    service.reset(R1); service.observe({ kind: "turn-end" }); await flush();
+    service.observe({ kind: "assistant-end", finalBlocks: [], stopReason: rpcStopReason("stop"), usage: {
+      input: 20, output: 10, cacheRead: 5, cacheWrite: 5, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    } });
+    service.observe({ kind: "turn-end" }); await flush();
+    expect(calls).toBe(1);
+    expect(values.at(-1)).toEqual({ kind: "known", percent: contextPercent(20) });
+  });
+
+  test("polls when totalTokens and every component are zero", async () => {
+    let calls = 0;
+    const values: ContextObservation[] = [];
+    const service = createContextObservationService({ getSessionStats: async () => stats(++calls * 25) }, (_run, value) => values.push(value));
+    service.reset(R1); service.observe({ kind: "turn-end" }); await flush();
+    service.observe({ kind: "assistant-end", finalBlocks: [], stopReason: rpcStopReason("length"), usage: {
+      input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    } });
+    service.observe({ kind: "turn-end" }); await flush();
+    expect(calls).toBe(2);
     expect(values.at(-1)).toEqual({ kind: "known", percent: contextPercent(50) });
+  });
+
+  test("falls back to input, output, cache read and cache write when totalTokens is invalid", async () => {
+    let calls = 0;
+    const values: ContextObservation[] = [];
+    const service = createContextObservationService({ getSessionStats: async () => { calls++; return stats(25); } }, (_run, value) => values.push(value));
+    service.reset(R1); service.observe({ kind: "turn-end" }); await flush();
+    service.observe({ kind: "assistant-end", finalBlocks: [], stopReason: rpcStopReason("length"), usage: {
+      input: 20, output: 10, cacheRead: 5, cacheWrite: 5, totalTokens: Number.NaN,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    } });
+    service.observe({ kind: "turn-end" }); await flush();
+    expect(calls).toBe(1);
+    expect(values.at(-1)).toEqual({ kind: "known", percent: contextPercent(20) });
   });
 
   test.each(["toolUse", "future_reason"] as const)("pulls stats after %s", async (reason) => {

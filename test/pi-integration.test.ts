@@ -331,6 +331,33 @@ describe("installed Pi integration prerequisites", () => {
     }
   }, 15_000);
 
+  test("production boundary keeps long multibyte assistant and tool observations live and bounded", async () => {
+    const harness = productionFakeRpcHarness("long-observation");
+    try {
+      await harness.controller.restore();
+      const started = await harness.controller.spawn({ task: "long observation" });
+      if (!("runId" in started)) throw new Error("run identity unavailable");
+      for (let index = 0; index < 200 && harness.controller.observationPort().observation(started.agentId)?.activity.kind !== "tool"; index++) {
+        await Bun.sleep(5);
+      }
+      const transcript = harness.controller.observationPort().transcriptSource(started.agentId)!.snapshot();
+      expect(transcript.availability).toBe("live");
+      expect(transcript.items).toEqual([
+        expect.objectContaining({ kind: "user", text: "long observation" }),
+        expect.objectContaining({ kind: "assistant", phase: "partial", text: "🙂".repeat(2_048) }),
+        expect.objectContaining({ kind: "tool", phase: "running", tool: "读".repeat(80) }),
+      ]);
+      expect(Buffer.byteLength((transcript.items[1] as { text: string }).text, "utf8")).toBe(8_192);
+      expect(harness.controller.observationPort().observation(started.agentId)?.activity).toMatchObject({
+        kind: "tool", tool: "读".repeat(80), phase: "running",
+      });
+      harness.releaseLongObservation();
+      expect(await harness.controller.awaitReady({ timeoutMs: milliseconds(10_000) })).toMatchObject({
+        completion: { agentId: started.agentId, runId: started.runId, state: CompletionState.Completed },
+      });
+    } finally { await harness.close(); }
+  }, 20_000);
+
   test("production routing keeps two reused-index runs distinct for exact authoritative replacement", async () => {
     const harness = productionFakeRpcHarness("observation-two-runs");
     try {
@@ -1046,6 +1073,7 @@ function productionFakeRpcHarness(
 ): {
   readonly controller: ReturnType<typeof createProductionController>;
   readonly events: readonly unknown[];
+  releaseLongObservation(): void;
   close(): Promise<void>;
   cleanup(): void;
 } {
@@ -1091,7 +1119,8 @@ function productionFakeRpcHarness(
       }) => {
         const child = spawnProcess(process.execPath, [fileURLToPath(new URL("fixtures/fake-rpc-child.mjs", import.meta.url))], {
           cwd: project,
-          env: { ...process.env, FAKE_RPC_SCENARIO: scenario, FAKE_RPC_AGENT_ID: childId, FAKE_RPC_SESSION_PATH: childSession },
+          env: { ...process.env, FAKE_RPC_SCENARIO: scenario, FAKE_RPC_AGENT_ID: childId, FAKE_RPC_SESSION_PATH: childSession,
+            FAKE_RPC_HANDSHAKE_DIR: root },
           stdio: ["pipe", "pipe", "pipe"],
         });
         children.add(child);
@@ -1110,7 +1139,9 @@ function productionFakeRpcHarness(
     for (const child of children) child.kill();
     state.cleanup();
   };
-  return { controller, events, cleanup, close: async () => {
+  return { controller, events, cleanup,
+    releaseLongObservation: () => { writeFileSync(join(root, "release-long-observation"), "release\n"); },
+    close: async () => {
     try { await controller.shutdown(); } catch { /* fake containment has no kernel authority */ }
     cleanup();
   } };

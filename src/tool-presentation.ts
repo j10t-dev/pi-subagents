@@ -34,18 +34,20 @@ export function renderLifecycleToolResult(
   const selected = tool === "await_agent"
     ? awaitLines(source, resolver, options.expanded)
     : ordinaryLines(tool, source, resolver, options.expanded);
-  return admitLines(selected.lines, options.expanded ? 100 : 20, selected.omitted, title(tool));
+  return admitLines(selected.headers, selected.lines, options.expanded ? 100 : 20, selected.omitted, title(tool),
+    tool === "await_agent" && options.expanded);
 }
 
-interface SelectedLines { readonly lines: readonly string[]; readonly omitted: readonly string[] }
+interface SelectedLines { readonly headers: readonly string[]; readonly lines: readonly string[]; readonly omitted: readonly string[] }
 interface ResolvedLine { readonly id: AgentId; readonly row: AgentRow; readonly source: Record<string, unknown> }
 
 function ordinaryLines(tool: string, source: Record<string, unknown>, resolver: AgentDisplayResolver, expanded: boolean): SelectedLines {
   const records = tool === "stop_agent" ? recordsFrom(source.outcomes) : [source];
-  const resolved = records.flatMap((item) => resolveLine(item, resolver));
-  const unavailable = resolved.length === 0 && records.length > 0 ? ["Agent · unavailable"] : [];
-  const lines = [...resolved.sort(compareRows).map((item) => renderRow(item, expanded)), ...unavailable];
-  return { lines, omitted: [] };
+  const lines = records.map((item) => {
+    const resolved = resolveLine(item, resolver)[0];
+    return resolved === undefined ? "Agent · unavailable" : renderRow(resolved, expanded);
+  });
+  return { headers: [], lines, omitted: [] };
 }
 
 function awaitLines(source: Record<string, unknown>, resolver: AgentDisplayResolver, expanded: boolean): SelectedLines {
@@ -77,15 +79,16 @@ function awaitLines(source: Record<string, unknown>, resolver: AgentDisplayResol
   if (!expanded && stopped > 0) omitted.push(`${stopped} stopped agent${stopped === 1 ? "" : "s"} not shown`);
   const later = nonnegativeInteger(inventory.remaining);
   if (later > 0) omitted.push(`${later} inventory agent${later === 1 ? "" : "s"} on later pages`);
+  const headers: string[] = [];
   if (expanded) {
     const cursor = validatedAgentId(inventory.nextAfterAgentId);
     const total = nonnegativeInteger(inventory.total);
     const omittedCount = nonnegativeInteger(inventory.omitted);
     const remaining = nonnegativeInteger(inventory.remaining);
-    lines.unshift(`inventory total=${total} omitted=${omittedCount} remaining=${remaining}`);
-    if (cursor !== undefined) lines.unshift(`nextAfterAgentId=${cursor}`);
+    if (cursor !== undefined) headers.push(`nextAfterAgentId=${cursor}`);
+    headers.push(`inventory total=${total} omitted=${omittedCount} remaining=${remaining}`);
   }
-  return { lines, omitted };
+  return { headers, lines, omitted };
 }
 
 function resolveLine(source: Record<string, unknown>, resolver: AgentDisplayResolver): ResolvedLine[] {
@@ -113,17 +116,26 @@ function renderRow(item: ResolvedLine, expanded: boolean): string {
   return safeLine(`${base} · ${diagnostics.join(" ")}`);
 }
 
-function admitLines(lines: readonly string[], cap: number, omissions: readonly string[], fallbackTitle: string): string {
+function admitLines(
+  headers: readonly string[],
+  lines: readonly string[],
+  cap: number,
+  omissions: readonly string[],
+  fallbackTitle: string,
+  diagnosticsOutsideCap: boolean,
+): string {
+  const safeHeaders = headers.map(safeLine).filter((line) => line.length > 0);
   const safe = lines.map(safeLine).filter((line) => line.length > 0);
   const semanticOmissions = [...omissions];
   const needsOmissionRow = semanticOmissions.length > 0 || safe.length > cap;
-  let admitted = safe.slice(0, Math.max(0, cap - (needsOmissionRow ? 1 : 0)));
+  const rowAllowance = Math.max(0, cap - (!diagnosticsOutsideCap && needsOmissionRow ? 1 : 0));
+  let admitted = safe.slice(0, rowAllowance);
   let omissionLine = exactOmissionLine(semanticOmissions, safe.length - admitted.length);
-  while (byteLength([...admitted, ...(omissionLine ? [omissionLine] : [])]) > 8_192 && admitted.length > 0) {
+  while (byteLength([...safeHeaders, ...admitted, ...(omissionLine ? [omissionLine] : [])]) > 8_192 && admitted.length > 0) {
     admitted = admitted.slice(0, -1);
     omissionLine = exactOmissionLine(semanticOmissions, safe.length - admitted.length);
   }
-  const output = [...admitted, ...(omissionLine ? [safeLine(omissionLine)] : [])].join("\n");
+  const output = [...safeHeaders, ...admitted, ...(omissionLine ? [safeLine(omissionLine)] : [])].join("\n");
   if (new TextEncoder().encode(output).byteLength <= 8_192) return output || "Agent · unavailable";
   return `${fallbackTitle}\n${safe.length} additional rows omitted`;
 }

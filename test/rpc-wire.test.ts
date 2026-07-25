@@ -184,8 +184,8 @@ describe("classifyInboundRecord", () => {
     const delta = "x".repeat(9_000);
     const result = classifyInboundRecord({ type: "message_update", message: assistantMessage(), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
     expect(result.ok).toBeTrue();
-    if (result.ok && result.record.kind === "assistant-content") {
-      expect(new TextEncoder().encode(result.record.text).byteLength).toBeLessThanOrEqual(8_192);
+    if (result.ok && result.record.kind === "assistant-content" && result.record.phase === "delta") {
+      expect(new TextEncoder().encode(result.record.delta).byteLength).toBeLessThanOrEqual(8_192);
       expect(result.record.outputText).toBe(delta);
     }
   });
@@ -197,8 +197,8 @@ describe("classifyInboundRecord", () => {
       assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi", partial: assistantMessage() },
     });
     expect(result.ok).toBe(true);
-    if (result.ok && result.record.kind === "assistant-content") {
-      expect(String(result.record.text)).toBe("hi");
+    if (result.ok && result.record.kind === "assistant-content" && result.record.phase === "delta") {
+      expect(String(result.record.delta)).toBe("hi");
       expect(Number(result.record.contentIndex)).toBe(0);
     } else {
       throw new Error("expected assistant-content");
@@ -227,6 +227,9 @@ describe("classifyInboundRecord", () => {
       },
     });
     expect(poisonedTextEnd).toMatchObject({ ok: true, record: { kind: "assistant-content", phase: "end", text: "POISONED_TEXT_END_CONTENT" } });
+    if (poisonedTextEnd.ok && poisonedTextEnd.record.kind === "assistant-content" && poisonedTextEnd.record.phase === "end") {
+      expect("delta" in poisonedTextEnd.record).toBeFalse();
+    }
   });
 
   test("rejects malformed required text_delta events instead of treating them as other updates", () => {

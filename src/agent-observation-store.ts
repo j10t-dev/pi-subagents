@@ -63,6 +63,8 @@ import {
   MAX_TRANSCRIPT_STORE_ITEMS,
 } from "./constants.ts";
 
+export type ObservationReconciliationPurpose = "restoration" | "projection-repair";
+
 export interface AgentObservationMutationPort {
   registerSpawned(input: SpawnObservationInput): void;
   acceptRun(input: AcceptedRunObservationInput): void;
@@ -70,7 +72,7 @@ export interface AgentObservationMutationPort {
   publishCompletion(completion: AgentCompletion): void;
   registerSensitiveValues(values: ObservationSensitiveValues): void;
   acknowledgeDelivered(keys: readonly AgentRunKey[]): void;
-  reconcile(snapshot: ObservationReconciliationSnapshot): void;
+  reconcile(snapshot: ObservationReconciliationSnapshot, purpose: ObservationReconciliationPurpose): void;
   dispose(): void;
 }
 
@@ -316,16 +318,16 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     const agent = this.agents.get(agentId);
     if (agent === undefined || agent.latestRunId !== runId) return;
     const frozen = Object.freeze({ ...context });
-    this.replaceObservation(agent, { context: frozen });
-    this.commit([agent.ordinal], false);
+    if (this.replaceObservation(agent, { context: frozen })) this.commit([agent.ordinal], false);
   }
 
   failObservationProjection(agentId: AgentId): void {
     if (this.disposed) return;
     const agent = this.agents.get(agentId);
     if (agent === undefined) return;
-    this.replaceObservation(agent, { activity: PROJECTION_UNAVAILABLE, context: UNAVAILABLE_CONTEXT });
-    this.commit([agent.ordinal], false);
+    if (this.replaceObservation(agent, { activity: PROJECTION_UNAVAILABLE, context: UNAVAILABLE_CONTEXT })) {
+      this.commit([agent.ordinal], false);
+    }
     this.reportProjectionFailure();
   }
 
@@ -401,13 +403,14 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     this.retryFailedReconciliation();
   }
 
-  reconcile(snapshot: ObservationReconciliationSnapshot): void {
+  reconcile(snapshot: ObservationReconciliationSnapshot, purpose: ObservationReconciliationPurpose = "restoration"): void {
     if (this.disposed) return;
     this.registerSensitiveValuesWithoutCommit(snapshot.sensitiveValues);
     const authorities = new Map(snapshot.agents.map((agent) => [agent.agentId, agent]));
     const runs = new Map(snapshot.runs.map((run) => [run.agentId, run]));
     const completions = new Map(snapshot.completions.map((completion) => [completion.agentId, completion]));
     const changed: AgentOrdinal[] = [];
+    const changedTranscripts = new Set<RetainedTranscript>();
     const authoritativeIds = new Set(snapshot.spawnSequence);
     for (const [id, agent] of this.agents) {
       if (authoritativeIds.has(id)) continue;
@@ -426,6 +429,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       const runId = run?.runId ?? completion?.runId;
       const assignment = runId === undefined ? undefined : snapshot.acceptedAssignments.get(agentRunKey(id, runId));
       const ordinal = directAgentOrdinal(index + 1);
+      const requiresRestoration = purpose === "restoration" || agent === undefined;
       if (agent === undefined) {
         this.registerSpawnedWithoutCommit({ ...authority, ordinal, assignment: assignment ?? "Delegated task" });
         changed.push(ordinal);
@@ -455,9 +459,15 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       const before = agent.observation;
       agent.candidate = candidate;
       agent.lifecycleState = lifecycleState;
-      const transcript = this.createTranscript(id, lifecycleState === AgentState.Stopped ? "stopped" : "unavailable");
-      if (runId !== undefined) transcript.boundRunId = runId;
-      transcript.availability = lifecycleState === AgentState.Stopped ? "stopped" : "unavailable";
+      const restoredAvailability = lifecycleState === AgentState.Stopped ? "stopped" : "unavailable";
+      const transcript = this.createTranscript(id, restoredAvailability);
+      if (requiresRestoration) {
+        const transcriptChanged = transcript.boundRunId !== runId || transcript.availability !== restoredAvailability;
+        if (runId === undefined) delete transcript.boundRunId;
+        else transcript.boundRunId = runId;
+        transcript.availability = restoredAvailability;
+        if (transcriptChanged) changedTranscripts.add(transcript);
+      }
       if (runId === undefined) delete agent.latestRunId;
       else agent.latestRunId = runId;
       if (completion === undefined) {
@@ -468,9 +478,12 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
         agent.completionState = completion.state;
       }
       agent.pendingDelivery = pending;
-      this.replaceObservation(agent, { activity: RESTORATION_UNAVAILABLE, context: UNAVAILABLE_CONTEXT });
+      this.replaceObservation(agent, requiresRestoration
+        ? { activity: RESTORATION_UNAVAILABLE, context: UNAVAILABLE_CONTEXT }
+        : {});
       if (agent.observation !== before) changed.push(agent.ordinal);
     }
+    this.commitTranscripts(changedTranscripts);
     const healthChanged = this.health.kind !== "healthy";
     this.health = HEALTHY;
     this.retryReconciliation = false;
@@ -648,20 +661,22 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
         break;
       case "assistant-content": {
         if (!source.generationOpen) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
+        if (event.phase === "start") break;
         const key = assistantKey(runId, source.generation, event.contentIndex, event.contentKind);
         let entry = source.assistant.get(key);
-        const text = boundedTranscriptPrefix(event.text ?? "");
+        if (entry !== undefined && !entry.open) break;
+        const existingItem = entry === undefined ? undefined : assistantTranscriptItem(entry.item);
+        const text = event.phase === "delta"
+          ? boundedTranscriptPrefix(`${existingItem?.text ?? ""}${event.delta}`)
+          : boundedTranscriptPrefix(event.text);
+        const phase = event.phase === "end" ? "final" as const : "partial" as const;
         if (entry === undefined) {
           const item = Object.freeze({ sequence: this.nextTranscriptSequence(source), runId,
-            kind: event.contentKind === "text" ? "assistant" as const : "thinking" as const,
-            phase: event.phase === "end" ? "final" as const : "partial" as const, text });
-          entry = this.insertTranscript(source, item, event.phase !== "end", affected);
+            kind: event.contentKind === "text" ? "assistant" as const : "thinking" as const, phase, text });
+          entry = this.insertTranscript(source, item, event.phase === "delta", affected);
           if (source.disabledRunId !== runId) source.assistant.set(key, entry);
         } else {
-          const phase = event.phase === "end" ? "final" as const : "partial" as const;
-          if (entry.item.kind !== "assistant" && entry.item.kind !== "thinking") throw new Error("invalid_state: assistant correlation mismatch");
-          const replacement = Object.freeze({ ...entry.item, phase, text });
-          this.replaceTranscript(source, entry, replacement, event.phase !== "end", affected);
+          this.replaceTranscript(source, entry, Object.freeze({ ...assistantTranscriptItem(entry.item), phase, text }), event.phase === "delta", affected);
         }
         break;
       }
@@ -833,19 +848,21 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   }
 
   private projectActivity(agentId: AgentId, runId: RunId, event: RpcObservationEvent): void {
-    const agent = this.agents.get(agentId);
-    if (agent === undefined || agent.latestRunId !== runId) return;
-    let activity: AgentActivity | undefined;
-    if (event.kind === "assistant-content" && event.phase === "delta") {
-      const preview = event.text === undefined ? undefined : activityText(event.text);
-      activity = Object.freeze({ kind: event.contentKind === "thinking" ? "thinking" : "responding", ...(preview === undefined ? {} : { preview }) });
-    } else if (event.kind === "tool") {
-      activity = Object.freeze({ kind: "tool", tool: event.tool, phase: event.phase, ...(event.preview === undefined ? {} : { preview: activityText(event.preview) }) });
-    } else if (event.kind === "agent-settled") activity = IDLE;
-    else if (event.kind === "transport-unavailable") activity = TRANSPORT_UNAVAILABLE;
-    if (activity === undefined || agent.observation.activity === activity) return;
-    this.replaceObservation(agent, { activity });
-    this.commit([agent.ordinal], false);
+    try {
+      const agent = this.agents.get(agentId);
+      if (agent === undefined || agent.latestRunId !== runId) return;
+      let activity: AgentActivity | undefined;
+      if (event.kind === "assistant-content" && event.phase === "delta") {
+        activity = Object.freeze({ kind: event.contentKind === "thinking" ? "thinking" : "responding", preview: boundedActivityPreview(event.delta) });
+      } else if (event.kind === "tool") {
+        activity = Object.freeze({ kind: "tool", tool: event.tool, phase: event.phase,
+          ...(event.preview === undefined ? {} : { preview: boundedActivityPreview(event.preview) }) });
+      } else if (event.kind === "agent-settled") activity = IDLE;
+      else if (event.kind === "transport-unavailable") activity = TRANSPORT_UNAVAILABLE;
+      if (activity !== undefined && this.replaceObservation(agent, { activity })) this.commit([agent.ordinal], false);
+    } catch {
+      try { this.failObservationProjection(agentId); } catch { /* activity projection is total */ }
+    }
   }
 
   private rejectAttempt(attempt: PendingObservationAttempt): void {
@@ -887,7 +904,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     queueMicrotask(() => {
       this.reconciliationScheduled = false;
       if (this.disposed || generation !== this.generation) return;
-      try { this.reconcile(this.reconciliationSupplier!()); }
+      try { this.reconcile(this.reconciliationSupplier!(), "projection-repair"); }
       catch {
         this.health = Object.freeze({ kind: "degraded", codes: Object.freeze(["reconciliation-failed" as const]) });
         this.retryReconciliation = true;
@@ -947,18 +964,19 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       truncatedBefore: source.truncatedBefore, availability: "unavailable" });
   }
 
-  private replaceObservation(agent: RetainedAgent, overrides: Partial<Pick<AgentObservation, "taskLabel" | "activity" | "context">>): void {
+  private replaceObservation(agent: RetainedAgent, overrides: Partial<Pick<AgentObservation, "taskLabel" | "activity" | "context">>): boolean {
     const taskLabel = overrides.taskLabel ?? deriveTaskLabel(agent.candidate, this.labelContext());
     const activity = overrides.activity ?? agent.observation.activity;
     const context = overrides.context ?? agent.observation.context;
     const displayState = deriveDisplayState(agent.lifecycleState, agent.completionState);
     if (agent.observation.taskLabel === taskLabel && agent.observation.lifecycleState === agent.lifecycleState &&
         agent.observation.displayState === displayState && agent.observation.completionPendingDelivery === agent.pendingDelivery &&
-        agent.observation.activity === activity && agent.observation.context === context) return;
+        sameActivity(agent.observation.activity, activity) && sameContext(agent.observation.context, context)) return false;
     agent.observation = Object.freeze({
       ...agent.observation, taskLabel, lifecycleState: agent.lifecycleState, displayState, activity, context,
       completionPendingDelivery: agent.pendingDelivery, revision: this.nextRevision(),
     });
+    return true;
   }
 
   private rederiveAll(): AgentOrdinal[] {
@@ -1129,8 +1147,27 @@ function directPosition(ordinal: AgentOrdinal): number { return Number(String(or
 function compareOrdinals(left: AgentOrdinal, right: AgentOrdinal): number { return directPosition(left) - directPosition(right); }
 function isThenable(value: void): value is never { return typeof value === "object" && value !== null && "then" in value; }
 function sameTask(observation: AgentObservation, candidate: string, context: ReturnType<AgentObservationStore["labelContext"]>): boolean { return observation.taskLabel === deriveTaskLabel(candidate, context); }
+function sameContext(left: ContextObservation, right: ContextObservation): boolean {
+  return left.kind === right.kind && (left.kind === "unavailable" || (right.kind === "known" && left.percent === right.percent));
+}
+function sameActivity(left: AgentActivity, right: AgentActivity): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "idle") return true;
+  if (left.kind === "unavailable") return right.kind === "unavailable" && left.reason === right.reason;
+  if (left.kind === "responding" || left.kind === "thinking") return right.kind === left.kind && left.preview === right.preview;
+  return right.kind === "tool" && left.tool === right.tool && left.phase === right.phase && left.preview === right.preview;
+}
 
 const transcriptEncoder = new TextEncoder();
+function boundedActivityPreview(value: string): ReturnType<typeof activityText> {
+  let output = ""; let points = 0; let bytes = 0;
+  for (const point of value) {
+    const pointBytes = transcriptEncoder.encode(point).byteLength;
+    if (points === 160 || bytes + pointBytes > 512) break;
+    output += point; points++; bytes += pointBytes;
+  }
+  return activityText(output);
+}
 function boundedTranscriptPrefix(value: string): typeof value & import("./domain.ts").TranscriptText {
   const bytes = transcriptEncoder.encode(value);
   if (bytes.byteLength <= MAX_TRANSCRIPT_FIELD_BYTES) return value as typeof value & import("./domain.ts").TranscriptText;
@@ -1149,6 +1186,10 @@ function transcriptItemBytes(item: TranscriptItem): number {
 }
 function assistantKey(runId: RunId, generation: number, index: import("./domain.ts").RpcContentIndex, kind: "text" | "thinking"): string {
   return `${runId}\u0000${generation}\u0000${index}\u0000${kind}`;
+}
+function assistantTranscriptItem(item: TranscriptItem): Extract<TranscriptItem, { readonly kind: "assistant" | "thinking" }> {
+  if (item.kind !== "assistant" && item.kind !== "thinking") throw new Error("invalid_state: assistant correlation mismatch");
+  return item;
 }
 function oldestEntry(entries: readonly TranscriptEntry[], open: boolean): TranscriptEntry | undefined {
   return entries.filter((entry) => entry.open === open).sort((left, right) => left.order - right.order)[0];

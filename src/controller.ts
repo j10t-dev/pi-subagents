@@ -438,7 +438,7 @@ export class SubagentController {
 
       this.completions.restore(restored.map(completionInventory));
       await this.restoreObservationAuthority(restored);
-      this.observation.reconcile(this.observationReconciliationSnapshot());
+      this.observation.reconcile(this.observationReconciliationSnapshot(), "restoration");
       this.restorationApplied = true;
       this.stagedRestorePlan = undefined;
       this.restored = ![...this.restoredRecords.values()].some(
@@ -881,7 +881,7 @@ function totalObservationAdapter(
     if (!claimReconciliation()) return;
     queueMicrotask(() => {
       try {
-        port.reconcile(authority());
+        port.reconcile(authority(), "projection-repair");
         reconciliationFailed = false;
       } catch { reconciliationFailed = true; }
       finally { releaseReconciliation(); }

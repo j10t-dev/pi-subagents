@@ -273,6 +273,26 @@ function runScenario() {
       emitNext();
       break;
     }
+    case "long-observation": {
+      const longDelta = "🙂".repeat(2_048);
+      const longToolName = "读".repeat(80);
+      write({ type: "message_start", message: assistantMessage("") });
+      write({ type: "message_update", message: assistantMessage(""), assistantMessageEvent: {
+        type: "text_delta", contentIndex: 0, delta: longDelta, partial: assistantMessage(""),
+      } });
+      write({ type: "message_update", message: assistantMessage(""), assistantMessageEvent: {
+        type: "text_delta", contentIndex: 0, delta: "saturated", partial: assistantMessage(""),
+      } });
+      write({ type: "tool_execution_start", toolCallId: "long-call", toolName: longToolName, args: {} });
+      const release = setInterval(() => {
+        if (handshakeDir === undefined || !existsSync(join(handshakeDir, "release-long-observation"))) return;
+        clearInterval(release);
+        write({ type: "tool_execution_end", toolCallId: "long-call", toolName: longToolName, result: {}, isError: false });
+        write({ type: "message_end", message: assistantMessage(longDelta) });
+        write({ type: "agent_settled" });
+      }, 5);
+      break;
+    }
     case "normal":
       emitTurn("hello world", { deltas: ["hello", " world"] });
       break;

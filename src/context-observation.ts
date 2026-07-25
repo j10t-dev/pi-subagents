@@ -1,4 +1,4 @@
-import { contextPercent, type RunId } from "./domain.ts";
+import { contextPercent, type RunId, type Usage } from "./domain.ts";
 import type { ContextObservation, RpcObservationEvent } from "./agent-observation.ts";
 
 export interface SessionStatsResult {
@@ -95,10 +95,10 @@ export function createContextObservationService(
       if (disposed || currentRun === undefined) return;
       switch (event.kind) {
         case "assistant-end": {
-          const calculatedTokens = event.usage.input + event.usage.cacheRead + event.usage.cacheWrite;
+          const calculatedTokens = shortcutTokens(event.usage);
           shortcutPercent = (event.stopReason === "stop" || event.stopReason === "length") &&
-            Number.isFinite(calculatedTokens) && calculatedTokens > 0 && contextWindow !== undefined
-            ? calculatedTokens / contextWindow * 100
+            calculatedTokens !== undefined && contextWindow !== undefined
+            ? Math.min(100, Math.max(0, calculatedTokens / contextWindow * 100))
             : undefined;
           trailingContext = false;
           return;
@@ -145,6 +145,12 @@ export function createContextObservationService(
       dirty = false;
     },
   };
+}
+
+function shortcutTokens(usage: Usage): number | undefined {
+  if (Number.isFinite(usage.totalTokens) && usage.totalTokens > 0) return usage.totalTokens;
+  const fallback = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  return Number.isFinite(fallback) && fallback > 0 ? fallback : undefined;
 }
 
 function validUsage(result: SessionStatsResult | undefined): { readonly contextWindow: number; readonly percent: number } | undefined {

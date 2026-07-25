@@ -400,10 +400,14 @@ export class RpcRunClient {
         this.routeOutputMutation(() => this.routeMessageEvent({ kind: "message_start", message: record.message }));
         return;
       case "assistant-content":
-        this.safeObservation(() => this.options.observationSink?.record({ kind: "assistant-content", contentIndex: record.contentIndex,
-          contentKind: record.contentKind, phase: record.phase, ...(record.text === undefined ? {} : { text: record.text }) }));
-        if (record.contentKind === "text" && record.phase === "delta" && record.outputText !== undefined) {
-          this.routeOutputMutation(() => this.routeTextDelta(record.contentIndex, record.outputText!));
+        this.safeObservation(() => this.options.observationSink?.record(record.phase === "start"
+          ? { kind: "assistant-content", contentIndex: record.contentIndex, contentKind: record.contentKind, phase: record.phase }
+          : record.phase === "delta"
+            ? { kind: "assistant-content", contentIndex: record.contentIndex, contentKind: record.contentKind, phase: record.phase, delta: record.delta }
+            : { kind: "assistant-content", contentIndex: record.contentIndex, contentKind: record.contentKind, phase: record.phase, text: record.text }));
+        if (record.contentKind === "text" && record.phase === "delta") {
+          const outputText = record.outputText;
+          if (outputText !== undefined) this.routeOutputMutation(() => this.routeTextDelta(record.contentIndex, outputText));
         }
         return;
       case "message_update_other":

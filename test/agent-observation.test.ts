@@ -35,6 +35,29 @@ describe("agent observation projection", () => {
       .toThrow("invalid_input: invalid model label");
   });
 
+  test.each([
+    ["opening backtick fence with arbitrary info", "```ts title=\"review\"\nReview the adapter\n```"],
+    ["opening tilde fence with arbitrary info", "  ~~~ typescript title='review'  \n\n  Review the adapter  \n~~~~"],
+    ["bare closing fences", "~~~\n```\nReview the adapter\n~~~~"],
+  ] as const)("skips standalone Markdown fence lines for %s", (_name, assignment) => {
+    expect(String(deriveTaskLabel(assignment, { knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set() })))
+      .toBe("Review the adapter");
+  });
+
+  test("does not classify ordinary prose containing backticks as a fence", () => {
+    expect(String(deriveTaskLabel("Review `inline` code and the ``` token", {
+      knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(),
+    }))).toBe("Review inline code and the token");
+  });
+
+  test("bounds the first descriptive line after standalone fences", () => {
+    const label = deriveTaskLabel(`\n\`\`\`\n${"界".repeat(1_000)}\n\`\`\``, {
+      knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(),
+    });
+    expect([...label]).toHaveLength(80);
+    expect(Buffer.byteLength(label, "utf8")).toBeLessThanOrEqual(512);
+  });
+
   test("redacts sensitive identities and path-like tokens from task labels", () => {
     const label = deriveTaskLabel("## Review /tmp/a.ts for agent-a. More detail", {
       knownAgentIds: new Set([agentId("agent-a")]),

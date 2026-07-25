@@ -74,19 +74,66 @@ test("collapsed await merges completion, hides stopped history, and counts later
   expect(text).not.toContain("deadbeef");
 });
 
-test("expanded await includes bounded diagnostics but never child output", () => {
-  const entries = Array.from({ length: 120 }, (_, index) => row(`agent-${index}`, `A${index + 1}`, "running"));
+test("expanded await admits 100 agent rows in addition to cursor and inventory headers", () => {
+  const entries = Array.from({ length: 100 }, (_, index) => row(`agent-${index}`, `A${index + 1}`, "running"));
   const text = renderLifecycleToolResult("await_agent", {
-    completions: [{ agentId: "agent-0", runId: "deadbeef", state: "completed", output: { text: "MODEL_SECRET" } }],
-    inventory: { total: 120, omitted: 0, remaining: 20, nextAfterAgentId: "agent-99", agents: entries.map(([id]) => ({ agentId: id, state: "running" })) },
+    completions: [], inventory: { total: 100, omitted: 0, remaining: 0, nextAfterAgentId: "agent-99",
+      agents: entries.map(([id]) => ({ agentId: id, state: "running" })) },
     remainingCompletions: 0, timedOut: false,
   }, resolver(entries), { expanded: true });
-  expect(text).toContain("nextAfterAgentId=");
-  expect(text).toContain("agentId=");
-  expect(text).toContain("23 additional rows omitted");
-  expect(text.split("\n")).toHaveLength(100);
-  expect(text).not.toContain("MODEL_SECRET");
+  expect(text.split("\n")).toHaveLength(102);
+  expect(text.split("\n")[0]).toBe("nextAfterAgentId=agent-99");
+  expect(text.split("\n")[1]).toBe("inventory total=100 omitted=0 remaining=0");
+  expect(text).not.toContain("additional rows omitted");
   expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(8_192);
+});
+
+test("expanded await reports exact omitted agent rows without charging diagnostic headers to the row cap", () => {
+  const entries = Array.from({ length: 121 }, (_, index) => row(`agent-${index}`, `A${index + 1}`, "running"));
+  const text = renderLifecycleToolResult("await_agent", {
+    completions: [], inventory: { total: 121, omitted: 0, remaining: 0, nextAfterAgentId: "agent-120",
+      agents: entries.map(([id]) => ({ agentId: id, state: "running" })) },
+    remainingCompletions: 0, timedOut: false,
+  }, resolver(entries), { expanded: true });
+  expect(text.split("\n").slice(0, 2)).toEqual([
+    "nextAfterAgentId=agent-120",
+    "inventory total=121 omitted=0 remaining=0",
+  ]);
+  expect(text.split("\n").at(-1)).toBe("21 additional rows omitted");
+  expect(text.split("\n").filter((line) => line.startsWith("A"))).toHaveLength(100);
+});
+
+test("expanded await preserves diagnostic headers and exact agent omissions under byte pressure", () => {
+  const entries = Array.from({ length: 100 }, (_, index) => row(`agent-${index}`, `A${index + 1}`, "running", `row-${index}-${"£😀".repeat(600)}`));
+  const text = renderLifecycleToolResult("await_agent", {
+    completions: [], inventory: { total: 100, omitted: 0, remaining: 0, nextAfterAgentId: "agent-99",
+      agents: entries.map(([id]) => ({ agentId: id, state: "running" })) },
+    remainingCompletions: 0, timedOut: false,
+  }, resolver(entries), { expanded: true });
+  const lines = text.split("\n");
+  expect(lines.slice(0, 2)).toEqual([
+    "nextAfterAgentId=agent-99",
+    "inventory total=100 omitted=0 remaining=0",
+  ]);
+  const shown = lines.filter((line) => line.startsWith("A")).length;
+  expect(lines.at(-1)).toBe(`${100 - shown} additional rows omitted`);
+  expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(8_192);
+});
+
+test("mixed stop outcomes preserve input order and duplicates with one safe row per outcome", () => {
+  const rows = resolver([row("agent-a", "A1", "cancelled"), row("agent-b", "A2", "failed")]);
+  const text = renderLifecycleToolResult("stop_agent", { outcomes: [
+    { agentId: "agent-b", state: "failed" },
+    { agentId: "missing", state: "failed" },
+    { agentId: "agent-a", state: "cancelled" },
+    { agentId: "agent-b", state: "failed" },
+  ] }, rows, { expanded: false });
+  expect(text.split("\n")).toEqual([
+    "A2 · luna:h · task · failed",
+    "Agent · unavailable",
+    "A1 · luna:h · task · cancelled",
+    "A2 · luna:h · task · failed",
+  ]);
 });
 
 test("collapsed rendering reserves a row and reports the exact cap omission count", () => {

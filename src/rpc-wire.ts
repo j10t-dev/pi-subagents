@@ -145,7 +145,9 @@ export type RpcInboundRecord =
   | { kind: "response"; id: RpcRequestId; command: RecognizedRpcCommand; success: true; data?: unknown }
   | { kind: "response"; id: RpcRequestId; command: RecognizedRpcCommand; success: false; error: string }
   | { kind: "assistant-start"; message: WireAssistantMessage }
-  | { kind: "assistant-content"; contentIndex: ReturnType<typeof rpcContentIndex>; contentKind: "text" | "thinking"; phase: "start" | "delta" | "end"; text?: ReturnType<typeof transcriptText>; outputText?: string }
+  | { kind: "assistant-content"; contentIndex: ReturnType<typeof rpcContentIndex>; contentKind: "text" | "thinking"; phase: "start" }
+  | { kind: "assistant-content"; contentIndex: ReturnType<typeof rpcContentIndex>; contentKind: "text" | "thinking"; phase: "delta"; delta: ReturnType<typeof transcriptText>; outputText?: string }
+  | { kind: "assistant-content"; contentIndex: ReturnType<typeof rpcContentIndex>; contentKind: "text" | "thinking"; phase: "end"; text: ReturnType<typeof transcriptText> }
   | { kind: "message_update_other" }
   | { kind: "assistant-end"; message: WireAssistantMessage; finalBlocks: readonly FinalAssistantBlock[]; usage: WireAssistantMessage["usage"]; stopReason: ReturnType<typeof rpcStopReason> }
   | { kind: "tool"; toolCallId: ReturnType<typeof rpcToolCallId>; tool: ReturnType<typeof toolDisplayName>; phase: "running" | "completed" | "failed" }
@@ -236,10 +238,16 @@ export function classifyInboundRecord(value: unknown): RpcWireResult {
         try {
           const contentKind = content.type.startsWith("text_") ? "text" as const : "thinking" as const;
           const phase = content.type.endsWith("_start") ? "start" as const : content.type.endsWith("_delta") ? "delta" as const : "end" as const;
-          const rawText = "delta" in content ? content.delta : "content" in content ? content.content : undefined;
-          return { ok: true, record: { kind: "assistant-content", contentIndex: rpcContentIndex(content.contentIndex), contentKind, phase,
-            ...(rawText === undefined ? {} : { text: boundedObservationText(rawText) }),
-            ...(content.type === "text_delta" ? { outputText: content.delta } : {}) } };
+          const contentIndex = rpcContentIndex(content.contentIndex);
+          if (phase === "start") return { ok: true, record: { kind: "assistant-content", contentIndex, contentKind, phase } };
+          if (phase === "delta" && "delta" in content) return { ok: true, record: {
+            kind: "assistant-content", contentIndex, contentKind, phase, delta: boundedObservationText(content.delta),
+            ...(content.type === "text_delta" ? { outputText: content.delta } : {}),
+          } };
+          if (phase === "end" && "content" in content) return { ok: true, record: {
+            kind: "assistant-content", contentIndex, contentKind, phase, text: boundedObservationText(content.content),
+          } };
+          throw new Error("invalid assistant content event");
         } catch { return { ok: false, reason: `malformed required ${eventType} event` }; }
       }
       return { ok: true, record: { kind: "message_update_other" } };
