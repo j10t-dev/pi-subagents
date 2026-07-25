@@ -53,6 +53,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
   controller: new Set([
     "agent-observation-store.test.ts",
     "agent-widget-source.test.ts",
+    "agent-widget-extension.test.ts",
     "context-safety.test.ts",
     "controller-scenarios.test.ts",
     "controller.test.ts",
