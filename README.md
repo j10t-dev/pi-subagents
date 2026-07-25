@@ -73,33 +73,6 @@ Human-facing agent ordinals derive from accepted unique `Spawned` positions in o
 
 Parent shutdown contains every active process group before returning. There is no detached execution: quit, reload, new-session, resume, and fork shutdown paths own cancellation. Version 1 does not persist collection attempts or inspect parent tool-result entries. Restoration re-exposes each owned agent’s latest persisted completion to the next `await_agent` and may therefore return a completion that was collected before reload or resume. No automatic message is sent on restoration; `agents: … result(s) ready` in the status bar is the passive discovery surface. The stable `runId` identifies duplicate visibility of the same durable outcome. Lifecycle ownership follows persisted parent custom entries and therefore survives compaction; branch navigation is rejected while active children would make ownership ambiguous. Reload closes the old controller before restoring its replacement.
 
-## Verification
+## Contributor documentation
 
-```sh
-bun install --frozen-lockfile
-bun test test/extension.test.ts
-bun test test/pi-integration.test.ts
-bun test test/controller-scenarios.test.ts
-bun test test/context-safety.test.ts
-bun tsc --noEmit
-bun run check:cgroup
-bun run test
-bun run test:process
-bun run test:integration
-```
-
-## Live-model smoke
-
-The opt-in live smoke submits this natural-language prompt:
-
-```text
-Launch a gpt-5.6-luna subagent with web_fetch to retrieve London's current temperature.
-```
-
-Run it separately from the default and integration suites:
-
-```sh
-bun run test:live-model
-```
-
-The script sets `PI_SUBAGENTS_LIVE_SMOKE=1`. It requires the current Pi registry to contain `openai-codex/gpt-5.6-luna`, usable `openai-codex` provider credentials, and an active `web_fetch` tool. A missing opt-in, model, or credential is reported as an explicit pre-start skip, not a product pass. Active `web_fetch` is required by the launched allowlist and verified through the child transcript; its absence fails the smoke. The explicit child `tools: ["web_fetch"]` allowlist is why this smoke still asserts no nested Pi command; it is not a universal restriction on children. The smoke covers direct parent `spawn_agent`, child `web_fetch`, parent `await_agent`, and successful completion. `PI_SUBAGENT_CHILD=1` remains compatibility input for legacy children and suppresses lifecycle tools. Malformed metadata fails closed and emits a warning. Environment metadata is forgeable recursion policy, not security containment. Broader live-model behavioural evaluation is out of scope.
+Architecture, lifecycle invariants and the canonical verification matrix live in [`docs/`](docs/README.md).
