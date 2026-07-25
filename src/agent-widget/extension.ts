@@ -9,6 +9,10 @@ import { Key, matchesKey, type EditorComponent, type TUI } from "@earendil-works
 
 import type { SubagentObservationPort } from "../agent-observation.ts";
 import { acquireStatusLease, type StatusLease } from "../ambient-status-lease.ts";
+import { createCoalescer, type Coalescer } from "../coalescer.ts";
+import { parseExtensionLaunchContext, type ExtensionLaunchContext } from "../delegation-policy.ts";
+import { agentId, milliseconds, type AbsolutePath } from "../domain.ts";
+import { createObservationRelay, type ObservationRelay } from "../observation-relay.ts";
 import { AgentWidgetComponent } from "./component.ts";
 import { clearSelection, emptyModel, replaceRows, type AgentWidgetModel } from "./model.ts";
 import type { AgentWidgetView } from "./render.ts";
@@ -24,7 +28,7 @@ import {
 } from "../widget-diagnostics.ts";
 
 const WIDGET_KEY = "pi-subagents-agents";
-const RENDER_COALESCE_MS = 50;
+const RENDER_COALESCE_WINDOW_MS = milliseconds(50);
 
 type WidgetSource = ReturnType<typeof createAgentWidgetSource>;
 type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
@@ -41,6 +45,10 @@ function shortcutTarget(editor: EditorComponent): ShortcutEditor | undefined {
 export interface AgentWidgetDeps {
   readonly createSource?: (port: SubagentObservationPort, onDiagnostic: (code: string) => void) => WidgetSource;
   readonly subscribePort?: typeof onObservationPort;
+  readonly createRelay?: typeof createObservationRelay;
+  readonly createCoalescer?: typeof createCoalescer;
+  readonly launchContext?: ExtensionLaunchContext;
+  readonly agentDir?: AbsolutePath;
   /** Gate-only observation seam. Production supplies no trace dependency. */
   readonly trace?: (event: WidgetTraceEvent) => void;
 }
@@ -100,7 +108,107 @@ function start(
   deps: AgentWidgetDeps,
   reported: Set<WidgetDiagnosticCodeValue>,
 ): WidgetCleanup {
+  const launchContext = deps.launchContext ?? parseExtensionLaunchContext(process.env);
+  if (launchContext.kind !== "root") return startPublisher(ctx, deps, reported);
   if (ctx.mode !== "tui") return () => true;
+  return startAggregator(ctx, deps, reported);
+}
+
+function startPublisher(
+  ctx: ExtensionContext,
+  deps: AgentWidgetDeps,
+  reported: Set<WidgetDiagnosticCodeValue>,
+): WidgetCleanup {
+  const report = (code: WidgetDiagnosticCodeValue): void => { notifyOnce(ctx, code, reported); };
+  const relay: ObservationRelay = (deps.createRelay ?? createObservationRelay)({
+    agentDir: deps.agentDir ?? absolutePath(getAgentDir()),
+    sessionId: agentId(ctx.sessionManager.getSessionId()),
+    diagnostic: report,
+  });
+  const coalescer: Coalescer = (deps.createCoalescer ?? createCoalescer)(() => relay.flush());
+  let stopping = false;
+  let relayDisposed = false;
+  let coalescerDisposed = false;
+  let unsubscribeRegistry: (() => void) | undefined;
+  let unsubscribePort: (() => void) | undefined;
+
+  const releasePort = (): boolean => {
+    const pending = unsubscribePort;
+    if (pending === undefined) return true;
+    try {
+      pending();
+      if (unsubscribePort === pending) unsubscribePort = undefined;
+      return true;
+    } catch {
+      report(WidgetDiagnosticCode.SourceFailed);
+      return false;
+    }
+  };
+  const releaseRegistry = (): boolean => {
+    const pending = unsubscribeRegistry;
+    if (pending === undefined) return true;
+    try {
+      pending();
+      if (unsubscribeRegistry === pending) unsubscribeRegistry = undefined;
+      return true;
+    } catch {
+      report(WidgetDiagnosticCode.RegistryFailed);
+      return false;
+    }
+  };
+  const requestFlush = (): void => {
+    relay.markDirty();
+    coalescer.request();
+  };
+  const onPortChange = (): void => {
+    if (!stopping) requestFlush();
+  };
+  const onRegistryPort = (port: SubagentObservationPort | undefined): void => {
+    if (stopping) return;
+    const released = releasePort();
+    relay.setPort(port);
+    if (port === undefined) return;
+    if (released) {
+      try { unsubscribePort = port.subscribe(onPortChange); }
+      catch { report(WidgetDiagnosticCode.SourceFailed); }
+    }
+    requestFlush();
+  };
+
+  // This is intentionally the first publisher work: even a portless descendant owns its empty slot.
+  requestFlush();
+  try {
+    unsubscribeRegistry = (deps.subscribePort ?? onObservationPort)(onRegistryPort);
+  } catch {
+    report(WidgetDiagnosticCode.RegistryFailed);
+  }
+
+  return (): boolean => {
+    if (!stopping) stopping = true;
+    if (!coalescerDisposed) {
+      try { coalescer.dispose(); coalescerDisposed = true; }
+      catch { report(WidgetDiagnosticCode.LifecycleFailed); }
+    }
+    if (!relayDisposed) {
+      try { relay.dispose(); relayDisposed = true; }
+      catch { report(WidgetDiagnosticCode.LifecycleFailed); }
+    }
+    const registryReleased = releaseRegistry();
+    const portReleased = releasePort();
+    return coalescerDisposed
+      && relayDisposed
+      && registryReleased
+      && portReleased
+      && unsubscribeRegistry === undefined
+      && unsubscribePort === undefined;
+  };
+}
+
+function startAggregator(
+  ctx: ExtensionContext,
+  deps: AgentWidgetDeps,
+  reported: Set<WidgetDiagnosticCodeValue>,
+): WidgetCleanup {
 
   let widget: AgentWidgetComponent | undefined;
   let editorRef: EditorComponent | undefined;
@@ -115,7 +223,7 @@ function start(
   let currentSource: WidgetSource | undefined;
   let unsubscribeRows: (() => void) | undefined;
   let unsubscribePort: (() => void) | undefined;
-  let renderTimer: ReturnType<typeof setTimeout> | undefined;
+  let renderCoalescer: Coalescer | undefined;
   let lease: StatusLease | undefined;
 
   const report = (code: WidgetDiagnosticCodeValue): void => { notifyOnce(ctx, code, reported); };
@@ -142,15 +250,20 @@ function start(
     }
   };
   const cancelScheduledRender = (): void => {
-    if (renderTimer !== undefined) clearTimeout(renderTimer);
-    renderTimer = undefined;
+    renderCoalescer?.dispose();
+    renderCoalescer = undefined;
   };
   const scheduleRender = (forGeneration: number): void => {
-    if (renderTimer !== undefined) return;
-    renderTimer = setTimeout(() => {
-      renderTimer = undefined;
+    if (renderCoalescer !== undefined) {
+      renderCoalescer.request();
+      return;
+    }
+    const coalescer = (deps.createCoalescer ?? createCoalescer)(() => {
+      if (renderCoalescer === coalescer) renderCoalescer = undefined;
       if (forGeneration === generation) guard(() => widget?.invalidate());
-    }, RENDER_COALESCE_MS);
+    }, undefined, RENDER_COALESCE_WINDOW_MS);
+    renderCoalescer = coalescer;
+    coalescer.request();
   };
 
   const editorLive = (): boolean => {

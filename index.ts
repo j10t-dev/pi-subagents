@@ -83,19 +83,29 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       );
       return;
     }
+    let publication: { readonly owner: ExtensionController; readonly token: ObservationPublication } | undefined;
+
+    // This synchronous phase must precede widget startup so a replacing session cannot leave an
+    // old projection visible while the next publisher or aggregator binds its context.
+    pi.on("session_start", () => {
+      setAmbientStatus(undefined);
+      clearPublication();
+    });
+
+    let widgetStartupReported = false;
+    const widgetStartup = installWidget();
     if (!options.registration.enabled) {
       const diagnostic = options.registration.diagnostic;
       if (diagnostic !== undefined) {
         options.diagnostic(diagnostic);
         pi.on("session_start", (_event, context) => { context.ui.notify(diagnostic, "warning"); });
       }
-      return;
+      return widgetStartup;
     }
 
     let current: ExtensionController | undefined;
     let activeContext: ExtensionContext | undefined;
     let closing: Promise<void> | undefined;
-    let publication: { readonly owner: ExtensionController; readonly token: ObservationPublication } | undefined;
     let lifecycleTail = Promise.resolve();
 
     // The status key now has exactly one writer. Everything that used to call setStatus directly
@@ -119,14 +129,8 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       registerSubagentTool(pi, "stop_agent", TOOL_SPECS.stop_agent, resolveCurrent, refreshAfterTool);
     };
 
-    // Replacement is deliberately split across two handlers. This synchronous first phase clears
-    // the old projection before the widget's handler tears down and rebinds its context. The
-    // continuation is registered only after widget startup, so replacement publication cannot
+    // The continuation is registered only after widget startup, so replacement publication cannot
     // reach the old context and the new widget can acquire its status lease before status refresh.
-    pi.on("session_start", () => {
-      setAmbientStatus(undefined);
-      clearPublication();
-    });
     pi.on("session_before_tree", () => ({ cancel: current?.beforeTree?.() === false }));
     pi.on("session_tree", (_event, context) => serialiseLifecycle(async () => {
       if (current === undefined) return;
@@ -151,8 +155,6 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       unsubscribeStatus?.(); unsubscribeStatus = undefined;
     }));
 
-    let widgetStartupReported = false;
-    const widgetStartup = installWidget();
     if (widgetStartup !== undefined) {
       return widgetStartup.then(finishInstallation);
     }

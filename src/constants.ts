@@ -37,6 +37,11 @@ export const ASSIGNMENT_IDENTITY_TIMEOUT_MS = milliseconds(5_000);
 /** Interval between post-barrier assignment identity snapshots. */
 export const ASSIGNMENT_IDENTITY_POLL_MS = milliseconds(25);
 
+export const RELAY_FLUSH_WINDOW_MS = milliseconds(120);
+export const INDEX_REFRESH_WINDOW_MS = milliseconds(120);
+export const WATCH_FALLBACK_INTERVAL_MS = milliseconds(2_000);
+export const MAX_WATCH_RETRY_INTERVAL_MS = milliseconds(30_000);
+
 /** Maximum UTF-8 bytes retained in a single persisted completion output. */
 export const MAX_COMPLETION_OUTPUT_BYTES = utf8Bytes(50_000);
 

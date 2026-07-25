@@ -316,7 +316,7 @@ describe("Pi subagents extension", () => {
       createPiSubagentsExtension({ platform: "linux", registration,
         createController: () => { throw new Error("must not construct"); }, diagnostic: () => {} })(extensionApiForTest(h.api));
       expect(h.tools).toEqual([]);
-      expect(h.handlers.size).toBe(0);
+      expect([...h.handlers.keys()]).toEqual(["session_start"]);
     }
   });
 
@@ -360,7 +360,7 @@ describe("Pi subagents extension", () => {
       createController: () => { throw new Error("must not construct"); }, diagnostic: () => {},
     })(extensionApiForTest(h.api));
     expect(h.tools.map((tool) => tool.name)).toEqual(["other_extension"]);
-    expect(h.handlers.size).toBe(0);
+    expect([...h.handlers.keys()]).toEqual(["session_start"]);
   });
 
   test("unsupported platform emits one bounded diagnostic and starts no resources", () => {

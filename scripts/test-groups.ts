@@ -20,6 +20,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "async-primitives.test.ts",
     "b0-gates.test.ts",
     "child-selection.test.ts",
+    "coalescer.test.ts",
     "completion-service.test.ts",
     "domain.test.ts",
     "durable-fs.test.ts",

@@ -1,16 +1,22 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { EditorComponent, TUI } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { createPiSubagentsExtension, type ExtensionController } from "../index.ts";
-import createAgentWidgetExtension from "../src/agent-widget/extension.ts";
-import type { AgentDisplayState, AgentWidgetSnapshot, AgentWidgetSource, SubagentObservationPort } from "../src/agent-observation.ts";
+import createAgentWidgetExtension, { type AgentWidgetDeps } from "../src/agent-widget/extension.ts";
+import type { AgentDisplayState, AgentObservation, AgentWidgetSnapshot, AgentWidgetSource, ObservationChange, SubagentObservationPort } from "../src/agent-observation.ts";
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
 import { onObservationPort, publishObservationPort } from "../src/observation-registry.ts";
+import { observationSnapshotPath, readKnownChildSnapshots } from "../src/observation-snapshot-path.ts";
+import { RELAY_FLUSH_WINDOW_MS } from "../src/constants.ts";
+import { parseExtensionLaunchContext } from "../src/delegation-policy.ts";
 import { setAmbientStatus, onAmbientStatus } from "../src/ambient-status-lease.ts";
 import {
   AgentState, agentCount, agentDepth, agentId, agentObservationRevision, agentOrdinal, agentWidgetRevision,
-  directAgentOrdinal, modelSpec,
+  contextPercent, directAgentOrdinal, modelSpec, observationRevision,
   type ContextLabel, type ModelLabel, type TaskLabel,
 } from "../src/domain.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
@@ -84,6 +90,7 @@ function harness(options: {
   registryUnsubscribeFailures?: number;
   notifyThrows?: boolean;
   createSourceThrows?: boolean;
+  createCoalescer?: NonNullable<AgentWidgetDeps["createCoalescer"]>;
   editorThrowsOn?: "getEditorComponent" | "getText" | "inherited" | "setFocus" | "requestRender";
   trace?: (event: string) => void;
 } = {}) {
@@ -157,6 +164,7 @@ function harness(options: {
     return (queue.shift() ?? fakeSource()).source;
   };
   createAgentWidgetExtension(pi as never, {
+    launchContext: parseExtensionLaunchContext({}),
     createSource,
     subscribePort: (listener) => {
       const unsubscribe = onObservationPort(listener);
@@ -169,6 +177,7 @@ function harness(options: {
         unsubscribe();
       };
     },
+    ...(options.createCoalescer === undefined ? {} : { createCoalescer: options.createCoalescer }),
     ...(options.trace === undefined ? {} : { trace: options.trace }),
   });
   handlers.get("session_start")?.({}, ctx);
@@ -202,7 +211,182 @@ function ambientRecorder(): { text: string | undefined } {
   cleanups.push(onAmbientStatus((text) => { state.text = text; }));
   return state;
 }
+
+function publisherPort(label: string) {
+  const listeners = new Set<(change: ObservationChange) => void>();
+  const id = agentId("publisher-child");
+  const observation: AgentObservation = {
+    agentId: id, ordinal: agentOrdinal("A1"), taskLabel: label as TaskLabel, modelLabel: "luna:h" as ModelLabel,
+    context: { kind: "known", percent: contextPercent(42) }, lifecycleState: AgentState.Running,
+    displayState: AgentState.Running as AgentDisplayState, activity: { kind: "idle" }, completionPendingDelivery: false,
+    revision: agentObservationRevision(1),
+  };
+  const port: SubagentObservationPort = {
+    observation: () => observation,
+    directSnapshot: () => ({
+      kind: "snapshot", revision: agentObservationRevision(1), health: { kind: "healthy" },
+      total: agentCount(1), omitted: agentCount(0), omittedActive: agentCount(0),
+      entries: [{
+        agentId: id,
+        observation,
+        row: {
+          ordinal: agentOrdinal("A1"), depth: agentDepth(0), model: "luna:h" as ModelLabel,
+          context: "42%" as ContextLabel, taskLabel: label as TaskLabel, state: AgentState.Running as AgentDisplayState,
+        },
+      }],
+    }),
+    transcriptSource: () => undefined,
+    subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+  };
+  return {
+    port,
+    emit: () => {
+      const change: ObservationChange = {
+        revision: agentObservationRevision(2), health: { kind: "healthy" }, changed: [], rescanRequired: true,
+      };
+      for (const listener of listeners) listener(change);
+    },
+  };
+}
+
+function publisherFor(
+  launchContext: ReturnType<typeof parseExtensionLaunchContext>,
+  mode: string,
+  options: { readonly replay?: SubagentObservationPort; readonly registryUnsubscribeFailures?: number } = {},
+) {
+  const agentDir = testAbsolutePath(mkdtempSync(join(tmpdir(), "publisher-widget-")));
+  const sessionId = agentId("publisher-session");
+  const handlers = new Map<string, Handler>();
+  const uiCalls: string[] = [];
+  let registryListener: ((port: SubagentObservationPort | undefined) => void) | undefined;
+  let registryUnsubscribeFailures = options.registryUnsubscribeFailures ?? 0;
+  let registryUnsubscribeAttempts = 0;
+  const pi = { on: (name: string, handler: Handler) => { handlers.set(name, handler); } };
+  const context = {
+    mode,
+    sessionManager: { getSessionId: () => String(sessionId) },
+    ui: {
+      setWidget: () => { uiCalls.push("widget"); }, setEditorComponent: () => { uiCalls.push("editor"); },
+      getEditorComponent: () => { uiCalls.push("editor-read"); return undefined; },
+      notify: () => { uiCalls.push("notify"); }, setStatus: () => { uiCalls.push("status"); },
+    },
+  };
+  const deps: AgentWidgetDeps = {
+    launchContext,
+    agentDir,
+    subscribePort: (listener) => {
+      registryListener = listener;
+      listener(options.replay);
+      return () => {
+        registryUnsubscribeAttempts += 1;
+        if (registryUnsubscribeFailures > 0) { registryUnsubscribeFailures -= 1; throw new Error("registry unsubscribe"); }
+      };
+    },
+  };
+  createAgentWidgetExtension(pi as never, deps);
+  handlers.get("session_start")?.({}, context);
+  return {
+    uiCalls,
+    published: () => readKnownChildSnapshots(agentDir, [sessionId]).snapshots.get(sessionId),
+    bytes: () => readFileSync(observationSnapshotPath(agentDir, sessionId), "utf8"),
+    arrive: (port: SubagentObservationPort | undefined) => { registryListener?.(port); },
+    shutdown: () => { handlers.get("session_shutdown")?.({}, context); },
+    registryUnsubscribeAttempts: () => registryUnsubscribeAttempts,
+    dispose: () => { handlers.get("session_shutdown")?.({}, context); rmSync(agentDir, { recursive: true, force: true }); },
+  };
+}
 afterEach(() => { while (cleanups.length > 0) cleanups.pop()!(); setAmbientStatus(undefined); });
+
+describe("publisher roles", () => {
+  test("every managed descendant publishes while a non-TUI root remains inert", async () => {
+    const descendants = [
+      parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1" }),
+      parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1" }),
+      parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "broken" }),
+    ];
+    const publishers = descendants.map((context) => publisherFor(context, "rpc"));
+    const root = publisherFor(parseExtensionLaunchContext({}), "rpc");
+    try {
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      for (const publisher of publishers) expect(publisher.published()).toMatchObject({ agents: [], total: 0 });
+      expect(root.published()).toBeUndefined();
+      expect(root.uiCalls).toEqual([]);
+    } finally {
+      for (const publisher of publishers) publisher.dispose();
+      root.dispose();
+    }
+  });
+
+  test("defers relay writes, upgrades arrivals, coalesces changes, and preserves withdrawn slots", async () => {
+    const context = parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1", PI_SUBAGENT_MAX_DEPTH: "2", PI_SUBAGENT_MAX_CONCURRENT_RUNS: "1" });
+    const port = publisherPort("updated task");
+    const h = publisherFor(context, "rpc");
+    try {
+      expect(h.published()).toBeUndefined();
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(h.published()).toMatchObject({ revision: 1, agents: [] });
+      expect(h.uiCalls).toEqual([]);
+
+      h.arrive(port.port);
+      expect(h.uiCalls).toEqual([]);
+      expect(h.published()).toMatchObject({ revision: 1, agents: [] });
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(h.published()).toMatchObject({ revision: 2, agents: [{ taskLabel: "updated task" }] });
+
+      port.emit(); port.emit(); port.emit();
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(h.published()?.revision).toBe(observationRevision(3));
+      const prior = h.bytes();
+      h.arrive(undefined);
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(h.bytes()).toBe(prior);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  test("replay shares the initial publication window and shutdown retries registry cleanup", async () => {
+    const context = parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1" });
+    const port = publisherPort("restored task");
+    const h = publisherFor(context, "rpc", { replay: port.port, registryUnsubscribeFailures: 1 });
+    try {
+      expect(h.published()).toBeUndefined();
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(h.published()).toMatchObject({ revision: 1, agents: [{ taskLabel: "restored task" }] });
+      h.shutdown();
+      h.shutdown();
+      expect(h.registryUnsubscribeAttempts()).toBe(2);
+    } finally {
+      h.dispose();
+    }
+  });
+});
+
+describe("aggregator render scheduling", () => {
+  test("uses a 50 ms coalescer for render bursts and disposes it on shutdown", () => {
+    const feed = fakeSource();
+    const windows: number[] = [];
+    let requests = 0;
+    let disposals = 0;
+    const createCoalescer: NonNullable<AgentWidgetDeps["createCoalescer"]> = (_runner, _timer, delay?) => {
+      windows.push(Number(delay));
+      return {
+        request: () => { requests += 1; },
+        dispose: () => { disposals += 1; },
+      };
+    };
+    const h = harness({ sources: [feed], createCoalescer });
+
+    publish();
+    feed.emit(snapshotOf(2));
+    feed.emit(snapshotOf(3));
+
+    expect(windows).toEqual([50]);
+    expect(requests).toBe(2);
+    h.shutdown();
+    expect(disposals).toBe(1);
+  });
+});
 
 describe("mount and unmount", () => {
   test("mounts on the first non-zero total and acquires the lease", () => {
@@ -533,9 +717,19 @@ describe("startup integration", () => {
     expect(h.diagnostics).toHaveLength(1);
   });
 
-  test("installs no widget when registration is disabled", () => {
-    const h = startupHarness({ registration: { enabled: false, diagnostic: "depth exhausted" } });
-    expect(h.log).toHaveLength(0);
+  test("loads and awaits the widget before disabled registration returns without controller tools", async () => {
+    const h = startupHarness({
+      registration: { enabled: false, diagnostic: "depth exhausted" },
+      loadWidget: async (log) => {
+        log.push("widget-import");
+        await Promise.resolve();
+        return () => { log.push("startWidget"); };
+      },
+    });
+    expect(h.tools()).toEqual([]);
+    await h.ready();
+    expect(h.log).toEqual(["widget-import", "startWidget"]);
+    expect(h.tools()).toEqual([]);
   });
 
   test("a throwing startup is reported on both channels and costs no tool or lifecycle handler", async () => {
@@ -697,7 +891,7 @@ describe("production composition session isolation", () => {
       platform: "linux",
       nodeVersion: "22.19.0",
       registration: { enabled: true },
-      startWidget: (pi) => { createAgentWidgetExtension(pi); },
+      startWidget: (pi) => { createAgentWidgetExtension(pi, { launchContext: parseExtensionLaunchContext({}) }); },
       createController: () => {
         const index = created++;
         return { ...startupController(), observationPort: () => stores[index]!, status: () => statuses[index]! };
