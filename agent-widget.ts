@@ -1,3 +1,5 @@
+import { appendFileSync } from "node:fs";
+
 import {
   CustomEditor,
   getAgentDir,
@@ -99,6 +101,13 @@ function start(ctx: ExtensionContext, deps: AgentWidgetDeps): () => void {
   const guard = <T>(operation: () => T): T | undefined => {
     try { return operation(); } catch (error) { report(error); return undefined; }
   };
+  // Gate-only trace. Inert in every real session: the variable is set solely by
+  // scripts/run-widget-focus-gate.ts, and every call sits behind `guard`.
+  const traceFile = process.env.PI_WIDGET_GATE_EVENT_FILE;
+  const trace = (event: string): void => {
+    if (traceFile === undefined) return;
+    guard(() => appendFileSync(traceFile, `${event}\u000A`));
+  };
   const acquire = (): void => { if (lease === undefined) lease = guard(acquireStatusLease); };
   const release = (): void => {
     const held = lease;
@@ -143,6 +152,7 @@ function start(ctx: ExtensionContext, deps: AgentWidgetDeps): () => void {
     guard(() => {
       tuiRef!.setFocus(editorRef!);
       tuiRef!.requestRender();
+      trace("editor-refocused");
     });
   };
   const forwardShortcut = (data: string): boolean => {
@@ -205,8 +215,10 @@ function start(ctx: ExtensionContext, deps: AgentWidgetDeps): () => void {
             widget?.enterFromEditor();
             tui.setFocus(widget!);
             tui.requestRender();
+            trace("widget-focused");
             return;
           }
+          if (matchesKey(data, Key.down) && editor.getText().length > 0) trace("native-arrow");
           inherited(data);
         });
       };
