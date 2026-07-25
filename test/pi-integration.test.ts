@@ -24,7 +24,9 @@ import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, RpcClient, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
 import { createProductionController, launchAfterSurrender } from "../src/pi-composition.ts";
-import { AgentState, agentId, contextPercent, delegationDepth, runCapacity, type AgentId } from "../src/domain.ts";
+import { AgentObservationStore } from "../src/agent-observation-store.ts";
+import type { TranscriptItem } from "../src/agent-observation.ts";
+import { AgentEventType, AgentState, CompletionState, agentId, contextPercent, delegationDepth, milliseconds, runCapacity, type AgentId, type RunId } from "../src/domain.ts";
 import { absolutePath } from "../src/paths.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
 import { containmentReceiptPath } from "../src/paths.ts";
@@ -317,12 +319,89 @@ describe("installed Pi integration prerequisites", () => {
       expect(observed).toEqual(expect.arrayContaining(["thinking", "responding", "tool", "idle"]));
       expect(controller.observationPort().observation(childId)?.context).toEqual({ kind: "known", percent: contextPercent(37) });
       expect(observedPayloads.join("\n")).not.toContain("not-copied");
+      const firstTranscript = controller.observationPort().transcriptSource(childId)!.snapshot();
+      expect(controller.observationPort().directSnapshot()).toMatchObject({ health: { kind: "healthy" } });
+      expect(firstTranscript.items.map((item) => item.kind)).toEqual(["user", "thinking", "assistant", "tool", "assistant"]);
+      expect(JSON.stringify(firstTranscript.items)).not.toContain("not-copied");
+
     } finally {
       try { await controller.shutdown(); } catch { /* fake containment has no kernel cgroup authority */ }
       for (const child of children) child.kill();
       state.cleanup();
     }
   }, 15_000);
+
+  test("production routing keeps two reused-index runs distinct for exact authoritative replacement", async () => {
+    const harness = productionFakeRpcHarness("observation-two-runs");
+    try {
+      await harness.controller.restore();
+      const first = await harness.controller.spawn({ task: "observation run one" });
+      if (!("runId" in first)) throw new Error("first run identity unavailable");
+      await waitForTranscriptItems(harness.controller, first.agentId, 1);
+      await Bun.sleep(50);
+      expect(await harness.controller.awaitReady({ timeoutMs: milliseconds(10_000) })).toMatchObject({
+        completion: { agentId: first.agentId, runId: first.runId },
+      });
+      const second = await harness.controller.sendInput(first.agentId, "observation run two");
+      if (!("runId" in second)) throw new Error("second run identity unavailable");
+      await waitForTranscriptItems(harness.controller, second.agentId, 2);
+      await Bun.sleep(50);
+      expect(await harness.controller.awaitReady({ timeoutMs: milliseconds(10_000) })).toMatchObject({
+        completion: { agentId: second.agentId, runId: second.runId },
+      });
+      expect(second.runId).not.toBe(first.runId);
+
+      const live = harness.controller.observationPort().transcriptSource(first.agentId)!.snapshot().items;
+      expect(live.filter((item) => item.kind === "assistant")).toHaveLength(2);
+      expect(live.filter((item) => item.kind === "tool")).toEqual([
+        expect.objectContaining({ runId: first.runId, tool: "read" }),
+        expect.objectContaining({ runId: second.runId, tool: "read" }),
+      ]);
+      const merged = mergeAuthoritativeRun(live, {
+        firstUserEntryId: second.runId,
+        items: [authoritativeAssistant(second.runId, "authoritative second")],
+      });
+      expect(merged).toContainEqual(expect.objectContaining({ runId: first.runId, kind: "assistant", text: "observed run one" }));
+      expect(merged).toContainEqual(expect.objectContaining({ runId: second.runId, kind: "assistant", text: "authoritative second" }));
+      expect(merged.filter((item) => "runId" in item && item.runId === second.runId && item.kind === "assistant")).toHaveLength(1);
+    } finally { await harness.close(); }
+  }, 20_000);
+
+  test.each(["unbound", "bound"] as const)("production projector throw at %s preserves durable completion, collection and shutdown", async (phase) => {
+    class ThrowingProjectionStore extends AgentObservationStore {
+      override createRoutedAttemptSink(...args: Parameters<AgentObservationStore["createRoutedAttemptSink"]>) {
+        const [agent, attempt, onEvent, onBind] = args;
+        let thrown = false;
+        const sink = super.createRoutedAttemptSink(agent, attempt, (event) => {
+          onEvent(event);
+          if (!thrown && phase === "bound") { thrown = true; throw new Error("projector fault"); }
+        }, onBind);
+        return {
+          record: (event: Parameters<typeof sink.record>[0]) => {
+            sink.record(event);
+            if (!thrown && phase === "unbound") { thrown = true; throw new Error("projector fault"); }
+          },
+          bind: (run: Parameters<typeof sink.bind>[0]) => sink.bind(run),
+          discard: () => sink.discard(),
+        };
+      }
+    }
+    const harness = productionFakeRpcHarness("observation-two-runs", { createObservationStore: () => new ThrowingProjectionStore() });
+    try {
+      await harness.controller.restore();
+      const started = await harness.controller.spawn({ task: "observation run one" });
+      if (!("runId" in started)) throw new Error("run identity unavailable");
+      const collected = await harness.controller.awaitReady({ timeoutMs: milliseconds(10_000) });
+      expect(collected).toMatchObject({ completion: { agentId: started.agentId, runId: started.runId, state: CompletionState.Completed } });
+      expect(harness.events).toContainEqual(expect.objectContaining({ eventType: AgentEventType.RunCompleted }));
+      expect(harness.controller.observationPort().transcriptSource(started.agentId)!.snapshot()).toMatchObject({
+        availability: "unavailable",
+        items: [expect.objectContaining({ kind: "notice", code: "projection-unavailable" })],
+      });
+      expect(await harness.controller.awaitReady({ timeoutMs: milliseconds(0) })).toMatchObject({ remainingCompletions: 0 });
+      await expect(harness.controller.shutdown()).resolves.toBeUndefined();
+    } finally { harness.cleanup(); }
+  }, 20_000);
 
   test("production restoration folds the selected parent branch once", async () => {
     let branchReads = 0;
@@ -424,6 +503,22 @@ describe("deterministic network-free real-Pi matrix", () => {
       const native = SessionManager.open(findChildTranscript(agentDir, started.agentId));
       expect(native.getSessionId()).toBe(started.agentId);
     });
+  }, 30_000);
+
+  test("03b provider messages exclude transcript projection state and internal paths", async () => {
+    await withFixture("provider-transcript-isolation", async ({ client, agentDir, root }) => {
+      await client.promptAndWait("CALL_SPAWN_TASK|CHILD_COMPLETE", undefined, 20_000);
+      const started = decodeStartResult(await client.getLastAssistantText());
+      const internalTranscriptPath = findChildTranscript(agentDir, started.agentId);
+      expect(internalTranscriptPath).toBeString();
+      const encoded = readFileSync(join(root, "provider-messages.jsonl"), "utf8");
+      expect(encoded).not.toContain('"ordinal"');
+      expect(encoded).not.toContain('"truncatedBefore"');
+      expect(encoded).not.toContain("projection-unavailable");
+      expect(encoded).not.toContain("transport-unavailable");
+      expect(encoded).not.toContain(internalTranscriptPath);
+      expect(encoded).not.toContain('"A1"');
+    }, process.env, ({ root }) => ({ MOCK_PROVIDER_CAPTURE_PATH: join(root, "provider-messages.jsonl") }));
   }, 30_000);
 
   test("04 each spawn/resume run ID is its exact literal assignment user-entry ID", async () => {
@@ -916,6 +1011,110 @@ describe("deterministic network-free real-Pi matrix", () => {
     });
   }, 40_000);
 });
+
+async function waitForTranscriptItems(
+  controller: ReturnType<typeof createProductionController>,
+  id: AgentId,
+  assistantCount: number,
+): Promise<void> {
+  for (let index = 0; index < 400; index++) {
+    const count = controller.observationPort().transcriptSource(id)?.snapshot().items
+      .filter((item) => item.kind === "assistant").length ?? 0;
+    if (count >= assistantCount) return;
+    await Bun.sleep(5);
+  }
+  throw new Error(`transcript did not reach ${assistantCount} assistant items`);
+}
+
+function mergeAuthoritativeRun(
+  live: readonly TranscriptItem[],
+  segment: { readonly firstUserEntryId: RunId; readonly items: readonly TranscriptItem[] },
+): readonly TranscriptItem[] {
+  return [
+    ...live.filter((item) => !("runId" in item) || item.runId !== segment.firstUserEntryId),
+    ...segment.items,
+  ];
+}
+
+function authoritativeAssistant(run: RunId, text: string): TranscriptItem {
+  return Object.freeze({ sequence: 999 as TranscriptItem["sequence"], runId: run, kind: "assistant", phase: "final", text: text as never });
+}
+
+function productionFakeRpcHarness(
+  scenario: string,
+  options: { readonly createObservationStore?: () => AgentObservationStore } = {},
+): {
+  readonly controller: ReturnType<typeof createProductionController>;
+  readonly events: readonly unknown[];
+  close(): Promise<void>;
+  cleanup(): void;
+} {
+  const state = temporaryStateRoot(`pi-production-${scenario}-`);
+  const root = String(state.path);
+  const project = join(root, "project");
+  const parentSessions = join(root, "parent-sessions");
+  mkdirSync(project); mkdirSync(parentSessions);
+  const parent = SessionManager.create(project, parentSessions);
+  const descriptors = new Map<string, ReturnType<typeof testContainmentAttempt>["descriptor"]>();
+  const children = new Set<ReturnType<typeof spawnProcess>>();
+  const events: unknown[] = [];
+  const backend = {
+    root: absolutePath(join(root, "cgroup")), parentScope: absolutePath(join(root, "cgroup", "parent")),
+    preflight: async () => {},
+    prepareAttempt: (attemptId: Parameters<typeof testContainmentAttempt>[0]) => {
+      const attempt = testContainmentAttempt(attemptId, absolutePath(join(root, "cgroup")), parent.getSessionId());
+      descriptors.set(String(attemptId), attempt.descriptor); return attempt;
+    },
+    restoreAttempt: () => { throw new Error("unexpected restoration"); },
+    shutdown: async () => {},
+  };
+  const controller = createProductionController(
+    {
+      sessionManager: parent, cwd: project,
+      model: { provider: "mock-provider", id: "luna" }, modelRegistry: { getAll: () => [] },
+      hasUI: false,
+      ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined,
+        editor: async () => undefined, notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+      isIdle: () => true, isProjectTrusted: () => false,
+    } as unknown as Parameters<typeof createProductionController>[0],
+    {
+      appendEntry: (customType: string, data: unknown) => { events.push(data); parent.appendCustomEntry(customType, data); },
+      sendMessage: () => {}, getThinkingLevel: () => "high", getActiveTools: () => [],
+    } as unknown as Parameters<typeof createProductionController>[1],
+    { capacity: runCapacity(1), currentDepth: delegationDepth(0), maxDepth: delegationDepth(1), stateRoot: absolutePath(root) },
+    {
+      createContainmentProvider: () => ({ kind: "available", backend }),
+      buildRpcLaunchSpec: (launch: { readonly cwd: ReturnType<typeof absolutePath> }) => ({ command: absolutePath(process.execPath), args: [], cwd: launch.cwd, env: {}, shell: false }),
+      ...(options.createObservationStore === undefined ? {} : { createObservationStore: options.createObservationStore }),
+      createPreparedRpcTransport: async ({ attempt, agentId: childId, sessionPath: childSession }: {
+        attempt: ReturnType<typeof testContainmentAttempt>; agentId: AgentId; sessionPath: string;
+      }) => {
+        const child = spawnProcess(process.execPath, [fileURLToPath(new URL("fixtures/fake-rpc-child.mjs", import.meta.url))], {
+          cwd: project,
+          env: { ...process.env, FAKE_RPC_SCENARIO: scenario, FAKE_RPC_AGENT_ID: childId, FAKE_RPC_SESSION_PATH: childSession },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        children.add(child);
+        await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+        return {
+          containment: descriptors.get(String(attempt.attemptId))!,
+          transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
+            exited: new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.once("exit", (code, signal) => resolve({ code, signal }))),
+            terminate: () => { child.kill(); } },
+          contain: async () => { child.kill(); return testVerifiedReceiptPath(); },
+        };
+      },
+    } as unknown as Parameters<typeof createProductionController>[3],
+  );
+  const cleanup = (): void => {
+    for (const child of children) child.kill();
+    state.cleanup();
+  };
+  return { controller, events, cleanup, close: async () => {
+    try { await controller.shutdown(); } catch { /* fake containment has no kernel authority */ }
+    cleanup();
+  } };
+}
 
 function productionHarness(options: {
   readonly getBranch: () => readonly unknown[];

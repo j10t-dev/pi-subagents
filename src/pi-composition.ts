@@ -14,7 +14,7 @@ import {
   type SurrenderContainment,
 } from "./controller.ts";
 import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord, type RestoredRegistry } from "./persistence.ts";
-import { AgentObservationStore, createTotalAgentObservationAdapter, createTotalRpcObservationAdapter } from "./agent-observation-store.ts";
+import { AgentObservationStore, createTotalAgentObservationAdapter, createTotalRpcObservationAdapter, type AgentObservationStoreOptions } from "./agent-observation-store.ts";
 import { createContextObservationService } from "./context-observation.ts";
 import { buildRpcLaunchSpec, resolvePiInvocation, type BuildRpcLaunchOptions, type RpcLaunchSpec } from "./pi-launcher.ts";
 import { isLocalOutputPublicationError, RpcRunClient, type RpcLaunchTransport } from "./rpc-client.ts";
@@ -111,6 +111,8 @@ interface ProductionControllerDependencies {
   readonly createContainmentProvider: typeof createContainmentProvider;
   readonly buildRpcLaunchSpec: (options: BuildRpcLaunchOptions) => RpcLaunchSpec;
   readonly createPreparedLaunch?: (prepared: PreparedProductionLaunch) => Promise<LaunchTransport>;
+  /** Test harness seam for projection fault injection without widening the observation port. */
+  readonly createObservationStore?: (options: AgentObservationStoreOptions) => AgentObservationStore;
   /** Test harness seam retaining the production RpcRunClient and observation composition. */
   readonly createPreparedRpcTransport?: (prepared: PreparedProductionRpcLaunch) => Promise<PreparedRpcTransport>;
 }
@@ -186,10 +188,12 @@ export function createProductionController(
     },
   };
   let controller!: SubagentController;
-  const observationStore = new AgentObservationStore({
+  const observationStoreOptions: AgentObservationStoreOptions = {
     reconciliation: () => controller.observationReconciliationSnapshot(),
     diagnostic: (message) => context.ui.notify(message, "warning"),
-  });
+  };
+  const observationStore = dependencies.createObservationStore?.(observationStoreOptions) ??
+    new AgentObservationStore(observationStoreOptions);
   controller = new SubagentController({
     capacity: options.capacity,
     observation: createTotalAgentObservationAdapter(observationStore),
@@ -400,10 +404,10 @@ export function createProductionController(
       },
       contain: async () => {
         try {
+          if (preparedRpc !== undefined) return await (await preparedRpc).contain();
           if (client !== undefined) await client.shutdown();
           else if (watchdog !== undefined) await watchdog.close();
           else return await attempt.terminate("no_process");
-          if (preparedRpc !== undefined) return await (await preparedRpc).contain();
           if (watchdog === undefined) throw new Error("containment_unavailable:watchdog ownership");
           return await watchdog.waitForReceipt();
         } catch (error) {

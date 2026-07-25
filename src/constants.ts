@@ -55,6 +55,12 @@ export const MAX_PENDING_ATTEMPT_BYTES = utf8Bytes(64 * 1024);
 export const MAX_PENDING_OBSERVATION_EVENTS = 256;
 export const MAX_PENDING_OBSERVATION_BYTES = utf8Bytes(256 * 1024);
 
+export const MAX_TRANSCRIPT_FIELD_BYTES = 8 * 1024;
+export const MAX_TRANSCRIPT_SOURCE_ITEMS = 256;
+export const MAX_TRANSCRIPT_SOURCE_BYTES = 256 * 1024;
+export const MAX_TRANSCRIPT_STORE_ITEMS = 1_024;
+export const MAX_TRANSCRIPT_STORE_BYTES = 1_024 * 1024;
+
 /** Maximum size of one ordinary RPC record before it is discarded through the next LF. */
 export const MAX_RPC_RECORD_BYTES = utf8Bytes(16 * 1024 * 1024);
 

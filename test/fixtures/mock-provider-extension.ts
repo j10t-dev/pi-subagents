@@ -1,7 +1,7 @@
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { Api, AssistantMessage, Context, Message, Model, ToolCall } from "@earendil-works/pi-ai";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 
@@ -12,6 +12,7 @@ const setsidPath = process.env.MOCK_SETSID_PATH;
 const setsidPidPath = process.env.MOCK_SETSID_PID_PATH;
 const confirmationTimeoutMs = Number(process.env.MOCK_CONFIRM_TIMEOUT_MS ?? 100);
 const childLaunchDir = process.env.MOCK_PROVIDER_CHILD_LAUNCH_DIR;
+const providerCapturePath = process.env.MOCK_PROVIDER_CAPTURE_PATH;
 
 if (process.env.PI_SUBAGENT_CHILD === "1" && childLaunchDir !== undefined) {
   writeFileSync(join(childLaunchDir, `${process.pid}.json`), JSON.stringify({ pid: process.pid, argv: process.argv }));
@@ -101,6 +102,7 @@ const factory: ExtensionFactory = (pi) => {
 
 function scripted(model: Model<Api>, context: Context): ReturnType<typeof createAssistantMessageEventStream> {
   const stream = createAssistantMessageEventStream();
+  if (providerCapturePath !== undefined) appendFileSync(providerCapturePath, `${JSON.stringify(context.messages)}\n`);
   const prompt = lastUserText(context.messages);
   const result = lastToolResultText(context.messages);
   if (process.env.PI_SUBAGENT_CHILD === "1" && prompt.includes("NESTED_DELEGATION")) {

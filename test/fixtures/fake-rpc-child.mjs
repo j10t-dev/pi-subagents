@@ -167,7 +167,8 @@ rl.on("line", (line) => {
       }
       const assignment = promptedMessage === undefined
         ? []
-        : [{ type: "message", id: "deadbeef", message: { role: "user", content: promptedMessage } }];
+        : [{ type: "message", id: scenario === "observation-two-runs" && promptedMessage.includes("two") ? "cafebabe" : "deadbeef",
+          message: { role: "user", content: promptedMessage } }];
       const entries = scenario === "settlement-invalid-usage" && hasSettled
         ? [
           { type: "message", id: "assistant-valid", message: assistantMessage("valid") },
@@ -234,6 +235,22 @@ function runScenario() {
     case "incomplete-tool-use": {
       const message = { ...assistantMessage(""), content: [{ type: "toolCall", id: "call-1", name: "x", arguments: {} }], stopReason: "toolUse" };
       write({ type: "message_end", message }); write({ type: "agent_settled" }); break;
+    }
+    case "observation-two-runs": {
+      const runLabel = promptedMessage?.includes("two") ? "two" : "one";
+      const final = assistantMessage(`observed run ${runLabel}`);
+      write({ type: "compaction_start", reason: "threshold" });
+      write({ type: "compaction_end", reason: "threshold", result: null, aborted: false, willRetry: false });
+      write({ type: "message_start", message: assistantMessage("") });
+      write({ type: "message_update", message: assistantMessage(""), assistantMessageEvent: {
+        type: "text_delta", contentIndex: 0, delta: `observed run ${runLabel}`, partial: assistantMessage(""),
+      } });
+      write({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: { path: "/not-copied" } });
+      write({ type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: { content: [], details: {} }, isError: false });
+      write({ type: "message_end", message: final });
+      write({ type: "turn_end", message: final, toolResults: [] });
+      write({ type: "agent_settled" });
+      break;
     }
     case "activity-context": {
       const final = { ...assistantMessage("answer"), stopReason: "toolUse" };

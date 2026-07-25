@@ -4,6 +4,8 @@ import {
   agentObservationRevision,
   agentRunKey,
   directAgentOrdinal,
+  transcriptRevision,
+  transcriptSequence,
   type AbsolutePath,
   type AgentCompletion,
   type AgentId,
@@ -15,6 +17,7 @@ import {
   type RunId,
   type RunAttemptId,
   type ThinkingLevel,
+  type TranscriptRevision,
 } from "./domain.ts";
 import {
   deriveDisplayState,
@@ -39,6 +42,9 @@ import {
   type ObservationHealthCode,
   type SpawnObservationInput,
   type SubagentObservationPort,
+  type TranscriptItem,
+  type TranscriptListener,
+  type TranscriptSnapshot,
   type TranscriptSource,
   activityText,
 } from "./agent-observation.ts";
@@ -50,6 +56,11 @@ import {
   MAX_PENDING_ATTEMPT_EVENTS,
   MAX_PENDING_OBSERVATION_BYTES,
   MAX_PENDING_OBSERVATION_EVENTS,
+  MAX_TRANSCRIPT_FIELD_BYTES,
+  MAX_TRANSCRIPT_SOURCE_BYTES,
+  MAX_TRANSCRIPT_SOURCE_ITEMS,
+  MAX_TRANSCRIPT_STORE_BYTES,
+  MAX_TRANSCRIPT_STORE_ITEMS,
 } from "./constants.ts";
 
 export interface AgentObservationMutationPort {
@@ -63,9 +74,17 @@ export interface AgentObservationMutationPort {
   dispose(): void;
 }
 
+export interface TranscriptBudgets {
+  readonly perSourceItems: number;
+  readonly perSourceBytes: number;
+  readonly globalItems: number;
+  readonly globalBytes: number;
+}
+
 export interface AgentObservationStoreOptions {
   readonly reconciliation?: () => ObservationReconciliationSnapshot;
   readonly diagnostic?: (message: string) => void;
+  readonly transcriptBudgets?: TranscriptBudgets;
 }
 
 interface RetainedAgent {
@@ -91,6 +110,34 @@ const UNAVAILABLE_CONTEXT = Object.freeze({ kind: "unavailable" } as const);
 const PROJECTION_UNAVAILABLE: AgentActivity = Object.freeze({ kind: "unavailable", reason: "projection" });
 const TRANSPORT_UNAVAILABLE: AgentActivity = Object.freeze({ kind: "unavailable", reason: "transport" });
 
+interface TranscriptEntry {
+  item: TranscriptItem;
+  readonly order: number;
+  open: boolean;
+  bytes: number;
+}
+
+interface RetainedTranscript {
+  readonly agentId: AgentId;
+  readonly source: TranscriptSource;
+  readonly entries: TranscriptEntry[];
+  readonly listeners: Set<TranscriptListener>;
+  readonly assistant: Map<string, TranscriptEntry>;
+  readonly tools: Map<string, TranscriptEntry>;
+  revision: TranscriptRevision;
+  sequence: number;
+  generation: number;
+  generationOpen: boolean;
+  truncatedBefore: boolean;
+  availability: TranscriptSnapshot["availability"];
+  boundRunId?: RunId;
+  disabledRunId?: RunId;
+  transportHealthy: boolean;
+  snapshot?: TranscriptSnapshot;
+  notificationScheduled: boolean;
+  disposed: boolean;
+}
+
 interface PendingObservationAttempt {
   readonly agentId: AgentId;
   readonly attemptId: RunAttemptId;
@@ -100,12 +147,14 @@ interface PendingObservationAttempt {
   readonly onBind: (runId: RunId) => void;
   bytes: number;
   rejected: boolean;
+  discarded: boolean;
   boundRunId?: RunId;
 }
 
 /** Process-local, UI-neutral projection of one controller's directly owned children. */
 export class AgentObservationStore implements SubagentObservationPort, AgentObservationMutationPort, ObservationAttemptSinkFactory {
   private readonly agents = new Map<AgentId, RetainedAgent>();
+  private readonly transcripts = new Map<AgentId, RetainedTranscript>();
   private readonly listeners = new Set<ObservationListener>();
   private readonly knownAgentIds = new Set<AgentId>();
   private readonly knownRunIds = new Set<RunId>();
@@ -126,10 +175,18 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   private attemptCreation = 0;
   private pendingAttemptEvents = 0;
   private pendingAttemptBytes = 0;
+  private retentionOrder = 0;
+  private readonly transcriptBudgets: TranscriptBudgets;
 
   constructor(options: AgentObservationStoreOptions = {}) {
     this.reconciliationSupplier = options.reconciliation;
     this.diagnostic = options.diagnostic ?? (() => {});
+    this.transcriptBudgets = options.transcriptBudgets ?? {
+      perSourceItems: MAX_TRANSCRIPT_SOURCE_ITEMS,
+      perSourceBytes: MAX_TRANSCRIPT_SOURCE_BYTES,
+      globalItems: MAX_TRANSCRIPT_STORE_ITEMS,
+      globalBytes: MAX_TRANSCRIPT_STORE_BYTES,
+    };
   }
 
   observation(agentId: AgentId): AgentObservation | undefined {
@@ -168,7 +225,9 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     return this.snapshotCache;
   }
 
-  transcriptSource(_agentId: AgentId): TranscriptSource | undefined { return undefined; }
+  transcriptSource(agentId: AgentId): TranscriptSource | undefined {
+    return this.disposed ? undefined : this.transcripts.get(agentId)?.source;
+  }
 
   subscribe(listener: ObservationListener): () => void {
     if (this.disposed) return () => {};
@@ -204,6 +263,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     };
     retained.observation = freezeObservation(retained, this.nextRevision(), model, IDLE, this.labelContext());
     this.agents.set(input.agentId, retained);
+    this.createTranscript(input.agentId, "stopped");
     changed.push(input.ordinal);
     this.commit(changed, false);
     this.retryFailedReconciliation();
@@ -212,12 +272,13 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   acceptRun(input: AcceptedRunObservationInput): void {
     if (this.disposed) return;
     const agent = this.agents.get(input.agentId);
-    if (agent === undefined) return;
+    if (agent === undefined || agent.latestRunId === input.runId) return;
     const candidate = boundedCandidate(input.assignment);
     const sensitiveChanged = this.addSensitiveValues({ agentIds: new Set(), runIds: new Set([input.runId]), internalPaths: new Set() });
     const equivalent = agent.latestRunId === input.runId && agent.candidate === candidate;
     agent.latestRunId = input.runId;
     agent.acceptedAttemptId = input.attemptId;
+    this.acceptTranscriptRun(input.agentId, input.runId);
     agent.candidate = candidate;
     const changed = sensitiveChanged ? this.rederiveAll() : [];
     if (!equivalent || !sameTask(agent.observation, candidate, this.labelContext())) {
@@ -240,7 +301,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   ): RpcObservationSink {
     const attempt: PendingObservationAttempt = {
       agentId, attemptId, creation: ++this.attemptCreation, events: [], onEvent, onBind,
-      bytes: 0, rejected: this.disposed || this.attempts.has(attemptId),
+      bytes: 0, rejected: this.disposed || this.attempts.has(attemptId), discarded: false,
     };
     if (!attempt.rejected) this.attempts.set(attemptId, attempt);
     return {
@@ -282,6 +343,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     }
     const changed = sensitiveChanged ? this.rederiveAll() : [];
     agent.lifecycleState = record.state;
+    this.projectTranscriptLifecycle(agent, record.runId);
     const before = agent.observation;
     this.replaceObservation(agent, {});
     if (agent.observation !== before) changed.push(agent.ordinal);
@@ -350,6 +412,8 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     for (const [id, agent] of this.agents) {
       if (authoritativeIds.has(id)) continue;
       this.agents.delete(id);
+      this.disposeTranscript(this.transcripts.get(id));
+      this.transcripts.delete(id);
       changed.push(agent.ordinal);
     }
     for (let index = 0; index < snapshot.spawnSequence.length; index++) {
@@ -391,6 +455,9 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       const before = agent.observation;
       agent.candidate = candidate;
       agent.lifecycleState = lifecycleState;
+      const transcript = this.createTranscript(id, lifecycleState === AgentState.Stopped ? "stopped" : "unavailable");
+      if (runId !== undefined) transcript.boundRunId = runId;
+      transcript.availability = lifecycleState === AgentState.Stopped ? "stopped" : "unavailable";
       if (runId === undefined) delete agent.latestRunId;
       else agent.latestRunId = runId;
       if (completion === undefined) {
@@ -420,6 +487,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     this.pendingRescan = false;
     this.notificationScheduled = false;
     this.reconciliationScheduled = false;
+    for (const source of this.transcripts.values()) this.disposeTranscript(source);
     this.agents.clear();
     this.attempts.clear();
     this.pendingAttemptEvents = 0;
@@ -427,14 +495,45 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     this.snapshotCache = Object.freeze({ kind: "unavailable", finalRevision: this.revision });
   }
 
-  /** Explicit total-adapter test seam; not part of the widget-facing port. */
-  testAdapter(): { reportProjectionFailure(): void } {
-    return { reportProjectionFailure: () => this.reportProjectionFailure() };
+  /** Explicit test seam; not part of the widget-facing port. */
+  testAdapter(): { reportProjectionFailure(): void; correlationCount(agentId: AgentId): number; transcriptItemCount(): number } {
+    return {
+      reportProjectionFailure: () => this.reportProjectionFailure(),
+      correlationCount: (agentId) => {
+        const source = this.transcripts.get(agentId);
+        return source === undefined ? 0 : source.assistant.size + source.tools.size;
+      },
+      transcriptItemCount: () => [...this.transcripts.values()].reduce((total, source) => total + source.entries.length, 0),
+    };
+  }
+
+  /** Emergency operation for the total RPC adapter. */
+  failTranscriptProjection(agentId: AgentId, runId: RunId): void {
+    try {
+      const source = this.transcripts.get(agentId);
+      if (source === undefined || source.boundRunId !== runId) return;
+      const affected = new Set<RetainedTranscript>();
+      this.failTranscript(source, runId, affected);
+      this.enforceTranscriptBudgets(source, affected);
+      this.commitTranscripts(affected);
+    } catch { /* emergency operation is total */ }
+  }
+
+  failAttemptProjection(agentId: AgentId, attemptId: RunAttemptId): void {
+    const attempt = this.attempts.get(attemptId);
+    if (attempt !== undefined && attempt.agentId === agentId) {
+      if (attempt.boundRunId === undefined) this.rejectAttempt(attempt);
+      else this.failTranscriptProjection(agentId, attempt.boundRunId);
+      return;
+    }
+    const agent = this.agents.get(agentId);
+    if (agent?.acceptedAttemptId === attemptId && agent.latestRunId !== undefined) this.failTranscriptProjection(agentId, agent.latestRunId);
   }
 
   private recordAttempt(attempt: PendingObservationAttempt, event: RpcObservationEvent): void {
     if (this.disposed || attempt.rejected) return;
     if (attempt.boundRunId !== undefined) {
+      this.projectTranscript(attempt.agentId, attempt.boundRunId, event);
       this.projectActivity(attempt.agentId, attempt.boundRunId, event);
       attempt.onEvent(event);
       return;
@@ -458,8 +557,12 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   }
 
   private bindAttempt(attempt: PendingObservationAttempt, runId: RunId): void {
-    if (this.disposed || attempt.rejected || attempt.boundRunId !== undefined) return;
+    if (this.disposed || attempt.discarded || attempt.boundRunId !== undefined) return;
     const agent = this.agents.get(attempt.agentId);
+    if (attempt.rejected) {
+      if (agent?.latestRunId === runId && agent.acceptedAttemptId === attempt.attemptId) this.failTranscriptProjection(attempt.agentId, runId);
+      return;
+    }
     if (agent === undefined || agent.latestRunId !== runId || agent.acceptedAttemptId !== attempt.attemptId) {
       this.rejectAttempt(attempt);
       return;
@@ -469,11 +572,264 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     this.pendingAttemptEvents -= events.length;
     this.pendingAttemptBytes -= attempt.bytes;
     attempt.bytes = 0;
+    this.bindTranscriptRun(attempt.agentId, runId);
     attempt.onBind(runId);
     for (const event of events) {
+      this.projectTranscript(attempt.agentId, runId, event);
       this.projectActivity(attempt.agentId, runId, event);
       attempt.onEvent(event);
     }
+  }
+
+  private createTranscript(agentId: AgentId, availability: TranscriptSnapshot["availability"]): RetainedTranscript {
+    const existing = this.transcripts.get(agentId);
+    if (existing !== undefined) return existing;
+    let retained!: RetainedTranscript;
+    const source: TranscriptSource = Object.freeze({
+      snapshot: (): TranscriptSnapshot => this.transcriptSnapshot(retained),
+      subscribe: (listener: TranscriptListener): (() => void) => {
+        if (retained.disposed) return () => {};
+        retained.listeners.add(listener);
+        let active = true;
+        return () => { if (active) { active = false; retained.listeners.delete(listener); } };
+      },
+    });
+    retained = {
+      agentId, source, entries: [], listeners: new Set(), assistant: new Map(), tools: new Map(),
+      revision: transcriptRevision(0), sequence: 0, generation: 0, generationOpen: false,
+      truncatedBefore: false, availability, transportHealthy: false, notificationScheduled: false, disposed: false,
+    };
+    this.transcripts.set(agentId, retained);
+    return retained;
+  }
+
+  private transcriptSnapshot(source: RetainedTranscript): TranscriptSnapshot {
+    if (source.snapshot !== undefined) return source.snapshot;
+    const items = Object.freeze(source.entries.map((entry) => entry.item));
+    source.snapshot = Object.freeze({ revision: source.revision, items, truncatedBefore: source.truncatedBefore, availability: source.availability });
+    return source.snapshot;
+  }
+
+  private acceptTranscriptRun(agentId: AgentId, runId: RunId): void {
+    const source = this.transcripts.get(agentId);
+    if (source === undefined || source.disabledRunId === runId) return;
+    const changed = source.disabledRunId !== undefined || source.boundRunId !== undefined || source.availability !== "unavailable";
+    delete source.disabledRunId;
+    source.boundRunId = runId;
+    source.transportHealthy = false;
+    source.generationOpen = false;
+    this.releaseRunCorrelations(source);
+    source.availability = "unavailable";
+    if (changed) this.commitTranscripts(new Set([source]));
+  }
+
+  private bindTranscriptRun(agentId: AgentId, runId: RunId): void {
+    const source = this.transcripts.get(agentId);
+    if (source === undefined || source.boundRunId !== runId || source.disabledRunId === runId) return;
+    source.transportHealthy = true;
+    if (source.availability !== "live") {
+      source.availability = "live";
+      this.commitTranscripts(new Set([source]));
+    }
+  }
+
+  private projectTranscript(agentId: AgentId, runId: RunId, event: RpcObservationEvent): void {
+    const source = this.transcripts.get(agentId);
+    if (source === undefined || source.boundRunId !== runId || source.disabledRunId === runId) return;
+    const affected = new Set<RetainedTranscript>();
+    const sequenceBefore = source.sequence;
+    switch (event.kind) {
+      case "prompt-accepted":
+        this.insertTranscript(source, Object.freeze({ sequence: this.nextTranscriptSequence(source), runId, kind: "user", text: boundedTranscriptPrefix(event.text) }), false, affected);
+        break;
+      case "assistant-start":
+        if (source.generationOpen) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
+        source.generation++; source.generationOpen = true;
+        break;
+      case "assistant-content": {
+        if (!source.generationOpen) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
+        const key = assistantKey(runId, source.generation, event.contentIndex, event.contentKind);
+        let entry = source.assistant.get(key);
+        const text = boundedTranscriptPrefix(event.text ?? "");
+        if (entry === undefined) {
+          const item = Object.freeze({ sequence: this.nextTranscriptSequence(source), runId,
+            kind: event.contentKind === "text" ? "assistant" as const : "thinking" as const,
+            phase: event.phase === "end" ? "final" as const : "partial" as const, text });
+          entry = this.insertTranscript(source, item, event.phase !== "end", affected);
+          if (source.disabledRunId !== runId) source.assistant.set(key, entry);
+        } else {
+          const phase = event.phase === "end" ? "final" as const : "partial" as const;
+          if (entry.item.kind !== "assistant" && entry.item.kind !== "thinking") throw new Error("invalid_state: assistant correlation mismatch");
+          const replacement = Object.freeze({ ...entry.item, phase, text });
+          this.replaceTranscript(source, entry, replacement, event.phase !== "end", affected);
+        }
+        break;
+      }
+      case "assistant-end": {
+        if (!source.generationOpen) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
+        for (const block of event.finalBlocks) {
+          const key = assistantKey(runId, source.generation, block.contentIndex, block.kind);
+          const entry = source.assistant.get(key);
+          const text = boundedTranscriptPrefix(block.text);
+          if (entry === undefined) {
+            this.insertTranscript(source, Object.freeze({ sequence: this.nextTranscriptSequence(source), runId,
+              kind: block.kind === "text" ? "assistant" as const : "thinking" as const, phase: "final" as const, text }), false, affected);
+          } else if (entry.item.kind === "assistant" || entry.item.kind === "thinking") {
+            this.replaceTranscript(source, entry, Object.freeze({ ...entry.item, phase: "final", text }), false, affected);
+          }
+        }
+        const generationPrefix = `${runId}\u0000${source.generation}\u0000`;
+        for (const [key, entry] of source.assistant) {
+          if (!key.startsWith(generationPrefix) || (entry.item.kind !== "assistant" && entry.item.kind !== "thinking")) continue;
+          this.replaceTranscript(source, entry, Object.freeze({ ...entry.item, phase: "final" }), false, affected);
+        }
+        this.releaseAssistantGeneration(source, runId, source.generation);
+        source.generationOpen = false;
+        break;
+      }
+      case "tool": {
+        const key = `${runId}\u0000${event.toolCallId}`;
+        let entry = source.tools.get(key);
+        const preview = event.preview === undefined ? undefined : boundedTranscriptPrefix(event.preview);
+        const item = entry === undefined
+          ? Object.freeze({ sequence: this.nextTranscriptSequence(source), runId, kind: "tool" as const, tool: event.tool, phase: event.phase, ...(preview === undefined ? {} : { preview }) })
+          : Object.freeze({ sequence: entry.item.sequence, runId, kind: "tool" as const, tool: event.tool, phase: event.phase, ...(preview === undefined ? {} : { preview }) });
+        if (entry === undefined) entry = this.insertTranscript(source, item, event.phase === "running", affected);
+        else this.replaceTranscript(source, entry, item, event.phase === "running", affected);
+        if (event.phase === "running" && source.disabledRunId !== runId) source.tools.set(key, entry);
+        else source.tools.delete(key);
+        break;
+      }
+      case "transport-unavailable":
+        if (source.transportHealthy) {
+          source.transportHealthy = false;
+          source.availability = "unavailable";
+          this.insertTranscript(source, Object.freeze({ sequence: this.nextTranscriptSequence(source), kind: "notice", code: "transport-unavailable" }), false, affected);
+        }
+        break;
+      case "agent-settled":
+      case "turn-end":
+      case "compaction":
+        break;
+    }
+    this.enforceTranscriptBudgets(source, affected, sequenceBefore);
+    this.commitTranscripts(affected);
+  }
+
+  private insertTranscript(source: RetainedTranscript, item: TranscriptItem, open: boolean, affected: Set<RetainedTranscript>): TranscriptEntry {
+    const entry: TranscriptEntry = { item, order: ++this.retentionOrder, open, bytes: transcriptItemBytes(item) };
+    source.entries.push(entry); affected.add(source);
+    return entry;
+  }
+
+  private replaceTranscript(source: RetainedTranscript, entry: TranscriptEntry, item: TranscriptItem, open: boolean, affected: Set<RetainedTranscript>): void {
+    const bytes = transcriptItemBytes(item);
+    if (sameTranscriptItem(entry.item, item) && entry.open === open) return;
+    entry.item = item; entry.open = open; entry.bytes = bytes; affected.add(source);
+  }
+
+  private enforceTranscriptBudgets(owner: RetainedTranscript, affected: Set<RetainedTranscript>, ownerSequenceBefore?: number): void {
+    while (sourceOverBudget(owner, this.transcriptBudgets)) {
+      const closed = oldestEntry(owner.entries, false);
+      if (closed !== undefined) {
+        this.evictTranscript(owner, closed, affected);
+        continue;
+      }
+      const oldestOpen = oldestEntry(owner.entries, true);
+      if (!this.failTranscript(owner, owner.boundRunId, affected, ownerSequenceBefore) && oldestOpen !== undefined) {
+        this.evictTranscript(owner, oldestOpen, affected);
+      }
+    }
+    while (storeOverBudget(this.transcripts.values(), this.transcriptBudgets)) {
+      const sources = [...this.transcripts.values()];
+      const closed = sources.flatMap((source) => source.entries.map((entry) => ({ source, entry })))
+        .filter(({ entry }) => !entry.open).sort((left, right) => left.entry.order - right.entry.order)[0];
+      if (closed !== undefined) {
+        this.evictTranscript(closed.source, closed.entry, affected);
+        continue;
+      }
+      const open = sources.flatMap((source) => source.entries.map((entry) => ({ source, entry })))
+        .sort((left, right) => left.entry.order - right.entry.order)[0];
+      if (open === undefined) return;
+      const rollback = open.source === owner ? ownerSequenceBefore : undefined;
+      if (!this.failTranscript(open.source, open.source.boundRunId, affected, rollback)) {
+        this.evictTranscript(open.source, open.entry, affected);
+      }
+    }
+  }
+
+  private evictTranscript(source: RetainedTranscript, entry: TranscriptEntry, affected: Set<RetainedTranscript>): void {
+    const index = source.entries.indexOf(entry);
+    if (index < 0) return;
+    source.entries.splice(index, 1);
+    source.truncatedBefore = true;
+    this.releaseEntryCorrelations(source, entry);
+    affected.add(source);
+  }
+
+  private failTranscript(
+    source: RetainedTranscript | undefined,
+    runId: RunId | undefined,
+    affected?: Set<RetainedTranscript>,
+    sequenceBefore?: number,
+  ): boolean {
+    if (source === undefined || source.disposed || runId === undefined || source.disabledRunId === runId) return false;
+    source.entries.length = 0;
+    source.assistant.clear(); source.tools.clear(); source.generationOpen = false;
+    source.disabledRunId = runId; source.transportHealthy = false; source.availability = "unavailable";
+    if (sequenceBefore !== undefined) source.sequence = sequenceBefore;
+    const item = Object.freeze({ sequence: this.nextTranscriptSequence(source), kind: "notice" as const, code: "projection-unavailable" as const });
+    const notice: TranscriptEntry = { item, order: ++this.retentionOrder, open: false, bytes: transcriptItemBytes(item) };
+    source.entries.push(notice);
+    if (affected === undefined) this.commitTranscripts(new Set([source]));
+    else affected.add(source);
+    return true;
+  }
+
+  private nextTranscriptSequence(source: RetainedTranscript) { return transcriptSequence(++source.sequence); }
+
+  private releaseEntryCorrelations(source: RetainedTranscript, entry: TranscriptEntry): void {
+    for (const [key, value] of source.assistant) if (value === entry) source.assistant.delete(key);
+    for (const [key, value] of source.tools) if (value === entry) source.tools.delete(key);
+  }
+
+  private releaseAssistantGeneration(source: RetainedTranscript, runId: RunId, generation: number): void {
+    const prefix = `${runId}\u0000${generation}\u0000`;
+    for (const key of source.assistant.keys()) if (key.startsWith(prefix)) source.assistant.delete(key);
+  }
+
+  private releaseRunCorrelations(source: RetainedTranscript, runId?: RunId): void {
+    if (runId === undefined) { source.assistant.clear(); source.tools.clear(); return; }
+    const prefix = `${runId}\u0000`;
+    for (const key of source.assistant.keys()) if (key.startsWith(prefix)) source.assistant.delete(key);
+    for (const key of source.tools.keys()) if (key.startsWith(prefix)) source.tools.delete(key);
+  }
+
+  private commitTranscripts(sources: Set<RetainedTranscript>): void {
+    for (const source of sources) {
+      if (source.disposed) continue;
+      source.revision = transcriptRevision(Number(source.revision) + 1);
+      delete source.snapshot;
+      this.scheduleTranscriptNotification(source);
+    }
+  }
+
+  private scheduleTranscriptNotification(source: RetainedTranscript): void {
+    if (source.notificationScheduled || source.disposed) return;
+    source.notificationScheduled = true;
+    const generation = this.generation;
+    queueMicrotask(() => {
+      source.notificationScheduled = false;
+      if (source.disposed || this.disposed || generation !== this.generation) return;
+      const snapshot = this.transcriptSnapshot(source);
+      for (const listener of [...source.listeners]) {
+        if (!source.listeners.has(listener)) continue;
+        try {
+          const returned = listener(snapshot);
+          if (isThenable(returned)) { source.listeners.delete(listener); void Promise.resolve(returned).catch(() => undefined); }
+        } catch { source.listeners.delete(listener); }
+      }
+    });
   }
 
   private projectActivity(agentId: AgentId, runId: RunId, event: RpcObservationEvent): void {
@@ -503,6 +859,8 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   }
 
   private releaseAttempt(attempt: PendingObservationAttempt): void {
+    if (attempt.discarded) return;
+    attempt.discarded = true;
     if (attempt.rejected) return;
     if (attempt.boundRunId !== undefined) {
       attempt.rejected = true;
@@ -554,6 +912,39 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     };
     retained.observation = freezeObservation(retained, this.nextRevision(), safeModel(input.model, input.thinkingLevel), RESTORATION_UNAVAILABLE, this.labelContext());
     this.agents.set(input.agentId, retained);
+    this.createTranscript(input.agentId, "stopped");
+  }
+
+  private projectTranscriptLifecycle(agent: RetainedAgent, runId: RunId | undefined): void {
+    const source = this.transcripts.get(agent.agentId);
+    if (source === undefined) return;
+    if (agent.lifecycleState === AgentState.Stopped) {
+      const terminalRunId = runId ?? source.boundRunId;
+      this.releaseRunCorrelations(source, terminalRunId);
+      if (terminalRunId !== undefined) for (const entry of source.entries) {
+        if (entry.open && "runId" in entry.item && entry.item.runId === terminalRunId) entry.open = false;
+      }
+      source.generationOpen = false;
+      source.transportHealthy = false;
+      delete source.boundRunId;
+      const availability = source.disabledRunId === (runId ?? agent.latestRunId) ? "unavailable" : "stopped";
+      if (source.availability !== availability) { source.availability = availability; this.commitTranscripts(new Set([source])); }
+    } else if (!source.transportHealthy && source.availability !== "unavailable") {
+      source.availability = "unavailable";
+      this.commitTranscripts(new Set([source]));
+    }
+  }
+
+  private disposeTranscript(source: RetainedTranscript | undefined): void {
+    if (source === undefined || source.disposed) return;
+    source.disposed = true;
+    source.notificationScheduled = false;
+    source.listeners.clear();
+    source.assistant.clear(); source.tools.clear();
+    source.revision = transcriptRevision(Number(source.revision) + 1);
+    source.availability = "unavailable";
+    source.snapshot = Object.freeze({ revision: source.revision, items: Object.freeze(source.entries.map((entry) => entry.item)),
+      truncatedBefore: source.truncatedBefore, availability: "unavailable" });
   }
 
   private replaceObservation(agent: RetainedAgent, overrides: Partial<Pick<AgentObservation, "taskLabel" | "activity" | "context">>): void {
@@ -662,25 +1053,31 @@ export function createTotalRpcObservationAdapter(
   identity: { readonly agentId: AgentId; readonly attemptId: RunAttemptId },
   report: (code: ObservationHealthCode) => void,
 ): RpcObservationSink {
-  const fail = (): void => {
+  const reportFailure = (): void => { try { report("projection-failed"); } catch { /* diagnostics are optional */ } };
+  const failObservation = (): void => {
     try { store.failObservationProjection(identity.agentId); } catch { /* total boundary */ }
-    try { report("projection-failed"); } catch { /* diagnostics are optional */ }
+    reportFailure();
+  };
+  const failTranscript = (): void => {
+    try { store.failObservationProjection(identity.agentId); } catch { /* total boundary */ }
+    try { store.failAttemptProjection(identity.agentId, identity.attemptId); } catch { /* total boundary */ }
+    reportFailure();
   };
   let discarded = false;
   const scoped = store.createRoutedAttemptSink(
     identity.agentId,
     identity.attemptId,
-    (event) => { try { context.observe(event); } catch { fail(); } },
-    (runId) => { try { context.reset(runId); } catch { fail(); } },
+    (event) => { try { context.observe(event); } catch { failObservation(); } },
+    (runId) => { try { context.reset(runId); } catch { failObservation(); } },
   );
   return {
-    record(event): void { if (discarded) return; try { scoped.record(event); } catch { fail(); } },
-    bind(runId): void { if (discarded) return; try { scoped.bind(runId); } catch { fail(); } },
+    record(event): void { if (discarded) return; try { scoped.record(event); } catch { failTranscript(); } },
+    bind(runId): void { if (discarded) return; try { scoped.bind(runId); } catch { failTranscript(); } },
     discard(): void {
       if (discarded) return;
       discarded = true;
-      try { scoped.discard(); } catch { fail(); }
-      try { context.dispose(); } catch { fail(); }
+      try { scoped.discard(); } catch { failTranscript(); }
+      try { context.dispose(); } catch { failObservation(); }
     },
   };
 }
@@ -732,3 +1129,45 @@ function directPosition(ordinal: AgentOrdinal): number { return Number(String(or
 function compareOrdinals(left: AgentOrdinal, right: AgentOrdinal): number { return directPosition(left) - directPosition(right); }
 function isThenable(value: void): value is never { return typeof value === "object" && value !== null && "then" in value; }
 function sameTask(observation: AgentObservation, candidate: string, context: ReturnType<AgentObservationStore["labelContext"]>): boolean { return observation.taskLabel === deriveTaskLabel(candidate, context); }
+
+const transcriptEncoder = new TextEncoder();
+function boundedTranscriptPrefix(value: string): typeof value & import("./domain.ts").TranscriptText {
+  const bytes = transcriptEncoder.encode(value);
+  if (bytes.byteLength <= MAX_TRANSCRIPT_FIELD_BYTES) return value as typeof value & import("./domain.ts").TranscriptText;
+  let output = ""; let used = 0;
+  for (const point of value) {
+    const encoded = transcriptEncoder.encode(point);
+    if (used + encoded.byteLength > MAX_TRANSCRIPT_FIELD_BYTES) break;
+    output += point; used += encoded.byteLength;
+  }
+  return output as typeof value & import("./domain.ts").TranscriptText;
+}
+function transcriptItemBytes(item: TranscriptItem): number {
+  if (item.kind === "user" || item.kind === "assistant" || item.kind === "thinking") return transcriptEncoder.encode(item.text).byteLength;
+  if (item.kind === "tool" && item.preview !== undefined) return transcriptEncoder.encode(item.preview).byteLength;
+  return 0;
+}
+function assistantKey(runId: RunId, generation: number, index: import("./domain.ts").RpcContentIndex, kind: "text" | "thinking"): string {
+  return `${runId}\u0000${generation}\u0000${index}\u0000${kind}`;
+}
+function oldestEntry(entries: readonly TranscriptEntry[], open: boolean): TranscriptEntry | undefined {
+  return entries.filter((entry) => entry.open === open).sort((left, right) => left.order - right.order)[0];
+}
+function sourceOverBudget(source: RetainedTranscript, budgets: TranscriptBudgets): boolean {
+  return source.entries.length > budgets.perSourceItems || source.entries.reduce((total, entry) => total + entry.bytes, 0) > budgets.perSourceBytes;
+}
+function storeOverBudget(sources: Iterable<RetainedTranscript>, budgets: TranscriptBudgets): boolean {
+  let items = 0; let bytes = 0;
+  for (const source of sources) { items += source.entries.length; bytes += source.entries.reduce((total, entry) => total + entry.bytes, 0); }
+  return items > budgets.globalItems || bytes > budgets.globalBytes;
+}
+function sameTranscriptItem(left: TranscriptItem, right: TranscriptItem): boolean {
+  if (left.kind !== right.kind || left.sequence !== right.sequence) return false;
+  if (left.kind === "notice" && right.kind === "notice") return left.code === right.code;
+  if (left.kind === "user" && right.kind === "user") return left.runId === right.runId && left.text === right.text;
+  if ((left.kind === "assistant" || left.kind === "thinking") && (right.kind === "assistant" || right.kind === "thinking")) {
+    return left.kind === right.kind && left.runId === right.runId && left.phase === right.phase && left.text === right.text;
+  }
+  if (left.kind === "tool" && right.kind === "tool") return left.runId === right.runId && left.tool === right.tool && left.phase === right.phase && left.preview === right.preview;
+  return false;
+}

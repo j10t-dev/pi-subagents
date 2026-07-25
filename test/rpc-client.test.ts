@@ -327,6 +327,8 @@ describe("RpcRunClient", () => {
       context: { kind: "unavailable" },
     });
     expect(store.directSnapshot()).toMatchObject({ health: { kind: "degraded", codes: ["projection-failed"] } });
+    expect(store.transcriptSource(AGENT)!.snapshot()).toMatchObject({ availability: "live" });
+    expect(store.transcriptSource(AGENT)!.snapshot().items.length).toBeGreaterThan(0);
   });
 
   test("issues unique, non-empty request IDs across commands", async () => {
