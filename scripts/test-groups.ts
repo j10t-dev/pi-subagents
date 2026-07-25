@@ -12,6 +12,8 @@ export interface TestGroup {
 export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string>>> = {
   unit: new Set([
     "agent-observation.test.ts",
+    "agent-widget-model.test.ts",
+    "agent-widget-render.test.ts",
     "assignment-identity.test.ts",
     "async-primitives.test.ts",
     "b0-gates.test.ts",
