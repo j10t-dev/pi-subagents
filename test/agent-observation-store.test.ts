@@ -927,6 +927,14 @@ describe("AgentObservationStore", () => {
     expect(store.directSnapshot()).toMatchObject({ health: { kind: "healthy" } });
   });
 
+  test("a store disposed before its first snapshot reports unavailable, never undefined", () => {
+    const store = new AgentObservationStore();
+    store.dispose();
+    const result = store.directSnapshot();
+    expect(result).toBeDefined();
+    expect(result.kind).toBe("unavailable");
+  });
+
   test("projection failure reconciles from authority and disposal is terminal", async () => {
     const store = new AgentObservationStore({ reconciliation: () => ({
       spawnSequence: [A],

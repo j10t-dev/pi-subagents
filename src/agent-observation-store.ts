@@ -196,7 +196,9 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   }
 
   directSnapshot(): DirectAgentSnapshotResult {
-    if (this.disposed) return this.snapshotCache!;
+    // A disposed store keeps serving its final snapshot, so a reader that outlives it sees the last
+    // truth rather than an empty tree. With no snapshot ever taken there is no such truth to serve.
+    if (this.disposed) return this.snapshotCache ?? { kind: "unavailable", finalRevision: this.revision };
     if (this.snapshotCache !== undefined) return this.snapshotCache;
     const all = [...this.agents.values()];
     const active = all.filter((agent) => agent.lifecycleState !== AgentState.Stopped)

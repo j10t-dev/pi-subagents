@@ -1,4 +1,5 @@
 import {
+  agentCount,
   delegationDepth,
   milliseconds,
   processCount,
@@ -49,6 +50,9 @@ export const MAX_AGGREGATE_AWAIT_BYTES = utf8Bytes(50_000);
 
 /** Maximum direct-child observations enumerated in one atomic snapshot/change set. */
 export const MAX_DIRECT_AGENT_OBSERVATIONS = 200;
+
+/** Maximum rows the widget retains and the direct source emits. Matches B1's direct bound. */
+export const MAX_WIDGET_ROWS = agentCount(MAX_DIRECT_AGENT_OBSERVATIONS);
 
 export const MAX_PENDING_ATTEMPT_EVENTS = 64;
 export const MAX_PENDING_ATTEMPT_BYTES = utf8Bytes(64 * 1024);
