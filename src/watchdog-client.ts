@@ -85,8 +85,8 @@ export class WatchdogClient {
 
   constructor(private readonly options: WatchdogClientOptions) {
     if (options.attempt.attemptId !== options.attemptId) throw new Error("watchdog attempt mismatch");
-    const script = options.watchdogPath ?? absolutePath(join(dirname(fileURLToPath(import.meta.url)), "../watchdog.mjs"));
-    const launcher = options.launcherPath ?? absolutePath(join(dirname(fileURLToPath(import.meta.url)), "../launcher.mjs"));
+    const script = options.watchdogPath ?? absolutePath(join(dirname(fileURLToPath(import.meta.url)), "runtime/watchdog.mjs"));
+    const launcher = options.launcherPath ?? absolutePath(join(dirname(fileURLToPath(import.meta.url)), "runtime/launcher.mjs"));
     rmSync(options.receiptPath, { force: true });
     const child = spawn(process.execPath, [
       script,

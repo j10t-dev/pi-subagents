@@ -1,10 +1,15 @@
+import { appendFileSync } from "node:fs";
+
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import createAgentWidgetExtension from "../agent-widget.ts";
+import createAgentWidgetExtension from "../src/agent-widget/extension.ts";
 import {
   contextLabel,
   deriveModelLabel,
+  deriveTaskLabel,
+  type AgentRow,
   type SubagentObservationPort,
+  type TaskLabelContext,
 } from "../src/agent-observation.ts";
 import {
   AgentState,
@@ -15,12 +20,17 @@ import {
   agentOrdinal,
   directAgentOrdinal,
   modelSpec,
-  type AgentRow,
 } from "../src/domain.ts";
 import { publishObservationPort } from "../src/observation-registry.ts";
+import { widgetGateTracePath } from "../src/paths.ts";
 
 const fixtureModel = deriveModelLabel(modelSpec("fixture/fixture"), "off");
 const unavailableContext = contextLabel({ kind: "unavailable" });
+const taskLabelContext: TaskLabelContext = {
+  knownAgentIds: new Set(),
+  knownRunIds: new Set(),
+  knownInternalPaths: new Set(),
+};
 
 const rows: readonly AgentRow[] = [
   {
@@ -28,7 +38,7 @@ const rows: readonly AgentRow[] = [
     depth: agentDepth(0),
     model: fixtureModel,
     context: unavailableContext,
-    taskLabel: "Observe first fixture agent",
+    taskLabel: deriveTaskLabel("Observe first fixture agent", taskLabelContext),
     state: AgentState.Running,
   },
   {
@@ -36,7 +46,7 @@ const rows: readonly AgentRow[] = [
     depth: agentDepth(0),
     model: fixtureModel,
     context: unavailableContext,
-    taskLabel: "Observe second fixture agent",
+    taskLabel: deriveTaskLabel("Observe second fixture agent", taskLabelContext),
     state: AgentState.Running,
   },
 ];
@@ -74,7 +84,11 @@ const port: SubagentObservationPort = {
 export default function installFixture(pi: ExtensionAPI): void {
   // --no-extensions means this fixture is the only extension loaded, so it owns
   // `pi-subagents-agents` alone and no controller exists to publish a competing port.
-  createAgentWidgetExtension(pi);
+  const rawTracePath = process.env.PI_WIDGET_GATE_EVENT_FILE;
+  const tracePath = rawTracePath === undefined ? undefined : widgetGateTracePath(rawTracePath);
+  createAgentWidgetExtension(pi, tracePath === undefined ? {} : {
+    trace: (event) => { appendFileSync(tracePath, `${event}\u000A`); },
+  });
   let publication: ReturnType<typeof publishObservationPort> | undefined;
   pi.on("session_start", () => {
     publication?.clear();

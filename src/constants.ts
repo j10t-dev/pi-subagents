@@ -1,4 +1,5 @@
 import {
+  MAX_WIDGET_ROW_COUNT,
   agentCount,
   delegationDepth,
   milliseconds,
@@ -49,7 +50,7 @@ export const MAX_STDERR_TAIL_BYTES = utf8Bytes(50_000);
 export const MAX_AGGREGATE_AWAIT_BYTES = utf8Bytes(50_000);
 
 /** Maximum direct-child observations enumerated in one atomic snapshot/change set. */
-export const MAX_DIRECT_AGENT_OBSERVATIONS = 200;
+export const MAX_DIRECT_AGENT_OBSERVATIONS = MAX_WIDGET_ROW_COUNT;
 
 /** Maximum rows the widget retains and the direct source emits. Matches B1's direct bound. */
 export const MAX_WIDGET_ROWS = agentCount(MAX_DIRECT_AGENT_OBSERVATIONS);

@@ -16,5 +16,5 @@
     "forceConsistentCasingInFileNames": true,
     "isolatedModules": true
   },
-  "include": ["index.ts", "agent-widget.ts", "src/**/*.ts", "test/**/*.ts"]
+  "include": ["index.ts", "src/**/*.ts", "test/**/*.ts", "scripts/widget-gate-fixture.ts"]
 }

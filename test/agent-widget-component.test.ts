@@ -139,7 +139,7 @@ function harness(rows: readonly AgentRow[], terminalRows = 40) {
 describe("AgentWidgetComponent", () => {
   test("enterFromEditor selects the first row and rowCount reports the model", () => {
     const h = harness([row("A1"), row("A2")]);
-    expect(h.component.rowCount()).toBe(2);
+    expect(Number(h.component.rowCount())).toBe(2);
     h.component.enterFromEditor();
     expect(h.selected()).toBe(agentOrdinal("A1"));
   });
@@ -205,7 +205,7 @@ describe("AgentWidgetComponent", () => {
       (error: unknown) => { reported.push(error); },
     );
     expect(component.render(120)).toEqual([]);
-    expect(component.rowCount()).toBe(0);
+    expect(Number(component.rowCount())).toBe(0);
     expect(() => component.handleInput("x")).not.toThrow();
     expect(() => component.enterFromEditor()).not.toThrow();
     expect(reported).toHaveLength(4);

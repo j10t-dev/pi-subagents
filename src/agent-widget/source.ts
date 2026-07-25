@@ -1,6 +1,7 @@
 import type {
   AgentRow,
   AgentWidgetSnapshot,
+  DirectAgentSnapshotResult,
   AgentWidgetSource,
   SubagentObservationPort,
   TranscriptSource,
@@ -18,7 +19,7 @@ export interface AgentWidgetSourceDeps {
   /** Unused by the direct source; taken so recursive-relay replaces the body without touching wiring. */
   readonly agentDir: AbsolutePath;
   readonly maxRows: AgentCount;
-  /** Never called by the direct source; recursive-relay reports `watch-unavailable` through it. */
+  /** Receives a bounded code once when direct projection fails; the adapter is contained. */
   readonly onDiagnostic?: (code: string) => void;
 }
 
@@ -37,6 +38,8 @@ export function createAgentWidgetSource(
   let revision = 0;
   let scheduled = false;
   let disposed = false;
+  let portUnsubscribed = false;
+  let projectionFailureReported = false;
   let current: AgentWidgetSnapshot = {
     revision: agentWidgetRevision(0),
     rows: [],
@@ -45,8 +48,20 @@ export function createAgentWidgetSource(
     degraded: true,
   };
 
+  const reportProjectionFailure = (): void => {
+    if (projectionFailureReported) return;
+    projectionFailureReported = true;
+    try { deps.onDiagnostic?.("projection-failed"); } catch { /* diagnostic adapter boundary */ }
+  };
+
   const project = (): AgentWidgetSnapshot => {
-    const result = port.directSnapshot();
+    let result: DirectAgentSnapshotResult;
+    try {
+      result = port.directSnapshot();
+    } catch {
+      reportProjectionFailure();
+      return { ...current, revision: agentWidgetRevision(revision), degraded: true };
+    }
     if (result.kind === "unavailable") {
       // A disposed store or a lost transport is not a statement that the children are gone.
       // Retain the last good rows and report incompleteness rather than asserting an empty tree.
@@ -57,7 +72,9 @@ export function createAgentWidgetSource(
     for (const entry of result.entries) {
       if (rows.length >= limit) break;
       rows.push(entry.row);
-      nextOwners.set(entry.row.ordinal, entry.agentId);
+      // The model retains the first row for a duplicate ordinal, so transcript correlation must
+      // retain that same row's owner rather than silently following a later duplicate.
+      if (!nextOwners.has(entry.row.ordinal)) nextOwners.set(entry.row.ordinal, entry.agentId);
     }
     owners = nextOwners;
     return {
@@ -74,7 +91,14 @@ export function createAgentWidgetSource(
     revision += 1;
     current = project();
     for (const listener of [...listeners]) {
-      if (listeners.has(listener)) listener();
+      if (!listeners.has(listener)) continue;
+      try {
+        listener();
+      } catch {
+        // A queued source refresh is an isolation boundary. Remove a throwing subscriber so it
+        // cannot escape another microtask or block healthy subscribers on later revisions.
+        listeners.delete(listener);
+      }
     }
   };
 
@@ -100,10 +124,11 @@ export function createAgentWidgetSource(
       return () => { listeners.delete(onChange); };
     },
     dispose: (): void => {
-      if (disposed) return;
       disposed = true;
-      unsubscribePort();
       listeners.clear();
+      if (portUnsubscribed) return;
+      unsubscribePort();
+      portUnsubscribed = true;
     },
   };
 }

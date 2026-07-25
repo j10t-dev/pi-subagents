@@ -7,6 +7,7 @@ import type {
   DiagnosticsPath,
   OutputPath,
   SessionPath,
+  WidgetGateTracePath,
 } from "./domain.ts";
 
 /** Brands an already-resolved absolute path. Resolves `value` against `cwd` if relative. */
@@ -16,6 +17,17 @@ export function absolutePath(value: string, cwd = process.cwd()): AbsolutePath {
   }
   const resolved = resolve(cwd, value);
   return resolved as AbsolutePath;
+}
+
+const TRACE_PATH_CONTROL = /[\u0000-\u001f\u007f]/u;
+
+/** Validates the gate-only event sink without resolving a caller-controlled relative path. */
+export function widgetGateTracePath(value: string): WidgetGateTracePath {
+  if (!isAbsolute(value) || TRACE_PATH_CONTROL.test(value)) {
+    throw new Error("invalid_input: widget gate trace path must be absolute and control-free");
+  }
+  // `isAbsolute` and the NUL check prove the path invariants before applying both brands.
+  return value as WidgetGateTracePath;
 }
 
 /**

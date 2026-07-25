@@ -3,17 +3,23 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 
 import type { AgentDisplayState, AgentRow, AgentWidgetSnapshot } from "../src/agent-observation.ts";
 import { emptyModel, replaceRows, selectFirst } from "../src/agent-widget/model.ts";
-import { renderRows, type AgentWidgetView } from "../src/agent-widget/render.ts";
+import { renderRows as renderBrandedRows, type AgentWidgetView } from "../src/agent-widget/render.ts";
 import {
   AgentState,
   agentCount,
   agentDepth,
   agentOrdinal,
   agentWidgetRevision,
+  renderWidth,
+  widgetRowBudget,
   type ContextLabel,
   type ModelLabel,
   type TaskLabel,
 } from "../src/domain.ts";
+
+function renderRows(view: AgentWidgetView, width: number, budget: number): string[] {
+  return renderBrandedRows(view, renderWidth(width), widgetRowBudget(budget));
+}
 
 function row(ordinal: string, depth = 0, taskLabel = "Research terminal UX"): AgentRow {
   return {

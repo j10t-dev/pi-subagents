@@ -8,6 +8,7 @@ import type {
   DiagnosticsPath,
   OutputPath,
   SessionPath,
+  WidgetGateTracePath,
 } from "../src/domain.ts";
 import {
   absolutePath,
@@ -19,11 +20,20 @@ import {
   restoredOutputPath,
   restoredSessionPath,
   restoredStatePath,
+  widgetGateTracePath,
   writeOwnerOnlyFile,
 } from "../src/paths.ts";
 import { temporaryStateRoot } from "./support/temp-state.ts";
 
 describe("paths", () => {
+  test("widget gate trace paths require an absolute control-free path", () => {
+    const path: WidgetGateTracePath = widgetGateTracePath("/tmp/widget-gate-events.txt");
+    expect(String(path)).toBe("/tmp/widget-gate-events.txt");
+    expect(() => widgetGateTracePath("relative/events.txt")).toThrow(/invalid_input/);
+    expect(() => widgetGateTracePath("/tmp/events\u0000.txt")).toThrow(/invalid_input/);
+    expect(() => widgetGateTracePath("/tmp/events\u000Aprivate.txt")).toThrow(/invalid_input/);
+  });
+
   test("a sibling directory with a shared prefix is never contained", () => {
     expect(isContainedPath("/trusted/project", "/trusted/project2")).toBe(false);
     expect(isContainedPath("/trusted/project", "/trusted/project2/file.txt")).toBe(false);

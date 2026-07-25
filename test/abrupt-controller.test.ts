@@ -48,8 +48,8 @@ describe("abrupt controller restoration matrix", () => {
       await backend.preflight();
       child = spawn(NODE, [
         join(import.meta.dir, "fixtures/abrupt-controller.mjs"),
-        join(import.meta.dir, "../watchdog.mjs"),
-        join(import.meta.dir, "../launcher.mjs"),
+        join(import.meta.dir, "../src/runtime/watchdog.mjs"),
+        join(import.meta.dir, "../src/runtime/launcher.mjs"),
         attemptId,
         receipt,
         scope,
@@ -126,7 +126,7 @@ describe("abrupt controller restoration matrix", () => {
     const child = spawn(process.execPath, [
       join(import.meta.dir, "fixtures/abrupt-controller.mjs"),
       join(import.meta.dir, "fixtures/fake-watchdog.mjs"),
-      join(import.meta.dir, "../launcher.mjs"),
+      join(import.meta.dir, "../src/runtime/launcher.mjs"),
       attemptId,
       receipt,
       scope,

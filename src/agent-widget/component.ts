@@ -9,6 +9,13 @@ import {
   type AgentWidgetModel,
 } from "./model.ts";
 import { renderRows, type AgentWidgetView } from "./render.ts";
+import {
+  renderWidth,
+  terminalRows,
+  widgetRowCount,
+  type WidgetRowBudget,
+  type WidgetRowCount,
+} from "../domain.ts";
 
 /**
  * A view over a model the extension owns. It holds no state that must survive a remount: it reads
@@ -32,16 +39,19 @@ export class AgentWidgetComponent implements Component, Focusable {
 
   render(width: number): string[] {
     return this.guard(() => {
-      // Recomputed per frame rather than cached, so a terminal resize takes effect on the next
-      // frame with no resize subscription.
-      return renderRows(this.view(), width, rowBudget(this.tui.terminal.rows));
+      // `Component.render` supplies a raw number by Pi's public interface. Brand immediately.
+      const safeWidth = renderWidth(width);
+      // `Terminal.rows` is also a raw public Pi adapter value. Normalise before core use.
+      const rows = terminalRows(this.tui.terminal.rows);
+      return renderRows(this.view(), safeWidth, rowBudget(rows));
     }, []);
   }
 
   handleInput(data: string): void {
     this.guard(() => {
       const view = this.view();
-      const budget = rowBudget(this.tui.terminal.rows);
+      // `Terminal.rows` is raw only because Pi's public terminal contract requires it.
+      const budget = rowBudget(terminalRows(this.tui.terminal.rows));
       if (matchesKey(data, Key.down)) return this.move(view.model, "down", budget);
       if (matchesKey(data, Key.up)) return this.move(view.model, "up", budget);
       if (matchesKey(data, Key.escape)) return this.exit(view.model);
@@ -61,15 +71,15 @@ export class AgentWidgetComponent implements Component, Focusable {
     this.guard(() => {}, undefined);
   }
 
-  rowCount(): number {
-    return this.guard(() => this.view().model.rows.length, 0);
+  rowCount(): WidgetRowCount {
+    return this.guard(() => widgetRowCount(this.view().model.rows.length), widgetRowCount(0));
   }
 
   enterFromEditor(): void {
     this.guard(() => this.applyModel(selectFirst(this.view().model)), undefined);
   }
 
-  private move(model: AgentWidgetModel, direction: "up" | "down", budget: number): void {
+  private move(model: AgentWidgetModel, direction: "up" | "down", budget: WidgetRowBudget): void {
     const result = moveSelection(model, direction, budget);
     this.applyModel(result.model);
     if (result.exit) this.returnFocusToEditor();

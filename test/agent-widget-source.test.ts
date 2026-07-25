@@ -98,6 +98,63 @@ describe("createAgentWidgetSource", () => {
     source.dispose();
   });
 
+  test("contains an initial direct projection failure and tears setup down cleanly", () => {
+    const diagnostics: string[] = [];
+    const listeners = new Set<(change: ObservationChange) => void>();
+    const port: SubagentObservationPort = {
+      observation: () => undefined,
+      directSnapshot: () => { throw new Error("initial projection boom"); },
+      transcriptSource: () => undefined,
+      subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    };
+
+    const source = createAgentWidgetSource(port, {
+      agentDir: AGENT_DIR,
+      maxRows: MAX_WIDGET_ROWS,
+      onDiagnostic: (code) => { diagnostics.push(code); },
+    });
+
+    expect(source.snapshot().rows).toEqual([]);
+    expect(source.snapshot().degraded).toBe(true);
+    expect(diagnostics).toEqual(["projection-failed"]);
+    source.dispose();
+    expect(listeners.size).toBe(0);
+  });
+
+  test("queued direct projection failures preserve the last good snapshot and report once", async () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Research terminal UX");
+    let projectionFails = false;
+    const diagnostics: string[] = [];
+    const port: SubagentObservationPort = {
+      observation: (id) => store.observation(id),
+      directSnapshot: () => {
+        if (projectionFails) throw new Error("queued projection boom");
+        return store.directSnapshot();
+      },
+      transcriptSource: (id) => store.transcriptSource(id),
+      subscribe: (listener) => store.subscribe(listener),
+    };
+    const source = createAgentWidgetSource(port, {
+      agentDir: AGENT_DIR,
+      maxRows: MAX_WIDGET_ROWS,
+      onDiagnostic: (code) => { diagnostics.push(code); throw new Error("diagnostic adapter boom"); },
+    });
+    const lastGood = source.snapshot();
+
+    projectionFails = true;
+    register(store, "agent-b", 2, "Review findings");
+    await flush();
+    register(store, "agent-c", 3, "Summarise");
+    await flush();
+
+    expect(source.snapshot().rows).toEqual(lastGood.rows);
+    expect(Number(source.snapshot().revision)).toBeGreaterThan(Number(lastGood.revision));
+    expect(source.snapshot().degraded).toBe(true);
+    expect(diagnostics).toEqual(["projection-failed"]);
+    source.dispose();
+  });
+
   test("retains the last good rows when the port becomes unavailable", async () => {
     const store = new AgentObservationStore();
     register(store, "agent-a", 1, "Research terminal UX");
@@ -131,6 +188,71 @@ describe("createAgentWidgetSource", () => {
     expect(after.degraded).toBe(true);
     expect(Number(after.revision)).toBeGreaterThan(Number(atRevision));
     source.dispose();
+  });
+
+  test("removes a throwing subscriber without blocking healthy subscribers", async () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Research terminal UX");
+    const source = sourceOver(store);
+    let throwingCalls = 0;
+    let healthyCalls = 0;
+    source.subscribe(() => { throwingCalls += 1; throw new Error("subscriber boom"); });
+    source.subscribe(() => { healthyCalls += 1; });
+
+    register(store, "agent-b", 2, "Review findings");
+    await flush();
+    register(store, "agent-c", 3, "Summarise");
+    await flush();
+
+    expect(throwingCalls).toBe(1);
+    expect(healthyCalls).toBe(2);
+    source.dispose();
+  });
+
+  test("keeps the first owner when duplicate source ordinals are projected", () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "First owner");
+    register(store, "agent-b", 2, "Duplicate owner");
+    const snapshot = store.directSnapshot();
+    if (snapshot.kind !== "snapshot") throw new Error("expected snapshot fixture");
+    const first = snapshot.entries[0]!;
+    const second = snapshot.entries[1]!;
+    const port: SubagentObservationPort = {
+      observation: (id) => store.observation(id),
+      directSnapshot: () => ({
+        ...snapshot,
+        entries: [first, { ...second, row: { ...second.row, ordinal: first.row.ordinal } }],
+      }),
+      transcriptSource: (id) => store.transcriptSource(id),
+      subscribe: () => () => {},
+    };
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+
+    expect(source.transcriptSource(agentOrdinal("A1"))).toBe(store.transcriptSource(agentId("agent-a")));
+    source.dispose();
+  });
+
+  test("disposal retries a transient observation-port unsubscription failure", () => {
+    const store = new AgentObservationStore();
+    let attempts = 0;
+    const port: SubagentObservationPort = {
+      observation: (id) => store.observation(id),
+      directSnapshot: () => store.directSnapshot(),
+      transcriptSource: (id) => store.transcriptSource(id),
+      subscribe: (listener) => {
+        const unsubscribe = store.subscribe(listener);
+        return () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error("port unsubscribe boom");
+          unsubscribe();
+        };
+      },
+    };
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+
+    expect(() => source.dispose()).toThrow("port unsubscribe boom");
+    expect(() => source.dispose()).not.toThrow();
+    expect(attempts).toBe(2);
   });
 
   test("disposal stops projecting", async () => {

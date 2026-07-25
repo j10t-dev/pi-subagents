@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-import createAgentWidgetExtension from "./agent-widget.ts";
 import { canDelegateFrom, parseExtensionLaunchContext, type DelegationLimits } from "./src/delegation-policy.ts";
 import { onAmbientStatus, setAmbientStatus } from "./src/ambient-status-lease.ts";
 import { SubagentController } from "./src/controller.ts";
@@ -16,10 +15,9 @@ import type { SubagentObservationPort } from "./src/agent-observation.ts";
 import { absolutePath } from "./src/paths.ts";
 import { loadSubagentSettings, readGlobalMaxDepth, readSubagentSettingsFiles, type SubagentSettingsResolved } from "./src/settings.ts";
 import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema, subagentToolSchemas, createSubagentTools, type SubagentToolName, type SubagentToolRegistry } from "./src/tools.ts";
+import { WidgetDiagnosticCode, widgetDiagnostic } from "./src/widget-diagnostics.ts";
 
 const STATUS_KEY = "pi-subagents";
-const ANSI_SEQUENCE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/gu;
 type ToolRegistrationSpec<K extends SubagentToolName> = {
   readonly label: string;
   readonly description: string;
@@ -62,24 +60,18 @@ export type ExtensionRegistration =
   | { readonly enabled: true }
   | { readonly enabled: false; readonly diagnostic?: string };
 
+export type WidgetStarter = (pi: ExtensionAPI) => void | Promise<void>;
+
 export interface PiSubagentsExtensionOptions {
   platform: string;
   nodeVersion?: string;
   registration: ExtensionRegistration;
   createController(context: ExtensionContext, api: ExtensionAPI, refreshStatus: () => void): ExtensionController;
   diagnostic(message: string): void;
-  /** Installs the TUI widget. Omitted by unit tests; supplied at the production call site. */
-  startWidget?(pi: ExtensionAPI): void;
-}
-
-function presentationError(error: unknown): string {
-  try {
-    const value = error instanceof Error ? error.message : String(error);
-    const sanitised = String(value).replace(ANSI_SEQUENCE, "").replace(CONTROL_CHARACTERS, " ").replace(/\s+/gu, " ").trim();
-    return sanitised === "" ? "unknown error" : sanitised;
-  } catch {
-    return "unknown error";
-  }
+  /** Synchronous test seam retained for headless composition tests. */
+  startWidget?: WidgetStarter;
+  /** Loads the widget asynchronously before tools are registered. Production supplies this seam. */
+  loadWidget?(): Promise<WidgetStarter>;
 }
 
 export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions): ExtensionFactory {
@@ -98,22 +90,6 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
         pi.on("session_start", (_event, context) => { context.ui.notify(diagnostic, "warning"); });
       }
       return;
-    }
-
-    // The widget is no longer an optional install, so this is the boundary that keeps a broken
-    // widget from taking the session's tools and child lifecycle with it. `diagnostic` is stderr
-    // and fires now, at load time, before any TUI exists; the notify surfaces it to a user who
-    // does get one. Same two-channel shape as the registration diagnostic above.
-    try {
-      options.startWidget?.(pi);
-    } catch (error) {
-      const detail = `Subagent widget unavailable: ${presentationError(error)}`;
-      try { options.diagnostic(detail); } catch { /* startup diagnostic boundary */ }
-      try {
-        pi.on("session_start", (_event, context) => {
-          try { context.ui.notify(detail, "warning"); } catch { /* startup diagnostic boundary */ }
-        });
-      } catch { /* startup notification registration boundary */ }
     }
 
     let current: ExtensionController | undefined;
@@ -136,25 +112,21 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       if (current === owner) setAmbientStatus(owner.status());
     };
     const resolveCurrent = (): ExtensionController | undefined => current;
-    registerSubagentTool(pi, "spawn_agent", TOOL_SPECS.spawn_agent, resolveCurrent, refreshAfterTool);
-    registerSubagentTool(pi, "send_input", TOOL_SPECS.send_input, resolveCurrent, refreshAfterTool);
-    registerSubagentTool(pi, "await_agent", TOOL_SPECS.await_agent, resolveCurrent, refreshAfterTool);
-    registerSubagentTool(pi, "stop_agent", TOOL_SPECS.stop_agent, resolveCurrent, refreshAfterTool);
+    const registerTools = (): void => {
+      registerSubagentTool(pi, "spawn_agent", TOOL_SPECS.spawn_agent, resolveCurrent, refreshAfterTool);
+      registerSubagentTool(pi, "send_input", TOOL_SPECS.send_input, resolveCurrent, refreshAfterTool);
+      registerSubagentTool(pi, "await_agent", TOOL_SPECS.await_agent, resolveCurrent, refreshAfterTool);
+      registerSubagentTool(pi, "stop_agent", TOOL_SPECS.stop_agent, resolveCurrent, refreshAfterTool);
+    };
 
-    pi.on("session_start", (_event, context) => serialiseLifecycle(async () => {
-      if (current !== undefined) await closeCurrent();
-      let controller!: ExtensionController;
-      const refreshStatus = (): void => {
-        if (current === controller && activeContext === context) setAmbientStatus(controller.status());
-      };
-      controller = options.createController(context, pi, refreshStatus);
-      current = controller;
-      activeContext = context;
-      await controller.restore();
-      const port = controller.observationPort?.();
-      if (port !== undefined && current === controller) publication = { owner: controller, token: publishObservationPort(port) };
-      setAmbientStatus(controller.status());
-    }));
+    // Replacement is deliberately split across two handlers. This synchronous first phase clears
+    // the old projection before the widget's handler tears down and rebinds its context. The
+    // continuation is registered only after widget startup, so replacement publication cannot
+    // reach the old context and the new widget can acquire its status lease before status refresh.
+    pi.on("session_start", () => {
+      setAmbientStatus(undefined);
+      clearPublication();
+    });
     pi.on("session_before_tree", () => ({ cancel: current?.beforeTree?.() === false }));
     pi.on("session_tree", (_event, context) => serialiseLifecycle(async () => {
       if (current === undefined) return;
@@ -179,10 +151,74 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       unsubscribeStatus?.(); unsubscribeStatus = undefined;
     }));
 
+    let widgetStartupReported = false;
+    const widgetStartup = installWidget();
+    if (widgetStartup !== undefined) {
+      return widgetStartup.then(finishInstallation);
+    }
+    finishInstallation();
+
+    function finishInstallation(): void {
+      pi.on("session_start", (_event, context) => serialiseLifecycle(async () => {
+        if (current !== undefined) await closeCurrent();
+        let controller!: ExtensionController;
+        const refreshStatus = (): void => {
+          if (current === controller && activeContext === context) setAmbientStatus(controller.status());
+        };
+        controller = options.createController(context, pi, refreshStatus);
+        current = controller;
+        activeContext = context;
+        await controller.restore();
+        const port = controller.observationPort?.();
+        if (port !== undefined && current === controller) {
+          publication = { owner: controller, token: publishObservationPort(port) };
+        }
+        setAmbientStatus(controller.status());
+      }));
+      registerTools();
+    }
+
+    function installWidget(): void | Promise<void> {
+      if (options.loadWidget !== undefined) {
+        try {
+          return options.loadWidget()
+            .then((startWidget) => startWidget(pi))
+            .catch(() => { reportWidgetStartupFailure(); });
+        } catch {
+          reportWidgetStartupFailure();
+          return;
+        }
+      }
+      if (options.startWidget === undefined) return;
+      try {
+        const pending = options.startWidget(pi);
+        return pending?.catch(() => { reportWidgetStartupFailure(); });
+      } catch {
+        reportWidgetStartupFailure();
+      }
+    }
+
+    function reportWidgetStartupFailure(): void {
+      if (widgetStartupReported) return;
+      widgetStartupReported = true;
+      const detail = widgetDiagnostic(WidgetDiagnosticCode.StartupFailed);
+      try { options.diagnostic(detail); } catch { /* startup diagnostic boundary */ }
+      try {
+        pi.on("session_start", (_event, context) => {
+          try { context.ui.notify(detail, "warning"); } catch { /* startup diagnostic boundary */ }
+        });
+      } catch { /* startup notification registration boundary */ }
+    }
+
     function serialiseLifecycle(operation: () => Promise<void>): Promise<void> {
       const result = lifecycleTail.catch(() => undefined).then(operation);
       lifecycleTail = result.catch(() => undefined);
       return result;
+    }
+
+    function clearPublication(): void {
+      publication?.token.clear();
+      publication = undefined;
     }
 
     async function closeCurrent(): Promise<void> {
@@ -190,10 +226,7 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       const owned = current;
       if (owned === undefined) return;
       const ownedContext = activeContext;
-      if (publication?.owner === owned) {
-        publication.token.clear();
-        publication = undefined;
-      }
+      if (publication?.owner === owned) clearPublication();
       const operation = owned.shutdown().then(() => {
         if (current === owned) current = undefined;
         if (activeContext === ownedContext) activeContext = undefined;
@@ -260,7 +293,7 @@ const extension = createPiSubagentsExtension({
   platform: process.platform,
   nodeVersion: process.versions.node,
   registration: defaultRegistration,
-  startWidget: createAgentWidgetExtension,
+  loadWidget: async () => (await import("./src/agent-widget/extension.ts")).default,
   createController: (context, pi, refreshStatus) => {
     const agentDir = absolutePath(getAgentDir());
     const cwd = absolutePath(context.cwd);

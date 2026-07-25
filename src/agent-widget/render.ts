@@ -1,6 +1,7 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import type { AgentRow } from "../agent-observation.ts";
+import type { RenderWidth, WidgetRowBudget } from "../domain.ts";
 import { visibleRows, type AgentWidgetModel } from "./model.ts";
 
 export interface AgentWidgetView {
@@ -22,11 +23,14 @@ const LABEL_FLOOR = 8;
 const ANSI = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/gu;
 
-export function renderRows(view: AgentWidgetView, width: number, budget: number): string[] {
+export function renderRows(view: AgentWidgetView, width: RenderWidth, budget: WidgetRowBudget): string[] {
   const rows = visibleRows(view.model, budget);
-  const step = chooseStep(rows, width);
-  const lines = step === undefined ? [] : rows.map((_, index) => line(rows, index, view.model, step, width));
-  return [header(view, lines.length, width), ...lines];
+  // Pi's public width utilities require raw numbers; `RenderWidth` has already normalised and
+  // bounded the adapter value before this deliberate unbranding.
+  const columns = Number(width);
+  const step = chooseStep(rows, columns);
+  const lines = step === undefined ? [] : rows.map((_, index) => line(rows, index, view.model, step, columns));
+  return [header(view, lines.length, columns), ...lines];
 }
 
 function header(view: AgentWidgetView, rendered: number, width: number): string {

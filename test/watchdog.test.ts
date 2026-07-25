@@ -49,7 +49,7 @@ describe("cgroup-v2 watchdog", () => {
       attemptId: fixture.attemptId,
       receiptPath: fixture.receipt,
       attempt: fixture.attempt,
-      launcherPath: join(import.meta.dir, "../launcher.mjs") as AbsolutePath,
+      launcherPath: join(import.meta.dir, "../src/runtime/launcher.mjs") as AbsolutePath,
       timeoutMs: milliseconds(1_000),
     }, { testEnvironment: { PI_WATCHDOG_FAKE_CGROUP: "1" } }));
     clients.push(client);
@@ -372,8 +372,8 @@ function watchdogFixture(options: { blockEmpty?: boolean; killFailure?: boolean;
     attempt,
     watchdogPath: options.watchdogPath ?? (useFakeHarness
       ? join(import.meta.dir, "fixtures/fake-watchdog.mjs") as AbsolutePath
-      : join(import.meta.dir, "../watchdog.mjs") as AbsolutePath),
-    launcherPath: join(import.meta.dir, "../launcher.mjs") as AbsolutePath,
+      : join(import.meta.dir, "../src/runtime/watchdog.mjs") as AbsolutePath),
+    launcherPath: join(import.meta.dir, "../src/runtime/launcher.mjs") as AbsolutePath,
     timeoutMs: milliseconds(1_000),
   });
   if (client !== undefined) clients.push(client);

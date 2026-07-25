@@ -45,6 +45,12 @@ describe("widget focus gate", () => {
     expect(screenHasAutocompleteSince(historical, historical.length)).toBe(false);
   });
 
+  test("rejects generic command text without a fresh selector count indicator", () => {
+    const before = "historical output";
+    expect(screenHasAutocompleteSince(`${before}\nCommands\n/help\nsettings`, before.length)).toBe(false);
+    expect(screenHasAutocompleteSince(`${before}\nautocomplete settings`, before.length)).toBe(false);
+  });
+
   test("reads the selector selection indicator from its frame", () => {
     expect(selectorSelectionIndicator("\u001b[2K❯ settings ... (1/23)")).toBe("❯");
     expect(selectorSelectionIndicator("\u001b[2K→ settings Open settings menu\n\u001b[2K  (1/23)")).toBe("→");
@@ -84,5 +90,15 @@ describe("widget focus gate", () => {
     expect(diagnostic).toContain("trace=widget-focused");
     expect(diagnostic).not.toContain("private model text");
     expect(diagnostic).not.toContain("unknown-secret");
+  });
+
+  test("deduplicates repeated trace events within the finite allow-list bound", () => {
+    const repeated = Array.from({ length: 10_000 }, (_, index) => REQUIRED_EVENTS[index % REQUIRED_EVENTS.length]!);
+    const diagnostic = safeGateDiagnostic("repeated events", "", repeated);
+
+    expect(diagnostic.length).toBeLessThanOrEqual(300);
+    for (const event of REQUIRED_EVENTS.slice(1)) {
+      expect(diagnostic.split(event).length - 1).toBe(1);
+    }
   });
 });

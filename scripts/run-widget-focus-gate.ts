@@ -71,8 +71,12 @@ export function safeGateDiagnostic(
     return code < 32 || code === 127;
   }).length;
   const escapeCount = screen.match(ANSI_ESCAPE)?.length ?? 0;
-  const knownEvents = events.filter((event) => DIAGNOSTIC_EVENTS.has(event));
-  return `phase=${safePhase}; outputLength=${screen.length}; controls=${controlCount}; escapes=${escapeCount}; trace=${knownEvents.join(",") || "none"}`;
+  const knownEvents = new Set<string>();
+  for (const event of events) {
+    if (DIAGNOSTIC_EVENTS.has(event)) knownEvents.add(event);
+    if (knownEvents.size === DIAGNOSTIC_EVENTS.size) break;
+  }
+  return `phase=${safePhase}; outputLength=${screen.length}; controls=${controlCount}; escapes=${escapeCount}; trace=${[...knownEvents].join(",") || "none"}`;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs: number, detail: () => string): Promise<void> {
@@ -116,8 +120,10 @@ export function responseMarkerAppeared(screen: string, marker: string, after: nu
 /** A selector belongs to this slash only when its frame was emitted after that slash was typed. */
 export function screenHasAutocompleteSince(screen: string, after: number): boolean {
   const added = screen.slice(after);
-  return /(?:Commands|command|autocomplete|\/help)/iu.test(added)
-    || (/\bsettings\b/iu.test(added) && /\(\d+\/\d+\)/u.test(added));
+  // Generic command text can be historical repaint or help output. Every accepted branch needs
+  // the selector's fresh position/total indicator from the post-slash frame.
+  return /\(\d+\/\d+\)/u.test(added)
+    && /(?:Commands|command|autocomplete|\/help|\bsettings\b)/iu.test(added);
 }
 
 /** Returns the selector-row marker that moves when Down changes the selected command. */

@@ -18,6 +18,11 @@ import {
   agentDepth,
   agentOrdinal,
   agentWidgetRevision,
+  renderWidth,
+  terminalRows,
+  widgetOffset,
+  widgetRowBudget,
+  widgetRowCount,
   type ContextLabel,
   type ModelLabel,
   type TaskLabel,
@@ -34,6 +39,8 @@ function row(ordinal: string, overrides: Partial<AgentRow> = {}): AgentRow {
     ...overrides,
   };
 }
+
+const budget = (value: number) => widgetRowBudget(value);
 
 function snapshot(rows: readonly AgentRow[], total = rows.length, omitted = 0): AgentWidgetSnapshot {
   return {
@@ -119,7 +126,7 @@ describe("replaceRows", () => {
 describe("selection", () => {
   test("keeps the selected ordinal across reorder and completion", () => {
     let model = selectFirst(replaceRows(emptyModel(), snapshot([row("A1"), row("A2")] )));
-    model = moveSelection(model, "down", 10).model;
+    model = moveSelection(model, "down", budget(10)).model;
     expect(model.selected).toBe(agentOrdinal("A2"));
     model = replaceRows(model, snapshot([row("A2", { state: "completed" as AgentDisplayState }), row("A1")]));
     expect(model.selected).toBe(agentOrdinal("A2"));
@@ -127,8 +134,8 @@ describe("selection", () => {
 
   test("clamps the previous index when the selected ordinal disappears", () => {
     let model = selectFirst(replaceRows(emptyModel(), snapshot([row("A1"), row("A2"), row("A3")] )));
-    model = moveSelection(model, "down", 10).model;
-    model = moveSelection(model, "down", 10).model;
+    model = moveSelection(model, "down", budget(10)).model;
+    model = moveSelection(model, "down", budget(10)).model;
     expect(model.selected).toBe(agentOrdinal("A3"));
     model = replaceRows(model, snapshot([row("A1"), row("A2")]));
     expect(model.selected).toBe(agentOrdinal("A2"));
@@ -136,10 +143,10 @@ describe("selection", () => {
 
   test("does not wrap, and signals exit above the first row", () => {
     const model = selectFirst(replaceRows(emptyModel(), snapshot([row("A1"), row("A2")] )));
-    const down = moveSelection(moveSelection(model, "down", 10).model, "down", 10);
+    const down = moveSelection(moveSelection(model, "down", budget(10)).model, "down", budget(10));
     expect(down.model.selected).toBe(agentOrdinal("A2"));
     expect(down.exit).toBe(false);
-    const up = moveSelection(model, "up", 10);
+    const up = moveSelection(model, "up", budget(10));
     expect(up.exit).toBe(true);
     expect(up.model.selected).toBe(undefined);
   });
@@ -151,26 +158,37 @@ describe("selection", () => {
   });
 });
 
+describe("widget measurements", () => {
+  test("normalises non-finite and out-of-range adapter values", () => {
+    expect(Number(renderWidth(Number.NaN))).toBe(0);
+    expect(Number(renderWidth(Number.POSITIVE_INFINITY))).toBe(10_000);
+    expect(Number(terminalRows(Number.NEGATIVE_INFINITY))).toBe(0);
+    expect(Number(widgetOffset(3.9))).toBe(3);
+    expect(Number(widgetRowBudget(Number.POSITIVE_INFINITY))).toBe(Number(MAX_WIDGET_ROWS));
+    expect(Number(widgetRowCount(-4))).toBe(0);
+  });
+});
+
 describe("viewport", () => {
   test("rowBudget clamps terminal quarters into [3, 10]", () => {
-    expect(rowBudget(4)).toBe(3);
-    expect(rowBudget(24)).toBe(6);
-    expect(rowBudget(200)).toBe(10);
+    expect(Number(rowBudget(terminalRows(4)))).toBe(3);
+    expect(Number(rowBudget(terminalRows(24)))).toBe(6);
+    expect(Number(rowBudget(terminalRows(200)))).toBe(10);
   });
 
   test("the window follows the selection and scrolls only when it would leave", () => {
     const rows = Array.from({ length: 8 }, (_, index) => row(`A${index + 1}`));
     let model = selectFirst(replaceRows(emptyModel(), snapshot(rows)));
-    expect(visibleRows(model, 3).map((entry) => entry.ordinal)).toEqual([agentOrdinal("A1"), agentOrdinal("A2"), agentOrdinal("A3")]);
-    for (let step = 0; step < 3; step += 1) model = moveSelection(model, "down", 3).model;
+    expect(visibleRows(model, budget(3)).map((entry) => entry.ordinal)).toEqual([agentOrdinal("A1"), agentOrdinal("A2"), agentOrdinal("A3")]);
+    for (let step = 0; step < 3; step += 1) model = moveSelection(model, "down", budget(3)).model;
     expect(model.selected).toBe(agentOrdinal("A4"));
-    expect(visibleRows(model, 3).map((entry) => entry.ordinal)).toEqual([agentOrdinal("A2"), agentOrdinal("A3"), agentOrdinal("A4")]);
+    expect(visibleRows(model, budget(3)).map((entry) => entry.ordinal)).toEqual([agentOrdinal("A2"), agentOrdinal("A3"), agentOrdinal("A4")]);
   });
 
   test("a shrinking budget pulls the window back onto the selection", () => {
     const rows = Array.from({ length: 8 }, (_, index) => row(`A${index + 1}`));
     let model = selectFirst(replaceRows(emptyModel(), snapshot(rows)));
-    for (let step = 0; step < 7; step += 1) model = moveSelection(model, "down", 8).model;
-    expect(visibleRows(model, 2).map((entry) => entry.ordinal)).toEqual([agentOrdinal("A7"), agentOrdinal("A8")]);
+    for (let step = 0; step < 7; step += 1) model = moveSelection(model, "down", budget(8)).model;
+    expect(visibleRows(model, budget(2)).map((entry) => entry.ordinal)).toEqual([agentOrdinal("A7"), agentOrdinal("A8")]);
   });
 });

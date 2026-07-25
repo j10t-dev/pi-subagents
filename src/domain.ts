@@ -23,6 +23,7 @@ export type ModelId = Brand<string, "ModelId">;
 export type ToolName = Brand<string, "ToolName">;
 export type ModelSpec = Brand<string, "PiCliModelSpec">;
 export type AbsolutePath = Brand<string, "AbsolutePath">;
+export type WidgetGateTracePath = AbsolutePath & Brand<string, "WidgetGateTracePath">;
 export type ObservedCgroupScopePath = AbsolutePath & Brand<string, "ObservedCgroupScopePath">;
 export type CgroupScopePath = ObservedCgroupScopePath & Brand<string, "CgroupScopePath">;
 export type ObservationSnapshotPath = AbsolutePath & Brand<string, "ObservationSnapshotPath">;
@@ -56,10 +57,16 @@ export type TranscriptText = Brand<string, "BoundedTranscriptText">;
 export type ToolDisplayName = Brand<string, "ToolDisplayName">;
 export type AgentDepth = Brand<number, "AgentTreeDepth">;
 export type AgentCount = Brand<number, "AgentCount">;
+export type WidgetOffset = Brand<number, "WidgetOffset">;
+export type WidgetRowBudget = Brand<number, "WidgetRowBudget">;
+export type TerminalRows = Brand<number, "TerminalRows">;
+export type RenderWidth = Brand<number, "RenderWidth">;
+export type WidgetRowCount = Brand<number, "WidgetRowCount">;
 export type AssistantGeneration = Brand<number, "AssistantGeneration">;
 export type RpcContentIndex = Brand<number, "RpcContentIndex">;
 export type RpcToolCallId = Brand<string, "RpcToolCallId">;
 export type RpcStopReason = Brand<string, "RpcStopReason">;
+export type WidgetTraceEvent = "widget-focused" | "editor-refocused" | "native-arrow";
 
 /** Canonical identity for state belonging to one agent run. Native entry IDs are session-local. */
 export type AgentRunKey = Brand<string, "AgentRunKey">;
@@ -303,6 +310,32 @@ export function agentCount(value: number): AgentCount {
   requireNonnegativeSafeInteger(value, "agent count");
   return value as AgentCount;
 }
+
+/** Shared hard bound for retained widget rows and their viewport measurements. */
+const MAX_WIDGET_ROW_COUNT_RAW = 200;
+export const MAX_WIDGET_ROW_COUNT: WidgetRowCount = widgetRowCount(MAX_WIDGET_ROW_COUNT_RAW);
+const MAX_TERMINAL_MEASUREMENT = 10_000;
+
+export function widgetOffset(value: number): WidgetOffset {
+  // Normalisation proves a bounded non-negative integer before branding.
+  return normalisedBoundedInteger(value, MAX_WIDGET_ROW_COUNT_RAW) as WidgetOffset;
+}
+export function widgetRowBudget(value: number): WidgetRowBudget {
+  // Normalisation proves a bounded non-negative integer before branding.
+  return normalisedBoundedInteger(value, MAX_WIDGET_ROW_COUNT_RAW) as WidgetRowBudget;
+}
+export function terminalRows(value: number): TerminalRows {
+  // Normalisation proves a bounded non-negative integer before branding.
+  return normalisedBoundedInteger(value, MAX_TERMINAL_MEASUREMENT) as TerminalRows;
+}
+export function renderWidth(value: number): RenderWidth {
+  // Normalisation proves a bounded non-negative integer before branding.
+  return normalisedBoundedInteger(value, MAX_TERMINAL_MEASUREMENT) as RenderWidth;
+}
+export function widgetRowCount(value: number): WidgetRowCount {
+  // Normalisation proves a bounded non-negative integer before branding.
+  return normalisedBoundedInteger(value, MAX_WIDGET_ROW_COUNT_RAW) as WidgetRowCount;
+}
 export function assistantGeneration(value: number): AssistantGeneration {
   requirePositiveSafeInteger(value, "assistant generation");
   return value as AssistantGeneration;
@@ -329,6 +362,13 @@ function boundedControlFreeIdentity(value: string, maxBytes: number, label: stri
     throw new Error(`invalid_input: invalid ${label}`);
   }
   return value;
+}
+
+function normalisedBoundedInteger(value: number, maximum: number): number {
+  if (Number.isNaN(value) || value <= 0) return 0;
+  if (value === Number.POSITIVE_INFINITY) return maximum;
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(maximum, Math.floor(value));
 }
 
 function requirePositiveSafeInteger(value: number, label: string): void {

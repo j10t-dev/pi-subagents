@@ -4,6 +4,7 @@ import { Value } from "typebox/value";
 import {
   AgentErrorCode,
   CodedError,
+  MAX_WIDGET_ROW_COUNT,
   codedErrorToAgentError,
   AgentEventType,
   AgentState,
@@ -72,6 +73,8 @@ import {
   type RpcRequestId,
   type ToolName,
   type UIRequestId,
+  type WidgetRowCount,
+  type AgentCount,
 } from "../src/domain.ts";
 import { absolutePath, diagnosticsPath, outputPath, sessionPath } from "../src/paths.ts";
 import {
@@ -143,6 +146,9 @@ const OFFSET: Utf16CodeUnitOffset = utf16CodeUnitOffset(4);
 const PROCESS_ID: ProcessId = processId(42);
 const PROCESS_GROUP_ID: ProcessGroupId = processGroupId(42);
 const OBSERVATION_REVISION: ObservationRevision = observationRevision(0);
+const MAXIMUM_WIDGET_ROWS: WidgetRowCount = MAX_WIDGET_ROW_COUNT;
+// @ts-expect-error widget row counts and observed agent counts are distinct numeric domains.
+const _widgetRowsAsAgents: AgentCount = MAX_WIDGET_ROW_COUNT;
 const ABSOLUTE_PATH = absolutePath("/tmp/proof-boundary");
 // @ts-expect-error an arbitrary absolute path has no canonical cgroup-scope proof.
 const _absoluteAsCgroupScope: CgroupScopePath = ABSOLUTE_PATH;
@@ -174,6 +180,8 @@ void _durationAsBytes;
 void _capacityAsDepth;
 void _processCountAsCapacity;
 void _offsetAsBytes;
+void MAXIMUM_WIDGET_ROWS;
+void _widgetRowsAsAgents;
 
 describe("correlation identities", () => {
   test("constructs non-empty RPC and UI identities", () => {

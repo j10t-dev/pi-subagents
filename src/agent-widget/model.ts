@@ -3,11 +3,16 @@ import { MAX_WIDGET_ROWS } from "../constants.ts";
 import {
   agentCount,
   agentDepth,
+  widgetOffset,
+  widgetRowBudget,
   type AgentCount,
   type AgentOrdinal,
   type ContextLabel,
   type ModelLabel,
   type TaskLabel,
+  type TerminalRows,
+  type WidgetOffset,
+  type WidgetRowBudget,
 } from "../domain.ts";
 
 export const MAX_ORDINAL_CHARS = 128;
@@ -23,11 +28,11 @@ export interface AgentWidgetModel {
   readonly displayOmitted: AgentCount;
   readonly degraded: boolean;
   readonly selected: AgentOrdinal | undefined;
-  readonly offset: number;
+  readonly offset: WidgetOffset;
 }
 
 export function emptyModel(): AgentWidgetModel {
-  return { rows: [], total: agentCount(0), sourceOmitted: agentCount(0), displayOmitted: agentCount(0), degraded: false, selected: undefined, offset: 0 };
+  return { rows: [], total: agentCount(0), sourceOmitted: agentCount(0), displayOmitted: agentCount(0), degraded: false, selected: undefined, offset: widgetOffset(0) };
 }
 
 export function replaceRows(model: AgentWidgetModel, snapshot: AgentWidgetSnapshot): AgentWidgetModel {
@@ -56,12 +61,12 @@ export function replaceRows(model: AgentWidgetModel, snapshot: AgentWidgetSnapsh
 
 export function selectFirst(model: AgentWidgetModel): AgentWidgetModel {
   const first = model.rows[0];
-  return first === undefined ? model : { ...model, selected: first.ordinal, offset: 0 };
+  return first === undefined ? model : { ...model, selected: first.ordinal, offset: widgetOffset(0) };
 }
 
 export function clearSelection(model: AgentWidgetModel): AgentWidgetModel { return { ...model, selected: undefined }; }
 
-export function moveSelection(model: AgentWidgetModel, direction: "up" | "down", budget: number): { readonly model: AgentWidgetModel; readonly exit: boolean } {
+export function moveSelection(model: AgentWidgetModel, direction: "up" | "down", budget: WidgetRowBudget): { readonly model: AgentWidgetModel; readonly exit: boolean } {
   const index = model.rows.findIndex((row) => row.ordinal === model.selected);
   if (index === -1) return direction === "down" ? { model: selectFirst(model), exit: false } : { model: clearSelection(model), exit: true };
   if (direction === "up" && index === 0) return { model: clearSelection(model), exit: true };
@@ -70,20 +75,24 @@ export function moveSelection(model: AgentWidgetModel, direction: "up" | "down",
   return { model: { ...model, selected, offset: scrollTo(model.offset, next, budget, model.rows.length) }, exit: false };
 }
 
-export function visibleRows(model: AgentWidgetModel, budget: number): readonly AgentRow[] {
+export function visibleRows(model: AgentWidgetModel, budget: WidgetRowBudget): readonly AgentRow[] {
   const index = model.rows.findIndex((row) => row.ordinal === model.selected);
   const offset = index === -1 ? clampOffset(model.offset, model.rows.length, budget) : scrollTo(model.offset, index, budget, model.rows.length);
-  return model.rows.slice(offset, offset + Math.max(0, budget));
+  return model.rows.slice(Number(offset), Number(offset) + Number(budget));
 }
 
-export function rowBudget(terminalRows: number): number { return Math.min(10, Math.max(3, Math.floor(terminalRows / 4))); }
+export function rowBudget(rows: TerminalRows): WidgetRowBudget {
+  return widgetRowBudget(Math.min(10, Math.max(3, Math.floor(Number(rows) / 4))));
+}
 
-function scrollTo(offset: number, index: number, budget: number, length: number): number {
-  const size = Math.max(1, budget);
+function scrollTo(offset: WidgetOffset, index: number, budget: WidgetRowBudget, length: number): WidgetOffset {
+  const size = Math.max(1, Number(budget));
   const lower = Math.max(0, index - size + 1);
-  return clampOffset(Math.min(Math.max(offset, lower), index), length, size);
+  return clampOffset(Math.min(Math.max(Number(offset), lower), index), length, budget);
 }
-function clampOffset(offset: number, length: number, budget = length): number { return Math.max(0, Math.min(offset, Math.max(0, length - Math.max(0, budget)))); }
+function clampOffset(offset: number, length: number, budget: WidgetRowBudget = widgetRowBudget(length)): WidgetOffset {
+  return widgetOffset(Math.max(0, Math.min(offset, Math.max(0, length - Number(budget)))));
+}
 function reselect(rows: readonly AgentRow[], selected: AgentOrdinal | undefined, previousIndex: number): AgentOrdinal | undefined {
   if (selected === undefined || rows.length === 0) return undefined;
   if (rows.some((row) => row.ordinal === selected)) return selected;

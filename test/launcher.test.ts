@@ -27,12 +27,17 @@ afterEach(async () => {
 });
 
 describe("launcher membership barrier", () => {
+  test("uses the runtime launcher location and has no root compatibility shim", () => {
+    expect(existsSync(join(import.meta.dir, "../src/runtime/launcher.mjs"))).toBeTrue();
+    expect(existsSync(join(import.meta.dir, "../launcher.mjs"))).toBeFalse();
+  });
+
   test("does not expose an environment-controlled filesystem write before initialisation", async () => {
     const state = temporaryStateRoot("pi-launcher-environment-");
     const directory: string = state.path;
     directories.push(state);
     const marker = join(directory, "forbidden-marker.json");
-    const child = spawn(process.execPath, [join(import.meta.dir, "../launcher.mjs")], {
+    const child = spawn(process.execPath, [join(import.meta.dir, "../src/runtime/launcher.mjs")], {
       env: { ...process.env, PI_SUBAGENTS_TEST_LAUNCHER_MARKER: marker },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -153,7 +158,7 @@ function launchFixture(command: { args: string[]; replaceMarker?: boolean }) {
   const args = command.replaceMarker
     ? command.args.map((value) => value.replace("PID_MARKER", marker))
     : command.args;
-  const child = spawn(process.execPath, [join(import.meta.dir, "../launcher.mjs")], {
+  const child = spawn(process.execPath, [join(import.meta.dir, "../src/runtime/launcher.mjs")], {
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe", "pipe"],
   });
   children.add(child);

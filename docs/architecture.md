@@ -19,7 +19,7 @@ Projection failures must not mutate lifecycle authority. Reconciliation repairs 
 ### Entrypoints and presentation
 
 - `index.ts` registers lifecycle tools, serialises Pi session events and owns controller replacement.
-- `agent-widget.ts` and `src/agent-widget/` mount and render the bounded agent widget.
+- `src/agent-widget/extension.ts` and its sibling widget modules mount and render the bounded agent widget.
 - `src/agent-observation*.ts`, `src/context-observation.ts`, `src/observation-registry.ts`, `src/tool-presentation.ts` and `src/ui-forwarder.ts` project bounded status. They do not own lifecycle state.
 
 ### Orchestration
@@ -54,8 +54,8 @@ Projection failures must not mutate lifecycle authority. Reconciliation repairs 
 - `src/containment.ts` defines containment ownership contracts.
 - `src/cgroup-v2.ts` proves host capability and owns cgroup scopes.
 - `src/watchdog-client.ts` controls the external watchdog and verifies receipts.
-- `watchdog.mjs` creates and verifies the attempt scope before authorising launch.
-- `launcher.mjs` is the sole process that spawns the Pi RPC child from an authorised launch specification.
+- `src/runtime/watchdog.mjs` creates and verifies the attempt scope before authorising launch.
+- `src/runtime/launcher.mjs` is the sole process that spawns the Pi RPC child from an authorised launch specification.
 
 ## Spawn and relaunch
 
@@ -67,7 +67,7 @@ spawn_agent or send_input
   → cgroup preflight and attempt preparation
   → pi-composition transfers containment ownership
   → pi-launcher builds the RPC specification
-  → WatchdogClient → watchdog.mjs → launcher.mjs → Pi RPC
+  → WatchdogClient → src/runtime/watchdog.mjs → src/runtime/launcher.mjs → Pi RPC
   → RpcRunClient resolves assignment identity
   → RunStarted is persisted
   → run settles and output is durably published
