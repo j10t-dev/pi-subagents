@@ -41,6 +41,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "output-store.test.ts",
     "rpc-client.test.ts",
     "rpc-wire.test.ts",
+    "snapshot-watcher.test.ts",
     "ui-forwarder.test.ts",
     "ui-spike.test.ts",
   ]),
