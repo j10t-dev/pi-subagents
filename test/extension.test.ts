@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import extension, { buildProductionControllerOptions, createPiSubagentsExtension, registrationForLaunchContext, type ExtensionController } from "../index.ts";
 import { parseExtensionLaunchContext } from "../src/delegation-policy.ts";
+import { acquireStatusLease } from "../src/ambient-status-lease.ts";
 import { withProductionContainmentPreflight } from "../src/pi-composition.ts";
 import type { ContainmentBackend } from "../src/containment.ts";
 import { AgentState, agentId, agentObservationRevision, delegationDepth, directAgentOrdinal, modelSpec, runId, runCapacity, type AbsolutePath } from "../src/domain.ts";
@@ -501,6 +502,32 @@ describe("Pi subagents extension", () => {
     refreshStatus();
 
     expect(ctx.statuses.at(-1)).toBe("agents: 0 running, 1 result ready");
+  });
+
+  test("a held lease suppresses the status key and release restores the controller's latest text", async () => {
+    const h = harness();
+    const log: string[] = [];
+    let refreshStatus = (): void => { throw new Error("status refresh was not wired"); };
+    let value = "agents: 1 running, 0 results ready";
+    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+      createController: (_context, _api, refresh) => {
+        refreshStatus = refresh;
+        return { ...controller(log), status: () => value };
+      }, diagnostic: () => {} })(extensionApiForTest(h.api));
+    const ctx = await h.emit("session_start", { type: "session_start", reason: "startup" });
+    expect(ctx.statuses.at(-1)).toBe("agents: 1 running, 0 results ready");
+
+    const lease = acquireStatusLease();
+    expect(ctx.statuses.at(-1)).toBe(undefined);
+    value = "agents: 0 running, 1 result ready";
+    refreshStatus();
+    expect(ctx.statuses.at(-1)).toBe(undefined);   // core kept publishing; the presenter suppressed it
+
+    lease.release();
+    expect(ctx.statuses.at(-1)).toBe("agents: 0 running, 1 result ready");
+
+    await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+    expect(ctx.statuses.at(-1)).toBe(undefined);
   });
 
   test("passes configured absolute roots only to root production controllers", () => {

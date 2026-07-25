@@ -15,6 +15,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "agent-widget-component.test.ts",
     "agent-widget-model.test.ts",
     "agent-widget-render.test.ts",
+    "ambient-status-lease.test.ts",
     "assignment-identity.test.ts",
     "async-primitives.test.ts",
     "b0-gates.test.ts",

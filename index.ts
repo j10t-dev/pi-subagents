@@ -5,6 +5,7 @@ import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext,
 import { Text } from "@earendil-works/pi-tui";
 
 import { canDelegateFrom, parseExtensionLaunchContext, type DelegationLimits } from "./src/delegation-policy.ts";
+import { onAmbientStatus, setAmbientStatus } from "./src/ambient-status-lease.ts";
 import { SubagentController } from "./src/controller.ts";
 import { delegationDepth, type AbsolutePath, type DelegationDepth } from "./src/domain.ts";
 import { createProductionController } from "./src/pi-composition.ts";
@@ -90,11 +91,18 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
     let publication: { readonly owner: ExtensionController; readonly token: ObservationPublication } | undefined;
     let lifecycleTail = Promise.resolve();
 
+    // The status key now has exactly one writer. Everything that used to call setStatus directly
+    // publishes through the lease instead, so a presenter that visibly replaces the status line
+    // can suppress it and have the latest text restored when it releases.
+    let unsubscribeStatus: (() => void) | undefined = onAmbientStatus((text) => {
+      activeContext?.ui.setStatus(STATUS_KEY, text);
+    });
+
     // Bound to the controller that actually executed: a tool call can outlive its session
     // (shutdown, or a replacing session_start), and neither case may destroy the result or
     // publish status from a controller that is no longer current.
     const refreshAfterTool = (owner: ExtensionController): void => {
-      if (current === owner) activeContext?.ui.setStatus(STATUS_KEY, owner.status());
+      if (current === owner) setAmbientStatus(owner.status());
     };
     const resolveCurrent = (): ExtensionController | undefined => current;
     registerSubagentTool(pi, "spawn_agent", TOOL_SPECS.spawn_agent, resolveCurrent, refreshAfterTool);
@@ -106,7 +114,7 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       if (current !== undefined) await closeCurrent();
       let controller!: ExtensionController;
       const refreshStatus = (): void => {
-        if (current === controller && activeContext === context) context.ui.setStatus(STATUS_KEY, controller.status());
+        if (current === controller && activeContext === context) setAmbientStatus(controller.status());
       };
       controller = options.createController(context, pi, refreshStatus);
       current = controller;
@@ -114,7 +122,7 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       await controller.restore();
       const port = controller.observationPort?.();
       if (port !== undefined && current === controller) publication = { owner: controller, token: publishObservationPort(port) };
-      context.ui.setStatus(STATUS_KEY, controller.status());
+      setAmbientStatus(controller.status());
     }));
     pi.on("session_before_tree", () => ({ cancel: current?.beforeTree?.() === false }));
     pi.on("session_tree", (_event, context) => serialiseLifecycle(async () => {
@@ -122,7 +130,7 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       await closeCurrent();
       let controller!: ExtensionController;
       const refreshStatus = (): void => {
-        if (current === controller && activeContext === context) context.ui.setStatus(STATUS_KEY, controller.status());
+        if (current === controller && activeContext === context) setAmbientStatus(controller.status());
       };
       controller = options.createController(context, pi, refreshStatus);
       current = controller;
@@ -130,13 +138,14 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       await controller.restore();
       const port = controller.observationPort?.();
       if (port !== undefined && current === controller) publication = { owner: controller, token: publishObservationPort(port) };
-      context.ui.setStatus(STATUS_KEY, controller.status());
+      setAmbientStatus(controller.status());
     }));
     pi.on("session_before_switch", () => { current?.beforeSwitch?.(); });
     pi.on("session_before_fork", () => { current?.beforeFork?.(); });
-    pi.on("session_shutdown", (_event, context) => serialiseLifecycle(async () => {
+    pi.on("session_shutdown", (_event, _context) => serialiseLifecycle(async () => {
+      setAmbientStatus(undefined);
       await closeCurrent();
-      context.ui.setStatus(STATUS_KEY, undefined);
+      unsubscribeStatus?.(); unsubscribeStatus = undefined;
     }));
 
     function serialiseLifecycle(operation: () => Promise<void>): Promise<void> {
