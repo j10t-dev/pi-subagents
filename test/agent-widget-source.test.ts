@@ -4,7 +4,15 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
-import type { AgentDisplayState, ObservationChange, SubagentObservationPort } from "../src/agent-observation.ts";
+import type {
+  AgentDisplayState,
+  ObservationChange,
+  SubagentObservationPort,
+  TranscriptListener,
+  TranscriptSnapshot,
+  TranscriptSource,
+} from "../src/agent-observation.ts";
+import { transcriptText } from "../src/agent-observation.ts";
 import { createAgentWidgetSource } from "../src/agent-widget/source.ts";
 import {
   type TranscriptDirectoryHandle,
@@ -31,6 +39,8 @@ import {
   modelSpec,
   observationRevision,
   runId,
+  runAttemptId,
+  rpcContentIndex,
   type FileOffset,
   type Milliseconds,
   type TranscriptFileName,
@@ -110,6 +120,8 @@ class RecordingTranscriptAdapters implements TranscriptFileSystem, TranscriptFil
   readonly directorySegments: string[] = [];
   readonly fileNames: string[] = [];
   readonly watchedDirectories: string[] = [];
+  activeWatches = 0;
+  disposedWatches = 0;
   private readonly bytes = new TextEncoder().encode(`${JSON.stringify({ type: "session", id: "agent-b" })}\n`);
   private readonly directory: TranscriptDirectoryHandle = {
     stat: async () => ({ directory: true }),
@@ -140,11 +152,36 @@ class RecordingTranscriptAdapters implements TranscriptFileSystem, TranscriptFil
 
   watch(directory: Parameters<TranscriptFileWatcherFactory["watch"]>[0]): TranscriptWatch {
     this.watchedDirectories.push(String(directory));
-    return { dispose: () => {} };
+    this.activeWatches += 1;
+    let disposed = false;
+    return {
+      dispose: () => {
+        if (disposed) return;
+        disposed = true;
+        this.activeWatches -= 1;
+        this.disposedWatches += 1;
+      },
+    };
   }
 
   schedule(_delay: Milliseconds, _callback: () => void): TranscriptScheduledTask {
     return { cancel: () => {} };
+  }
+}
+
+class CountingTranscriptSource implements TranscriptSource {
+  readonly listeners = new Set<TranscriptListener>();
+
+  constructor(private readonly source: TranscriptSource) {}
+
+  snapshot(): TranscriptSnapshot { return this.source.snapshot() }
+  subscribe(listener: TranscriptListener): () => void {
+    this.listeners.add(listener);
+    const unsubscribe = this.source.subscribe(listener);
+    return () => {
+      if (!this.listeners.delete(listener)) return;
+      unsubscribe();
+    };
   }
 }
 
@@ -205,6 +242,65 @@ describe("createAgentWidgetSource", () => {
     expect(source.transcriptSource(agentOrdinal("A1"))).toBe(selected);
     expect(source.transcriptSource(agentOrdinal("A1.1"))).toBeUndefined();
     expect(source.transcriptSource(agentOrdinal("A9"))).toBeUndefined();
+    source.dispose();
+  });
+
+  test("attaches direct live and authoritative sources but keeps nested selections authoritative-only", async () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Parent task");
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-b", transcriptFile: "agent-b.jsonl" }]);
+    const attempt = runAttemptId("direct-live");
+    store.acceptRun({ agentId: agentId("agent-a"), runId: runId("11111111"), attemptId: attempt, assignment: "Direct live" });
+    const sink = store.createAttemptSink(agentId("agent-a"), attempt);
+    sink.bind(runId("11111111"));
+    sink.record({ kind: "prompt-accepted", text: transcriptText("Direct live") });
+    sink.record({ kind: "assistant-start" });
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "delta", delta: transcriptText("partial") });
+    await Promise.resolve();
+    const realLive = store.transcriptSource(agentId("agent-a"));
+    if (realLive === undefined) throw new Error("missing real observation transcript source");
+    const live = new CountingTranscriptSource(realLive);
+    const calls: string[] = [];
+    const port: SubagentObservationPort = {
+      observation: (id) => store.observation(id),
+      directSnapshot: () => store.directSnapshot(),
+      transcriptSource: (id) => { calls.push(String(id)); return id === agentId("agent-a") ? live : undefined; },
+      subscribe: (listener) => store.subscribe(listener),
+    };
+    const adapters = new RecordingTranscriptAdapters();
+    const source = createAgentWidgetSource(port, {
+      agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS,
+      transcriptFileSystem: adapters, transcriptWatcher: adapters, transcriptClock: adapters,
+    });
+
+    const direct = source.transcriptSource(agentOrdinal("A1"));
+    const directUnsubscribe = direct?.subscribe(() => {});
+    await Bun.sleep(0);
+    expect(calls).toEqual(["agent-a"]);
+    expect(direct?.snapshot().transcript.items).toContainEqual(expect.objectContaining({ kind: "assistant", text: "partial" }));
+    expect(live.listeners.size).toBe(1);
+    expect(adapters.activeWatches).toBe(1);
+
+    const nested = source.transcriptSource(agentOrdinal("A1.2"));
+    const nestedUnsubscribe = nested?.subscribe(() => {});
+    await Bun.sleep(0);
+    expect(calls).toEqual(["agent-a"]);
+    expect(live.listeners.size).toBe(0);
+    expect(adapters.disposedWatches).toBe(1);
+    expect(adapters.activeWatches).toBe(1);
+
+    nestedUnsubscribe?.();
+    expect(adapters.activeWatches).toBe(0);
+    expect(live.listeners.size).toBe(0);
+
+    const directAgain = source.transcriptSource(agentOrdinal("A1"));
+    const directAgainUnsubscribe = directAgain?.subscribe(() => {});
+    await Bun.sleep(0);
+    expect(live.listeners.size).toBe(1);
+    directAgainUnsubscribe?.();
+    expect(live.listeners.size).toBe(0);
+    expect(adapters.activeWatches).toBe(0);
+    directUnsubscribe?.();
     source.dispose();
   });
 

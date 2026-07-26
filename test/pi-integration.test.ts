@@ -25,6 +25,7 @@ import { CONFIG_DIR_NAME, RpcClient, SessionManager, type SessionEntry } from "@
 
 import { createProductionController, launchAfterSurrender } from "../src/pi-composition.ts";
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
+import { createAgentWidgetSource } from "../src/agent-widget/source.ts";
 import {
   deriveTaskLabel,
   directAgentRow,
@@ -42,6 +43,8 @@ import {
   agentId,
   agentObservationRevision,
   agentOrdinal,
+  observationRevision,
+  incarnationId,
   contextPercent,
   delegationDepth,
   milliseconds,
@@ -50,7 +53,14 @@ import {
   type AgentId,
   type RunId,
 } from "../src/domain.ts";
-import { observationSnapshotPath, readKnownChildSnapshots, type ObservationSnapshot } from "../src/observation-snapshot-path.ts";
+import {
+  encodeObservationSnapshot,
+  observationSlotDirectory,
+  observationSnapshotPath,
+  readKnownChildSnapshots,
+  type ObservationRow,
+  type ObservationSnapshot,
+} from "../src/observation-snapshot-path.ts";
 import { absolutePath } from "../src/paths.ts";
 import { createRecursiveAgentIndex, type RecursiveAgentIndex } from "../src/recursive-agent-index.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
@@ -829,6 +839,73 @@ describe("deterministic network-free real-Pi matrix", () => {
     });
   }, 50_000);
 
+  test("05ab child conversation transcript sources use direct live and nested committed updates", async () => {
+    const harness = productionFakeRpcHarness("long-observation");
+    let source: ReturnType<typeof createAgentWidgetSource> | undefined;
+    try {
+      await harness.controller.restore();
+      const started = await harness.controller.spawn({ task: "live before durable commit" });
+      if (!("runId" in started)) throw new Error("missing production run identity");
+      for (let index = 0; index < 200 && !harness.controller.observationPort().transcriptSource(started.agentId)?.snapshot().items
+        .some((item) => item.kind === "assistant" && item.phase === "partial"); index += 1) await Bun.sleep(5);
+      expect(harness.controller.observationPort().transcriptSource(started.agentId)?.snapshot().items)
+        .toContainEqual(expect.objectContaining({ kind: "assistant", phase: "partial", text: "🙂".repeat(2_048) }));
+
+      const nestedSessions = join(harness.root, "pi-subagents", started.agentId, "sessions");
+      mkdirSync(nestedSessions, { recursive: true });
+      const nested = SessionManager.create(join(harness.root, "project"), nestedSessions);
+      nested.appendMessage({ role: "user", content: "nested committed", timestamp: Date.now() });
+      nested.appendMessage({
+        role: "assistant", content: [{ type: "text", text: "nested durable" }],
+        api: "messages", provider: "anthropic", model: "fake",
+        usage: {
+          input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop", timestamp: Date.now(),
+      });
+      const nestedFile = nested.getSessionFile();
+      if (nestedFile === undefined) throw new Error("nested committed session was not persisted");
+      const nestedId = agentId(nested.getSessionId());
+      const publication = encodeObservationSnapshot({
+        sessionId: started.agentId,
+        incarnation: incarnationId("task3-review"),
+        revision: observationRevision(1),
+        total: agentCount(1),
+        omitted: agentCount(0),
+        degraded: false,
+        agents: [{
+          ordinal: agentOrdinal("A1"), sessionId: nestedId,
+          model: "mock:h" as ObservationRow["model"], context: "?%" as ObservationRow["context"],
+          taskLabel: "nested committed" as ObservationRow["taskLabel"], state: AgentState.Running,
+          transcriptFile: transcriptFileName(basename(nestedFile)),
+        }],
+      });
+      if (!publication.ok) throw new Error("nested publication fixture exceeded codec bound");
+      mkdirSync(observationSlotDirectory(absolutePath(harness.root), started.agentId), { recursive: true });
+      writeFileSync(observationSnapshotPath(absolutePath(harness.root), started.agentId), publication.text);
+
+      source = createAgentWidgetSource(harness.controller.observationPort(), {
+        agentDir: absolutePath(harness.root), rootSessionId: harness.rootSessionId, maxRows: MAX_WIDGET_ROWS,
+      });
+      const direct = source.transcriptSource(agentOrdinal("A1"));
+      const directUnsubscribe = direct?.subscribe(() => {});
+      await Bun.sleep(20);
+      expect(direct?.snapshot().transcript.items)
+        .toContainEqual(expect.objectContaining({ kind: "assistant", phase: "partial", text: "🙂".repeat(2_048) }));
+
+      const committed = source.transcriptSource(agentOrdinal("A1.1"));
+      const committedUnsubscribe = committed?.subscribe(() => {});
+      await Bun.sleep(20);
+      expect(committed?.snapshot().transcript.items).toContainEqual(expect.objectContaining({ kind: "user", text: "nested committed" }));
+      directUnsubscribe?.();
+      committedUnsubscribe?.();
+    } finally {
+      source?.dispose();
+      await harness.close();
+    }
+  }, 50_000);
+
   test("05b child model selection does not change Pi's global defaults", async () => {
     await withFixture("model-defaults", async ({ client, agentDir }) => {
       const settingsPath = join(agentDir, "settings.json");
@@ -1221,6 +1298,8 @@ function productionFakeRpcHarness(
 ): {
   readonly controller: ReturnType<typeof createProductionController>;
   readonly events: readonly unknown[];
+  readonly root: string;
+  readonly rootSessionId: AgentId;
   releaseLongObservation(): void;
   close(): Promise<void>;
   cleanup(): void;
@@ -1287,8 +1366,8 @@ function productionFakeRpcHarness(
     for (const child of children) child.kill();
     state.cleanup();
   };
-  return { controller, events, cleanup,
-    releaseLongObservation: () => { writeFileSync(join(root, "release-long-observation"), "release\n"); },
+  return { controller, events, root, rootSessionId: agentId(parent.getSessionId()), cleanup,
+    releaseLongObservation: () => { writeFileSync(join(root, "release-long-observation"), "release\n"); }, 
     close: async () => {
     try { await controller.shutdown(); } catch { /* fake containment has no kernel authority */ }
     cleanup();

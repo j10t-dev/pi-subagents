@@ -23,6 +23,7 @@ import {
   type TranscriptRefreshClock,
 } from "../session-transcript-source.ts";
 import { createSnapshotWatcher } from "../snapshot-watcher.ts";
+import { createMergedTranscriptSource } from "../merged-transcript-source.ts";
 import { createSelectedTranscriptSource } from "./conversation-source.ts";
 
 export interface AgentWidgetSourceDeps {
@@ -96,23 +97,25 @@ export function createAgentWidgetSource(
     snapshot: (): AgentWidgetSnapshot => current,
     transcriptSource: (ordinal: AgentOrdinal): SelectedTranscriptSource | undefined => {
       if (selected?.ordinal === ordinal) return selected.source;
-      // The authoritative reader resolves any routed ordinal, direct or nested: the route names
-      // the owning session's partition, which this session can traverse for itself.
       const selectedRoute = index.transcriptRoute(ordinal);
       const selectedRow = current.rows.find((row) => row.ordinal === ordinal);
       if (selectedRoute === undefined || selectedRow === undefined) return undefined;
       selected?.source.dispose();
+      const authoritative = createSessionTranscriptSource(selectedRoute, {
+        agentDir: deps.agentDir,
+        onDiagnostic: deps.onDiagnostic ?? (() => {}),
+        filesystem: deps.transcriptFileSystem ?? createNodeTranscriptFileSystem(),
+        watcher: deps.transcriptWatcher ?? createNodeTranscriptFileWatcherFactory(),
+        clock: deps.transcriptClock ?? createNodeTranscriptRefreshClock(),
+      });
       const source = createSelectedTranscriptSource(
         ordinal,
         selectedRoute,
         selectedRow,
-        createSessionTranscriptSource(selectedRoute, {
-          agentDir: deps.agentDir,
-          onDiagnostic: deps.onDiagnostic ?? (() => {}),
-          filesystem: deps.transcriptFileSystem ?? createNodeTranscriptFileSystem(),
-          watcher: deps.transcriptWatcher ?? createNodeTranscriptFileWatcherFactory(),
-          clock: deps.transcriptClock ?? createNodeTranscriptRefreshClock(),
-        }),
+        createMergedTranscriptSource(
+          authoritative,
+          selectedRoute.direct ? port.transcriptSource(selectedRoute.childSessionId) : undefined,
+        ),
       );
       selected = { ordinal, source };
       return source;
