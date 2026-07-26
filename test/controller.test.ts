@@ -106,7 +106,7 @@ describe("parent lifecycle wiring", () => {
       },
     });
 
-    const failure = await c.spawn({ task: "one" }).catch((error: Error) => error);
+    const failure = await c.spawn({ task: "one" }).catch((error: unknown) => error);
 
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
     expect(failure.message).toBe(expected);
@@ -445,7 +445,7 @@ describe("parent lifecycle wiring", () => {
 
     const caller = c.spawn({ task: "caller" });
     const concurrent = c.spawn({ task: "concurrent" });
-    const callerOutcome = caller.catch((error: Error) => error);
+    const callerOutcome = caller.catch((error: unknown) => error);
     await Promise.resolve();
     releaseConcurrent.resolve();
     await expect(concurrent).resolves.toMatchObject({ state: AgentState.Running });
@@ -860,7 +860,7 @@ describe("parent lifecycle wiring", () => {
         runtime: { abort: async () => {}, contain: async () => { await gate.promise; return testVerifiedReceiptPath("/tmp/pi-subagents-test/waits.receipt"); } } },
     ]);
 
-    const shutdown = c.shutdown().catch((error: Error) => { rejected = true; throw error; });
+    const shutdown = c.shutdown().catch((error: unknown) => { rejected = true; throw error; });
     await Promise.resolve();
     expect(rejected).toBeFalse();
     gate.resolve();
@@ -911,16 +911,12 @@ describe("parent lifecycle wiring", () => {
     expect(c.completions.queuedCount()).toBe(0);
   });
 
-  test("scheduled external callback runs in a future turn and handles rejection", async () => {
+  test("scheduled external callback runs in a future turn, not during preparation", async () => {
     const callbackFinished = deferred<void>();
     let ran = false;
     const c = new SubagentController({ composition: {
       prepareSpawn: async (_input, scope) => {
-        scope.scheduleExternal(async () => {
-          ran = true;
-          try { throw new Error("detached detail"); }
-          finally { callbackFinished.resolve(); }
-        });
+        scope.scheduleExternal(() => { ran = true; callbackFinished.resolve(); });
         expect(ran).toBeFalse();
         throw new Error("prepared");
       },
@@ -929,8 +925,38 @@ describe("parent lifecycle wiring", () => {
 
     await expect(c.spawn({ task: "one" })).rejects.toThrow("spawn_failed: failed to spawn child agent");
     await callbackFinished.promise;
-    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(ran).toBeTrue();
+  });
+
+  test("scheduled external callback that returns a rejecting promise is contained without an unhandled rejection", async () => {
+    const callbackEntered = deferred<void>();
+    let ran = false;
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const c = new SubagentController({ composition: {
+        prepareSpawn: async (_input, scope) => {
+          // eslint-disable-next-line @typescript-eslint/no-misused-promises -- this fixture deliberately passes a promise-returning callback, which the `(callback: () => void): void` contract at src/controller.ts:111 forbids, to exercise the runtime containment arm at src/controller.ts:559 where types are erased.
+          scope.scheduleExternal(async () => {
+            ran = true;
+            callbackEntered.resolve();
+            await Promise.resolve();
+            throw new Error("detached detail");
+          });
+          throw new Error("prepared");
+        },
+        prepareSend: async () => { throw new Error("unused"); },
+      } });
+
+      await expect(c.spawn({ task: "one" })).rejects.toThrow("spawn_failed: failed to spawn child agent");
+      await callbackEntered.promise;
+      for (let turn = 0; turn < 5; turn++) await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(ran).toBeTrue();
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
   });
 
   test("shutdown and restore join an admitted spawn without deadlock", async () => {

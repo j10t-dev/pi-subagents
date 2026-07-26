@@ -206,16 +206,16 @@ class ManagedObservationRelay implements ObservationRelay {
 
 function writeSyncedFile(path: string, text: string, filesystem: DurableFileSystem): void {
   let fd: number | undefined;
-  let failure: unknown;
+  let failure: Error | undefined;
   try {
     fd = filesystem.open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
     filesystem.write(fd, text);
     filesystem.sync(fd);
   } catch (error) {
-    failure = error;
+    failure = asError(error);
   } finally {
     if (fd !== undefined) {
-      try { filesystem.close(fd); } catch (error) { failure ??= error; }
+      try { filesystem.close(fd); } catch (error) { failure ??= asError(error); }
     }
   }
   if (failure !== undefined) throw failure;
@@ -231,16 +231,20 @@ function isAlreadyExists(error: unknown): boolean {
 
 function syncDirectory(path: string, filesystem: DurableFileSystem): void {
   let fd: number | undefined;
-  let failure: unknown;
+  let failure: Error | undefined;
   try {
     fd = filesystem.open(path, "r");
     filesystem.sync(fd);
   } catch (error) {
-    failure = error;
+    failure = asError(error);
   } finally {
     if (fd !== undefined) {
-      try { filesystem.close(fd); } catch (error) { failure ??= error; }
+      try { filesystem.close(fd); } catch (error) { failure ??= asError(error); }
     }
   }
   if (failure !== undefined) throw failure;
+}
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value), { cause: value });
 }

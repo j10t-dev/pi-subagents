@@ -267,7 +267,7 @@ describe("exact tool contracts", () => {
     const message = 'invalid_input: child tool "web_fetch" is not active in the parent';
     const controller = fakeToolController({ spawn: async () => { throw new PublicPreflightError(AgentErrorCode.InvalidInput, message.slice("invalid_input: ".length)); } });
 
-    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
+    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(PublicPreflightError);
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
@@ -336,9 +336,9 @@ describe("exact tool contracts", () => {
     ["control characters", new Error("transport\u0000THROW_SECRET\nvalue"), "spawn_failed: failed to spawn child agent"],
     ["transport failure", new Error("transport failed: THROW_SECRET"), "spawn_failed: failed to spawn child agent"],
   ] as const)("canonicalises %s without exposing hostile detail", async (_name, thrown, expected) => {
-    const controller = fakeToolController({ spawn: async () => { throw thrown; } });
+    const controller = fakeToolController({ spawn: () => Promise.reject(thrown) });
 
-    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
+    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(Error);
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
@@ -357,7 +357,7 @@ describe("exact tool contracts", () => {
       prepareSend: async () => { throw new Error("unused"); },
     } });
 
-    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
+    const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: unknown) => error);
 
     if (!(failure instanceof Error)) throw new Error("expected spawn rejection");
     expect(failure.message).toBe("spawn_failed: failed to spawn child agent");
@@ -389,14 +389,14 @@ describe("exact tool contracts", () => {
         let launchSideEffects = 0;
         const existing = agentId("existing");
         const composition = {
-          prepareSpawn: async () => { throw thrown; },
-          prepareSend: async () => { throw thrown; },
+          prepareSpawn: () => Promise.reject(thrown),
+          prepareSend: () => Promise.reject(thrown),
         } satisfies PiControllerComposition;
         const controller = new SubagentController({ composition });
         controller.runs.register({ agentId: existing, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/existing.jsonl") });
         const failure = operation === "spawn"
-          ? await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error)
-          : await createSubagentTools(controller).send_input.execute({ agentId: existing, message: "literal" }).catch((error: Error) => error);
+          ? await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: unknown) => error)
+          : await createSubagentTools(controller).send_input.execute({ agentId: existing, message: "literal" }).catch((error: unknown) => error);
 
         expect(failure).toBeInstanceOf(Error);
         expect((failure as Error).message).toBe(expected);
@@ -414,11 +414,11 @@ describe("exact tool contracts", () => {
       : "spawn_failed: failed to spawn child agent";
     test(`spawn normalises ${thrown instanceof Error ? thrown.message.split("-")[0] : "non-error"} session creation failures and leaves no owner`, async () => {
       const controller = new SubagentController({ composition: {
-        prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: async () => { throw thrown; }, persistSpawned: async () => {}, createLaunch: async () => { throw new Error("unused"); } }),
+        prepareSpawn: async () => ({ selection: TEST_SELECTION, createSession: () => Promise.reject(thrown), persistSpawned: async () => {}, createLaunch: async () => { throw new Error("unused"); } }),
         prepareSend: async () => { throw new Error("unused"); },
       } });
 
-      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
+      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: unknown) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe(expected);
@@ -434,7 +434,7 @@ describe("exact tool contracts", () => {
         prepareSend: async () => { throw new Error("unused"); },
       } });
 
-      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: Error) => error);
+      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "work" }).catch((error: unknown) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe(thrown.message.startsWith("raw")
@@ -464,7 +464,7 @@ describe("exact tool contracts", () => {
 
       const failure = await (operation === "spawn"
         ? spawn!.execute({ task: "second" })
-        : send!.execute({ agentId: idle.agentId, message: "next" })).catch((error: Error) => error);
+        : send!.execute({ agentId: idle.agentId, message: "next" })).catch((error: unknown) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe("capacity_exceeded: maximum concurrent runs exceeded");
@@ -483,7 +483,7 @@ describe("exact tool contracts", () => {
     const { spawn_agent: spawn, send_input: send } = createSubagentTools(controller);
     await expect(spawn!.execute({ task: "occupy" })).resolves.toMatchObject({ details: { state: "running" } });
 
-    const failure = await send!.execute({ agentId: session.agentId, message: "next" }).catch((error: Error) => error);
+    const failure = await send!.execute({ agentId: session.agentId, message: "next" }).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).message).toBe("invalid_state: agent is not in a valid state for this operation");
@@ -512,7 +512,7 @@ describe("exact tool contracts", () => {
     const awaitTool = createSubagentTools(controller).await_agent;
     const abort = new AbortController();
 
-    const pending = awaitTool.execute({}, abort.signal).catch((error: Error) => error);
+    const pending = awaitTool.execute({}, abort.signal).catch((error: unknown) => error);
     await new Promise<void>((resolve) => setImmediate(resolve));
     abort.abort();
     const failure = await pending;
@@ -741,7 +741,7 @@ describe("exact tool contracts", () => {
       const tools = createSubagentTools(controller);
 
       const failure = await executeTool(tools, name, HOSTILE_TOOL_CASES[name].validInput)
-        .catch((error: Error) => error);
+        .catch((error: unknown) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe("internal_error: internal agent result is invalid");
@@ -758,7 +758,7 @@ describe("exact tool contracts", () => {
       });
       const tools = createSubagentTools(new SubagentController());
 
-      const failure = await executeTool(tools, name, input).catch((error: Error) => error);
+      const failure = await executeTool(tools, name, input).catch((error: unknown) => error);
 
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe("internal_error: internal agent result is invalid");
@@ -771,7 +771,7 @@ describe("exact tool contracts", () => {
     const original = JSON.stringify;
     JSON.stringify = () => { throw new Error("JSON_SECRET"); };
     try {
-      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "x" }).catch((error: Error) => error);
+      const failure = await createSubagentTools(controller).spawn_agent.execute({ task: "x" }).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toBe("internal_error: internal agent result is invalid");
     } finally {

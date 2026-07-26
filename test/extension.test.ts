@@ -77,6 +77,8 @@ function controller(log: string[], observation?: SubagentObservationPort): Exten
   };
 }
 
+// The extension factory returns its detached widget startup. These tests supply no widget seam, and
+// `installWidget` already contains and reports startup failure, so every call site marks it `void`.
 describe("Pi subagents extension", () => {
   test("publishes only the restored controller port and clears it before shutdown", async () => {
     const h = harness();
@@ -89,7 +91,7 @@ describe("Pi subagents extension", () => {
     };
     const seen: Array<SubagentObservationPort | undefined> = [];
     const unsubscribe = onObservationPort((value) => seen.push(value));
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => controller(log, port), diagnostic: () => {} })(extensionApiForTest(h.api));
     await h.emit("session_start", { type: "session_start", reason: "startup" });
     expect(seen.at(-1)).toBe(port);
@@ -102,7 +104,7 @@ describe("Pi subagents extension", () => {
   test("supported parent registers four rendered tools and the lifecycle handlers without starting resources", () => {
     const h = harness();
     const log: string[] = [];
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "linux",
       nodeVersion: "22.19.0",
       registration: { enabled: true },
@@ -125,7 +127,7 @@ describe("Pi subagents extension", () => {
   test("renders historical tool results without exposing raw details", async () => {
     const h = harness();
     const log: string[] = [];
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "linux", registration: { enabled: true },
       createController: () => controller(log), diagnostic: () => {},
     })(extensionApiForTest(h.api));
@@ -150,7 +152,7 @@ describe("Pi subagents extension", () => {
   ] as const)("registered %s uses the observation-backed lifecycle renderer", async (name, details) => {
     const h = harness();
     const store = observedRunningStore();
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => ({ ...controller([], store), tools: () => createSubagentTools(
         new SubagentController(), createObservationDisplayResolver(store),
       ) }), diagnostic: () => {} })(extensionApiForTest(h.api));
@@ -176,7 +178,7 @@ describe("Pi subagents extension", () => {
       model: modelSpec("mock-provider/luna"), thinkingLevel: "high" });
     store.updateLifecycle({ agentId: id, runId: nativeRunId, state: AgentState.Running,
       transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl") });
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => ({ ...controller(log, store), tools: () => createSubagentTools(
         new SubagentController(), createObservationDisplayResolver(store),
       ) }), diagnostic: () => {} })(extensionApiForTest(h.api));
@@ -222,7 +224,7 @@ describe("Pi subagents extension", () => {
         };
       },
     };
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "linux", nodeVersion: "22.19.0", registration: { enabled: true },
       createController: () => slow, diagnostic: () => {},
     })(extensionApiForTest(h.api));
@@ -241,7 +243,7 @@ describe("Pi subagents extension", () => {
 
   test("spawn registration gives one non-duplicated asynchronous delegation guideline", () => {
     const h = harness();
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "linux",
       registration: { enabled: true },
       createController: () => controller([]),
@@ -287,7 +289,7 @@ describe("Pi subagents extension", () => {
     expect(typeof registration.diagnostic).toBe("string");
     const h = harness();
     const diagnostics: string[] = [];
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "linux", registration,
       createController: () => { throw new Error("must not construct"); },
       diagnostic: (message) => diagnostics.push(message),
@@ -313,7 +315,7 @@ describe("Pi subagents extension", () => {
     ];
     for (const registration of registrations) {
       const h = harness();
-      createPiSubagentsExtension({ platform: "linux", registration,
+      void createPiSubagentsExtension({ platform: "linux", registration,
         createController: () => { throw new Error("must not construct"); }, diagnostic: () => {} })(extensionApiForTest(h.api));
       expect(h.tools).toEqual([]);
       expect([...h.handlers.keys()]).toEqual(["session_start"]);
@@ -329,7 +331,7 @@ describe("Pi subagents extension", () => {
     ];
     for (const registration of registrations) {
       const h = harness();
-      createPiSubagentsExtension({ platform: "linux", registration,
+      void createPiSubagentsExtension({ platform: "linux", registration,
         createController: () => controller([]), diagnostic: () => {} })(extensionApiForTest(h.api));
       expect(h.tools).toHaveLength(4);
     }
@@ -338,7 +340,7 @@ describe("Pi subagents extension", () => {
   test("invalid registration warns once at session start without registering tools", async () => {
     const h = harness();
     const diagnostics: string[] = [];
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "linux", registration: { enabled: false, diagnostic: "pi-subagents disabled: malformed managed delegation environment" },
       createController: () => { throw new Error("must not construct"); }, diagnostic: (message) => diagnostics.push(message),
     })(extensionApiForTest(h.api));
@@ -355,7 +357,7 @@ describe("Pi subagents extension", () => {
   test("child suppression registers nothing and cannot disable other extensions", () => {
     const h = harness();
     h.tools.push({ name: "other_extension" });
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "linux", registration: { enabled: false },
       createController: () => { throw new Error("must not construct"); }, diagnostic: () => {},
     })(extensionApiForTest(h.api));
@@ -366,7 +368,7 @@ describe("Pi subagents extension", () => {
   test("unsupported platform emits one bounded diagnostic and starts no resources", () => {
     const h = harness();
     const diagnostics: string[] = [];
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "darwin", nodeVersion: "22.19.0", registration: { enabled: true },
       createController: () => { throw new Error("must not construct"); },
       diagnostic: (message) => diagnostics.push(message),
@@ -382,7 +384,7 @@ describe("Pi subagents extension", () => {
   test("marked children still report an unsupported platform before suppressing lifecycle tools", () => {
     const h = harness();
     const diagnostics: string[] = [];
-    createPiSubagentsExtension({
+    void createPiSubagentsExtension({
       platform: "darwin", nodeVersion: "22.19.0", registration: { enabled: false },
       createController: () => { throw new Error("must not construct"); },
       diagnostic: (message) => diagnostics.push(message),
@@ -399,7 +401,7 @@ describe("Pi subagents extension", () => {
     for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
       const h = harness();
       const log: string[] = [];
-      createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+      void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
         createController: () => controller(log), diagnostic: () => {} })(extensionApiForTest(h.api));
       const ctx = await h.emit("session_start", { type: "session_start", reason: "startup" });
       expect(log).toEqual(["restore"]);
@@ -417,7 +419,7 @@ describe("Pi subagents extension", () => {
     let created = 0;
     const seen: Array<SubagentObservationPort | undefined> = [];
     const unsubscribe = onObservationPort((port) => seen.push(port));
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => {
         const index = created++;
         return {
@@ -440,7 +442,7 @@ describe("Pi subagents extension", () => {
   test("reload shuts down the old instance before the next instance restores", async () => {
     const h = harness();
     const log: string[] = [];
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => controller(log), diagnostic: () => {} })(extensionApiForTest(h.api));
     await h.emit("session_start", { type: "session_start", reason: "startup" });
     await h.emit("session_shutdown", { type: "session_shutdown", reason: "reload" });
@@ -454,7 +456,7 @@ describe("Pi subagents extension", () => {
     const release = deferred<void>();
     const log: string[] = [];
     let shutdownAttempts = 0;
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: () => ({ ...controller(log), shutdown: async () => {
         shutdownAttempts++;
         log.push(`shutdown-${shutdownAttempts}`);
@@ -478,7 +480,7 @@ describe("Pi subagents extension", () => {
 
   test("Node versions before 22.19 are rejected before registration", () => {
     const h = harness(); const diagnostics: string[] = [];
-    createPiSubagentsExtension({ platform: "linux", nodeVersion: "22.18.0", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", nodeVersion: "22.18.0", registration: { enabled: true },
       createController: () => { throw new Error("must not construct"); }, diagnostic: (message) => diagnostics.push(message) })(extensionApiForTest(h.api));
     expect(h.tools).toEqual([]);
     expect(diagnostics).toEqual([
@@ -491,7 +493,7 @@ describe("Pi subagents extension", () => {
     const log: string[] = [];
     let refreshStatus = (): void => { throw new Error("status refresh was not wired"); };
     let value = "agents: 1 running, 0 results ready";
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: (_context, _api, refresh) => {
         refreshStatus = refresh;
         return { ...controller(log), status: () => value };
@@ -509,7 +511,7 @@ describe("Pi subagents extension", () => {
     const log: string[] = [];
     let refreshStatus = (): void => { throw new Error("status refresh was not wired"); };
     let value = "agents: 1 running, 0 results ready";
-    createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+    void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
       createController: (_context, _api, refresh) => {
         refreshStatus = refresh;
         return { ...controller(log), status: () => value };

@@ -105,16 +105,16 @@ export function syncPublishedFileSync(destination: string, fs = systemDurableFil
 
 function writeSyncedFile(path: string, data: string | Uint8Array, fs: DurableFileSystem): void {
   let fd: number | undefined;
-  let primary: unknown;
+  let primary: Error | undefined;
   try {
     fd = fs.open(path, "wx", 0o600);
     fs.write(fd, data);
     fs.sync(fd);
   } catch (error) {
-    primary = error;
+    primary = asError(error);
   } finally {
     if (fd !== undefined) {
-      try { fs.close(fd); } catch (error) { primary ??= error; }
+      try { fs.close(fd); } catch (error) { primary ??= asError(error); }
     }
   }
   if (primary !== undefined) throw primary;
@@ -130,16 +130,20 @@ function syncDirectory(path: string, fs: DurableFileSystem): void {
 
 function syncDescriptor(path: string, fs: DurableFileSystem): void {
   let fd: number | undefined;
-  let primary: unknown;
+  let primary: Error | undefined;
   try {
     fd = fs.open(path, "r");
     fs.sync(fd);
   } catch (error) {
-    primary = error;
+    primary = asError(error);
   } finally {
     if (fd !== undefined) {
-      try { fs.close(fd); } catch (error) { primary ??= error; }
+      try { fs.close(fd); } catch (error) { primary ??= asError(error); }
     }
   }
   if (primary !== undefined) throw primary;
+}
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value), { cause: value });
 }

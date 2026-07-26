@@ -80,7 +80,7 @@ function fakeSource(options: {
 
 function harness(options: {
   mode?: string;
-  modeError?: unknown;
+  modeError?: Error;
   modeThrows?: boolean;
   sources?: ReadonlyArray<ReturnType<typeof fakeSource>>;
   setWidgetThrowsOn?: "mount" | "unmount";

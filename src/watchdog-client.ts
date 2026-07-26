@@ -157,7 +157,7 @@ export class WatchdogClient {
         if (value.type !== "exit") throw new Error("protocol_error: expected exit");
         await this.waitForReceipt();
         return { code: value.code, signal: value.signal };
-      }).catch(async (error) => { throw await this.containAndDescribe("exit", error); });
+      }).catch(async (error: unknown) => { throw await this.containAndDescribe("exit", error); });
       void exited.catch(() => undefined);
       const rpcStreams = this.requireRpcStreams();
       return { stdin: rpcStreams[0], stdout: rpcStreams[1], stderr: rpcStreams[2], exited };
@@ -468,7 +468,7 @@ function groupHasLiveMembers(pgid: ProcessGroupId): boolean {
 }
 function errorCode(error: unknown): string | undefined { if (typeof error !== "object" || error === null || !("code" in error)) return undefined; const value = Reflect.get(error, "code"); return typeof value === "string" ? value : undefined; }
 function procStatFields(stat: string): string[] { const end = stat.lastIndexOf(")"); if (end < 0) throw new Error("malformed proc stat"); return stat.slice(end + 2).split(" "); }
-function withTimeout<T>(promise: Promise<T>, ms: Milliseconds, message: string): Promise<T> { return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(message)), ms); promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); }); }); }
+function withTimeout<T>(promise: Promise<T>, ms: Milliseconds, message: string): Promise<T> { return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(message)), ms); promise.then((value) => { clearTimeout(timer); resolve(value); }, (error: unknown) => { clearTimeout(timer); reject(error); }); }); }
 async function settlesWithin(promise: Promise<void>, ms: Milliseconds): Promise<boolean> { try { await withTimeout(promise, ms, "timeout"); return true; } catch (error) { if (error instanceof Error && error.message === "timeout") return false; throw error; } }
 async function waitForPipeClosure(endpoints: ChildProcess["stdio"]): Promise<void> {
   while (!endpoints.every((endpoint) => endpoint === null || endpoint === undefined || endpoint.closed)) await delay(milliseconds(10));

@@ -169,9 +169,10 @@ export class RpcRunClient {
       throw new Error("invalid_state: rpc client has already been started");
     }
     this.started = true;
-    this.launchPromise = this.launch().catch((error: Error) => {
-      this.options.outputStore.appendDiagnostics(`child process error: ${error.message}\n`);
-      this.terminate(processExit(null, null, AgentErrorCode.ProcessExited), error);
+    this.launchPromise = this.launch().catch((error: unknown) => {
+      const failure = error instanceof Error ? error : new Error(String(error), { cause: error });
+      this.options.outputStore.appendDiagnostics(`child process error: ${failure.message}\n`);
+      this.terminate(processExit(null, null, AgentErrorCode.ProcessExited), failure);
       throw error;
     });
     return this.launchPromise;
@@ -197,9 +198,10 @@ export class RpcRunClient {
     void child.exited.then(({ code, signal }) => {
       this.decoder.end();
       this.terminate(processExit(code, signal, AgentErrorCode.ProcessExited), new Error(`rpc child terminated (code=${code}, signal=${signal})`));
-    }, (error: Error) => {
-      this.options.outputStore.appendDiagnostics(`child process error: ${error.message}\n`);
-      this.terminate(processExit(null, null, AgentErrorCode.ProcessExited), error);
+    }, (error: unknown) => {
+      const failure = error instanceof Error ? error : new Error(String(error), { cause: error });
+      this.options.outputStore.appendDiagnostics(`child process error: ${failure.message}\n`);
+      this.terminate(processExit(null, null, AgentErrorCode.ProcessExited), failure);
     });
   }
 
@@ -567,7 +569,8 @@ export class RpcRunClient {
   }
 
   private failLocalOutput(): void {
-    this.establishTransportFailure(
+    // Detached deliberately: `transportFailure` owns the sentinel and observes its settlement.
+    void this.establishTransportFailure(
       processExit(null, null, AgentErrorCode.ProcessExited),
       new Error("local output publication failed"),
       "local_output_error: authoritative output publication failed\n",

@@ -423,10 +423,6 @@ function isTerminal(state: AgentDisplayState): boolean {
     case CompletionState.Failed:
     case CompletionState.Cancelled:
       return true;
-    default: {
-      const exhaustive: never = state;
-      return exhaustive;
-    }
   }
 }
 

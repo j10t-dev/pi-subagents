@@ -74,9 +74,13 @@ export function createAgentWidgetSource(
     },
     dispose: (): void => {
       listeners.clear();
-      let failure: unknown;
+      let failure: Error | undefined;
       const contain = (operation: () => void): void => {
-        try { operation(); } catch (error) { failure ??= error; }
+        try {
+          operation();
+        } catch (error) {
+          failure ??= error instanceof Error ? error : new Error(String(error), { cause: error });
+        }
       };
       const pendingPortUnsubscribe = unsubscribePort;
       if (pendingPortUnsubscribe !== undefined) {

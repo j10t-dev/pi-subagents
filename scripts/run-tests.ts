@@ -193,7 +193,7 @@ async function runConcurrentGroups(
   const pipeline = dependencies.pipeline ?? nodePipeline;
   let directory: string | undefined;
   let outcome: Outcome = { kind: "status", status: 0 };
-  let cleanupError: unknown;
+  let cleanupError: Error | undefined;
   const transcripts: AllocatedTranscript[] = [];
 
   try {
@@ -213,7 +213,7 @@ async function runConcurrentGroups(
       runnable.length,
       dependencies,
     );
-    cleanupError = launched.closeError;
+    cleanupError = asError(launched.closeError);
     const originalMaxListeners = dependencies.stdout.getMaxListeners();
     if (originalMaxListeners !== 0) {
       dependencies.stdout.setMaxListeners(
@@ -230,13 +230,13 @@ async function runConcurrentGroups(
     outcome = { kind: "error", error };
   }
 
-  cleanupError ??= await firstCloseError(transcripts);
+  cleanupError ??= asError(await firstCloseError(transcripts));
   try {
     if (directory !== undefined) {
       await fs.rm(directory);
     }
   } catch (error) {
-    cleanupError ??= error;
+    cleanupError ??= asError(error);
   }
 
   if (cleanupError !== undefined) {
@@ -293,7 +293,7 @@ async function launchAndSettle(
       closes.push(
         closeHandle(transcript.handle).then(
           () => undefined,
-          (closeError) => closeError,
+          (closeError: unknown) => closeError,
         ),
       );
       continue;
@@ -309,7 +309,7 @@ async function launchAndSettle(
     closes.push(
       closeHandle(transcript.handle).then(
         () => undefined,
-        (closeError) => closeError,
+        (closeError: unknown) => closeError,
       ),
     );
   }
@@ -329,7 +329,7 @@ async function firstCloseError(
     transcripts.map((transcript) =>
       closeHandle(transcript.handle).then(
         () => undefined,
-        (error) => error,
+        (error: unknown) => error,
       )),
   );
   return results.find((error) => error !== undefined);
@@ -544,6 +544,13 @@ function canonicalRunnableGroups(groups: readonly TestGroup[]): TestGroup[] {
     .sort(
       (left, right) => order.get(left.name)! - order.get(right.name)!,
     );
+}
+
+function asError(value: unknown): Error | undefined {
+  if (value === undefined) return undefined;
+  return value instanceof Error
+    ? value
+    : new Error(String(value), { cause: value });
 }
 
 function boundedDiagnostic(prefix: string, error: unknown): string {

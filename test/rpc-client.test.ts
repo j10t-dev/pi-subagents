@@ -158,6 +158,9 @@ function makeClient(
   return { client, outputStore, attemptId, sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")) };
 }
 
+// `void client.start()` marks a deliberate launch race: the test issues commands before launch
+// resolves, and every such test later observes settlement through an awaited command, `waitSettled`
+// or `shutdown`, so a launch failure still fails the test.
 describe("RpcRunClient", () => {
   test("configures the decoder from the shared RPC record byte constant", () => {
     const source = readFileSync(join(import.meta.dir, "../src/rpc-client.ts"), "utf8");
@@ -333,7 +336,7 @@ describe("RpcRunClient", () => {
 
   test("issues unique, non-empty request IDs across commands", async () => {
     const { client } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     const [a, b] = await Promise.all([client.getEntries(), client.getEntries()]);
     expect(a).toBeDefined();
     expect(b).toBeDefined();
@@ -343,7 +346,7 @@ describe("RpcRunClient", () => {
   test("rejects a sequential repeated start while retaining control of the first child", async () => {
     const launchMarker = join(workDir, "launches");
     const { client } = makeClient("normal", workDir, {}, process.execPath, { FAKE_RPC_LAUNCH_MARKER: launchMarker });
-    client.start();
+    void client.start();
 
     expect(() => client.start()).toThrow(/already been started/);
     await expect(client.getEntries()).resolves.toEqual({ entries: [], leafId: null });
@@ -382,7 +385,7 @@ describe("RpcRunClient", () => {
 
   test("correlates out-of-order responses to the correct pending request", async () => {
     const { client } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     const results = await Promise.all([client.getEntries(), client.getEntries(), client.getEntries()]);
     for (const result of results) {
       expect(result.entries).toEqual([]);
@@ -392,14 +395,14 @@ describe("RpcRunClient", () => {
 
   test("rejects the caller's promise on command failure", async () => {
     const { client } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     await expect(client.getEntries(sessionEntryId("ffffffff"))).rejects.toThrow(/Entry not found/);
     await client.shutdown();
   });
 
   test("prompt resolves once the child acknowledges receipt", async () => {
     const { client } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     await expect(client.prompt("hello")).resolves.toBeUndefined();
     const settled = await client.waitSettled();
     expect(settled).toMatchObject({ reason: "agent_settled", stopReason: "stop" });
@@ -437,7 +440,7 @@ describe("RpcRunClient", () => {
       outputStore, uiForwarder: forwarder, agentId: AGENT,
       sessionPath: containedSessionPath(workDir, join(workDir, "session.jsonl")), runAttemptId: createRunAttemptId(),
     });
-    client.start();
+    void client.start();
     await client.prompt("hello");
     expect(launches).toBe(1);
     expect(readFileSync(marker, "utf8")).toBe("prompt:hello\n");
@@ -446,7 +449,7 @@ describe("RpcRunClient", () => {
 
   test("get_entries returns entries and a leaf cursor", async () => {
     const { client } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     const result = await client.getEntries();
     expect(result).toEqual({ entries: [], leafId: null });
     await client.shutdown();
@@ -471,7 +474,7 @@ describe("RpcRunClient", () => {
 
   test("agent_settled resolves waitSettled with the sole normal run boundary", async () => {
     const { client } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     const settled = await client.waitSettled();
     expect(settled).toMatchObject({ reason: "agent_settled", stopReason: "stop" });
@@ -485,14 +488,14 @@ describe("RpcRunClient", () => {
     ["incomplete-tool-use", { stopReason: "toolUse", toolSequenceCompleted: false, failureCause: terminalFailureCause(AgentErrorCode.RunInterrupted) }],
   ] as const) test(`uses authoritative session evidence for ${scenario}`, async () => {
     const { client } = makeClient(scenario, workDir);
-    client.start(); await client.prompt("hello");
+    void client.start(); await client.prompt("hello");
     await expect(client.waitSettled()).resolves.toMatchObject({ reason: "agent_settled", ...expected });
     await client.shutdown();
   });
 
   test("process exit before settlement resolves waitSettled with process_exited", async () => {
     const { client } = makeClient("crash", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     const settled = await client.waitSettled();
     expect(settled).toMatchObject({ reason: "process_exited", failureCause: terminalFailureCause(AgentErrorCode.ProcessExited) });
@@ -503,7 +506,7 @@ describe("RpcRunClient", () => {
   test("a run can still bind to an empty sidecar after an unbound partial candidate is discarded on exit", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("crash", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     client.bindRun(runId);
@@ -513,7 +516,7 @@ describe("RpcRunClient", () => {
 
   test("commands issued after process exit reject immediately", async () => {
     const { client } = makeClient("crash", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     await expect(client.getEntries()).rejects.toThrow(/terminated|exited/);
@@ -522,7 +525,7 @@ describe("RpcRunClient", () => {
 
   test("native abort is acknowledged and the run still settles via agent_settled", async () => {
     const { client } = makeClient("abort", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await expect(client.abort()).resolves.toBeUndefined();
     const settled = await client.waitSettled();
@@ -532,7 +535,7 @@ describe("RpcRunClient", () => {
 
   test("retains a bounded stderr tail without crashing", async () => {
     const { client, outputStore } = makeClient("stderr-flood", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     const tail = outputStore.getStderrTail();
@@ -542,7 +545,7 @@ describe("RpcRunClient", () => {
 
   test("retains the newest UTF-8-safe 50 KB suffix from one oversized stderr chunk", async () => {
     const { client, outputStore } = makeClient("stderr-single-chunk", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     const tail = outputStore.getStderrTail();
@@ -555,7 +558,7 @@ describe("RpcRunClient", () => {
 
   test("malformed required events contain the transport before settlement", async () => {
     const { client } = makeClient("malformed", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     const settled = await client.waitSettled();
     expect(settled).toEqual({ reason: "process_exited", code: null, signal: null, failureCause: terminalFailureCause(AgentErrorCode.ProtocolError) });
@@ -565,7 +568,7 @@ describe("RpcRunClient", () => {
   test("an oversized ordinary record is discarded and settlement continues", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("oversized", workDir);
-    client.start();
+    void client.start();
     client.bindRun(runId);
     await client.prompt("hello");
     const settled = await client.waitSettled();
@@ -577,7 +580,7 @@ describe("RpcRunClient", () => {
   test("an oversized Pi message_update is discarded through LF and recovered authoritatively", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("oversized-message-update", workDir);
-    client.start();
+    void client.start();
     client.bindRun(runId);
     await client.prompt("hello");
 
@@ -594,7 +597,7 @@ describe("RpcRunClient", () => {
     "an oversized %s-correlation response rejects pending work and contains the transport",
     async (kind) => {
       const { client } = makeClient(`oversized-response-${kind}`, workDir);
-      client.start();
+      void client.start();
       await expect(client.getEntries()).rejects.toThrow(/protocol_error/);
       await expect(client.getEntries()).rejects.toThrow(/exited|terminated|protocol_error/);
       await expect(client.waitSettled()).resolves.toEqual({ reason: "process_exited", code: null, signal: null, failureCause: terminalFailureCause(AgentErrorCode.ProtocolError) });
@@ -604,7 +607,7 @@ describe("RpcRunClient", () => {
 
   test("a known correlated oversized response rejects only that request and transport remains usable", async () => {
     const { client } = makeClient("oversized-response-known", workDir);
-    client.start();
+    void client.start();
     await expect(client.getEntries()).rejects.toThrow(/oversized get_entries response/);
     await expect(client.getEntries()).resolves.toEqual({ entries: [], leafId: null });
     await client.shutdown();
@@ -612,7 +615,7 @@ describe("RpcRunClient", () => {
 
   test("an irrelevant malformed ordinary record does not hide later authoritative settlement", async () => {
     const { client } = makeClient("malformed-ordinary", workDir);
-    client.start(); await client.prompt("hello");
+    void client.start(); await client.prompt("hello");
     await expect(client.waitSettled()).resolves.toMatchObject({ reason: "agent_settled", stopReason: "stop" });
     await client.shutdown();
   });
@@ -620,7 +623,7 @@ describe("RpcRunClient", () => {
   test("routes text_delta into the bound OutputStore run and settles with the final text", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     client.bindRun(runId);
     await client.prompt("hello");
     await client.waitSettled();
@@ -632,7 +635,7 @@ describe("RpcRunClient", () => {
   test("a poisoned text_end reaches neither current output, committed output, diagnostics nor settlement", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore: store } = makeClient("poison-text-end", workDir);
-    client.start();
+    void client.start();
     client.bindRun(runId);
     await client.prompt("hello");
 
@@ -647,7 +650,7 @@ describe("RpcRunClient", () => {
   test("promotes message boundaries and text deltas received before binding", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     client.bindRun(runId);
@@ -658,7 +661,7 @@ describe("RpcRunClient", () => {
   test("preserves finalised pre-bind output through shutdown after settlement", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     await client.shutdown();
@@ -674,7 +677,7 @@ describe("RpcRunClient", () => {
   test("preserves finalised pre-bind output through natural exit after settlement", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("settled-exit", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     await Bun.sleep(50);
@@ -692,7 +695,7 @@ describe("RpcRunClient", () => {
     const originalRunId: RunId = brandRunId("aaaaaaaa");
     const differentRunId: RunId = brandRunId("bbbbbbbb");
     const { client, outputStore } = makeClient("delayed-protocol-loss", workDir);
-    client.start();
+    void client.start();
     client.bindRun(originalRunId);
 
     expect(() => client.bindRun(originalRunId)).toThrow(/invalid_state/);
@@ -715,7 +718,7 @@ describe("RpcRunClient", () => {
     const occupyingAttempt = createRunAttemptId();
     outputStore.beginAttempt(occupyingAttempt);
     outputStore.bindRun(occupyingAttempt, occupiedRunId);
-    client.start();
+    void client.start();
 
     expect(() => client.bindRun(occupiedRunId)).toThrow(/already bound/);
     client.bindRun(clientRunId);
@@ -861,14 +864,14 @@ describe("RpcRunClient", () => {
   test("protocol loss marks a previously finalised output transport-incomplete", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("protocol-loss", workDir);
-    client.start(); client.bindRun(runId); await client.prompt("hello"); await client.waitSettled();
+    void client.start(); client.bindRun(runId); await client.prompt("hello"); await client.waitSettled();
     expect(outputStore.currentOutput(runId).transportIncomplete).toBe(true);
     await client.shutdown();
   });
 
   test("process exit rejects pending commands and resolves settlement once", async () => {
     const { client } = makeClient("pending-command", workDir);
-    client.start();
+    void client.start();
     const pending = client.getEntries();
     const settled = client.waitSettled();
     await client.shutdown();
@@ -878,7 +881,7 @@ describe("RpcRunClient", () => {
 
   test("spawn error rejects pending commands and resolves settlement", async () => {
     const { client } = makeClient("normal", workDir, {}, join(workDir, "missing-executable"));
-    client.start();
+    void client.start();
     const pending = client.getEntries();
     const settled = client.waitSettled();
     await expect(pending).rejects.toThrow(/terminated|ENOENT/);
@@ -888,7 +891,7 @@ describe("RpcRunClient", () => {
 
   test("shutdown resolves all waitSettled callers exactly once", async () => {
     const { client } = makeClient("pending-command", workDir);
-    client.start();
+    void client.start();
     const a = client.waitSettled(); const b = client.waitSettled();
     await client.shutdown();
     expect(await a).toEqual(await b);
@@ -900,7 +903,7 @@ describe("RpcRunClient", () => {
     const { client } = makeClient("ui", workDir, { confirm: async () => true }, process.execPath, {
       FAKE_RPC_COMMAND_MARKER: marker,
     });
-    client.start();
+    void client.start();
     await client.prompt("hello");
     const settled = await client.waitSettled();
     expect(settled).toMatchObject({ reason: "agent_settled", stopReason: "stop" });
@@ -918,7 +921,7 @@ describe("RpcRunClient", () => {
       setStatus: (_key, text) => calls.push(`status:${text}`),
       setWidget: (_key, lines) => calls.push(`widget:${lines?.join(",")}`),
     }, process.execPath, { FAKE_RPC_COMMAND_MARKER: marker });
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await expect(client.waitSettled()).resolves.toMatchObject({ reason: "agent_settled", stopReason: "stop" });
     expect(calls).toEqual(["[agent-1] done", "status:running", "widget:one", "status:undefined", "widget:undefined"]);
@@ -943,7 +946,7 @@ describe("RpcRunClient", () => {
     const statusKey = expectedParentKey(AGENT, "build");
     const widgetKey = expectedParentKey(AGENT, "jobs");
 
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await resourcesReady.promise;
     await finish(client);
@@ -1120,7 +1123,7 @@ describe("RpcRunClient", () => {
 
   test("sends a correlated cancellation when the parent UI rejects", async () => {
     const { client } = makeClient("ui", workDir, { confirm: async () => { throw new Error("dialog failed"); } });
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await expect(client.waitSettled()).resolves.toMatchObject({ reason: "agent_settled", stopReason: "stop" });
     await client.shutdown();
@@ -1129,7 +1132,7 @@ describe("RpcRunClient", () => {
   test("fails transport for overflowed aggregate usage without exposing the invalid candidate", async () => {
     const runId: RunId = brandRunId("aaaaaaaa");
     const { client, outputStore } = makeClient("overflowed-aggregate-usage", workDir);
-    client.start();
+    void client.start();
     client.bindRun(runId);
     await client.prompt("hello");
 
@@ -1166,7 +1169,7 @@ describe("RpcRunClient", () => {
       { FAKE_RPC_TERMINATION_MARKER: terminationMarker },
     );
     const terminationObserved = waitForFixtureMarker(terminationMarker);
-    client.start();
+    void client.start();
     client.bindRun(runId);
     await client.prompt("hello");
 
@@ -1184,7 +1187,7 @@ describe("RpcRunClient", () => {
 
   test("immediate exit after acknowledgement settles once as process_exited with no pending command", async () => {
     const { client } = makeClient("exit-immediate", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
 
     const first = client.waitSettled();
@@ -1203,7 +1206,7 @@ describe("RpcRunClient", () => {
     const { client, outputStore } = makeClient("exit-pending-get-entries", workDir, {}, process.execPath, {
       FAKE_RPC_HANDSHAKE_DIR: workDir,
     });
-    client.start();
+    void client.start();
     client.bindRun(runId);
     await client.prompt("hello");
     await waitForFixtureMarker(join(workDir, "get-entries-received"));
@@ -1228,7 +1231,7 @@ describe("RpcRunClient", () => {
 
   test("aggregates optional usage counters across finalised assistant messages", async () => {
     const { client } = makeClient("multi-turn-usage", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     expect(client.getUsage()).toEqual(expect.objectContaining({
@@ -1240,7 +1243,7 @@ describe("RpcRunClient", () => {
 
   test("keeps optional usage counters undefined when no finalised message reports them", async () => {
     const { client } = makeClient("multi-turn-usage-undefined", workDir);
-    client.start();
+    void client.start();
     await client.prompt("hello");
     await client.waitSettled();
     expect(client.getUsage()?.usage.cacheWrite1h).toBeUndefined();
@@ -1250,7 +1253,7 @@ describe("RpcRunClient", () => {
 
   test("shutdown rejects any pending requests and leaves no dangling promises", async () => {
     const { client } = makeClient("normal", workDir);
-    client.start();
+    void client.start();
     const pending = client.getEntries();
     await client.shutdown();
     await expect(pending).rejects.toThrow();

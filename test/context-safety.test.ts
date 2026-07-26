@@ -98,7 +98,8 @@ describe("context safety", () => {
   test("cumulative message updates and a huge tool result retain bounded authoritative output", async () => {
     const fixture = fakeClient("context-cumulative");
     try {
-      fixture.client.start();
+      // Deliberate launch race: settlement is observed by the waitSettled assertion below.
+      void fixture.client.start();
       const id = runId("aaaaaaaa");
       fixture.client.bindRun(id);
       await fixture.client.prompt("flood");
@@ -116,7 +117,8 @@ describe("context safety", () => {
     for (const scenario of ["oversized-ui", "malformed"] as const) {
       const fixture = fakeClient(scenario);
       try {
-        fixture.client.start();
+        // Deliberate launch race: settlement is observed by the waitSettled assertion below.
+        void fixture.client.start();
         await fixture.client.prompt("break transport");
         await expect(fixture.client.waitSettled()).resolves.toEqual({ reason: "process_exited", code: null, signal: null,
           failureCause: terminalFailureCause(AgentErrorCode.ProtocolError) });
@@ -130,7 +132,8 @@ describe("context safety", () => {
   test("large stderr remains within its public tail limit", async () => {
     const fixture = fakeClient("stderr-single-chunk");
     try {
-      fixture.client.start();
+      // Deliberate launch race: settlement is observed by the waitSettled assertion below.
+      void fixture.client.start();
       await fixture.client.prompt("stderr");
       await fixture.client.waitSettled();
       const tail = fixture.store.getStderrTail();
@@ -286,7 +289,8 @@ async function providerHarness(controller: SubagentController): Promise<{
     tools: () => createSubagentTools(controller), beforeTree: () => controller.beforeTree(),
     beforeSwitch: () => controller.beforeSwitch(), beforeFork: () => controller.beforeFork(),
   };
-  createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
+  // Detached widget startup: no widget seam is supplied here and `installWidget` reports its own failure.
+  void createPiSubagentsExtension({ platform: "linux", registration: { enabled: true },
     createController: () => adapter, diagnostic: () => {} })(extensionApiForTest(api));
   const context = { ui: { setStatus: () => {} } };
   for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, context);
@@ -365,7 +369,8 @@ function hostileLaunch(
       return verifiedContainmentReceiptPath(session.containmentReceiptPath);
     } },
     ready: async () => containment, persistLaunchRequested: async () => {}, persistRunStarted: async () => {},
-    start: async () => { client.start(); },
+    // Deliberate launch race: this adapter returns before launch, and the client settles through `waitSettled`.
+    start: async () => { void client.start(); },
     getEntries: async () => queried
       ? { entries: [{ type: "message", id: nativeRunId, message: { role: "user", content: assignment } }], leafId: nativeRunId }
       : (queried = true, { entries: [], leafId: null }),
