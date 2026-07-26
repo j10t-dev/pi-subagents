@@ -11,7 +11,6 @@ import {
 } from "../src/agent-widget/conversation-model.ts";
 import {
   AgentState,
-  agentDepth,
   agentOrdinal,
   conversationRevision,
   viewportLineCount,
@@ -24,11 +23,11 @@ import {
 function conversation(revision = 1, options: Partial<ConversationSnapshot> = {}): ConversationSnapshot {
   return Object.freeze({
     revision: conversationRevision(revision),
-    items: [],
+    turns: [],
     truncatedBefore: false,
     availability: "live" as const,
-    row: Object.freeze({
-      ordinal: agentOrdinal("A1.2"), depth: agentDepth(1), model: "luna:h" as ModelLabel,
+    header: Object.freeze({
+      ordinal: agentOrdinal("A1.2"), model: "luna:h" as ModelLabel,
       context: "42%" as ContextLabel, taskLabel: "Research terminal UX" as TaskLabel,
       state: AgentState.Running as AgentDisplayState,
     }),
@@ -102,7 +101,7 @@ describe("child conversation model", () => {
 
     expect(model).toMatchObject({
       following: false, lineOffset: 4, thinkingVisible: false, toolsExpanded: true,
-      conversation: { availability: "unavailable", routeAvailable: false, items: [] },
+      conversation: { availability: "unavailable", routeAvailable: false, turns: [] },
     });
   });
 });

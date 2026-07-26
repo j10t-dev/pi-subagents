@@ -2,11 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { Theme, type KeybindingsManager as AppKeybindingsManager, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, TUI, TUI_KEYBINDINGS, visibleWidth, type Terminal } from "@earendil-works/pi-tui";
 
-import type { AgentDisplayState, ConversationItem, ConversationSnapshot } from "../src/agent-observation.ts";
+import type { AgentDisplayState, ConversationAssistantBlock, ConversationSnapshot, ConversationTurn } from "../src/agent-observation.ts";
 import { ChildConversationComponent } from "../src/agent-widget/conversation-component.ts";
 import { createChildConversationModel } from "../src/agent-widget/conversation-model.ts";
 import {
-  AgentState, agentDepth, agentOrdinal, conversationItemKey, conversationRevision,
+  AgentState, agentOrdinal, conversationCallKey, conversationRevision, conversationTurnKey,
   type ContextLabel, type ModelLabel, type TaskLabel, type ToolDisplayName, type TranscriptText,
 } from "../src/domain.ts";
 
@@ -51,17 +51,23 @@ const theme = new Theme(foreground, background, "truecolor");
 
 function conversation(revision = 1): ConversationSnapshot {
   const r = conversationRevision(revision);
-  const items: ConversationItem[] = [
-    { key: conversationItemKey(r, 0), kind: "thinking", phase: "final", text: "private thought" as TranscriptText },
-    { key: conversationItemKey(r, 1), kind: "tool", tool: "read" as ToolDisplayName, phase: "completed", preview: "expanded preview" as TranscriptText },
-    ...Array.from({ length: 30 }, (_, index): ConversationItem => ({
-      key: conversationItemKey(r, index + 2), kind: "user", text: `line ${index}` as TranscriptText,
+  const assistantBlocks: readonly ConversationAssistantBlock[] = [
+    { kind: "thinking", text: "private thought" as TranscriptText },
+    { kind: "tool", presentation: {
+      callKey: conversationCallKey(r, 0, 1), tool: "read" as ToolDisplayName,
+      phase: "completed", preview: "expanded preview" as TranscriptText, rendering: "renderer-override",
+    } },
+  ];
+  const turns: readonly ConversationTurn[] = [
+    { key: conversationTurnKey(r, 0), kind: "assistant", phase: "final", blocks: assistantBlocks },
+    ...Array.from({ length: 30 }, (_, index): ConversationTurn => ({
+      key: conversationTurnKey(r, index + 1), kind: "user", text: `line ${index}` as TranscriptText,
     })),
   ];
   return Object.freeze({
-    revision: r, items: Object.freeze(items), truncatedBefore: false, availability: "live",
-    row: Object.freeze({
-      ordinal: agentOrdinal("A1.2"), depth: agentDepth(1), model: "luna:h" as ModelLabel,
+    revision: r, turns: Object.freeze(turns), truncatedBefore: false, availability: "live",
+    header: Object.freeze({
+      ordinal: agentOrdinal("A1.2"), model: "luna:h" as ModelLabel,
       context: "42%" as ContextLabel, taskLabel: "Task" as TaskLabel,
       state: AgentState.Running as AgentDisplayState,
     }),

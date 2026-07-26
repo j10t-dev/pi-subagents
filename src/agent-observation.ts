@@ -13,8 +13,11 @@ import {
   type AgentWidgetRevision,
   type ContextLabel,
   type ContextPercent,
-  type ConversationItemKey,
+  type ConversationCallKey,
   type ConversationRevision,
+  type ConversationTurnKey,
+  type PresentationCwd,
+  type SafePresentationJson,
   type ModelLabel,
   type ModelSpec,
   type RunId,
@@ -191,22 +194,49 @@ export interface SelectedTranscriptSource {
   subscribe(listener: (snapshot: SelectedTranscriptSnapshot) => void): () => void;
 }
 
-/** Correlation-free transcript content accepted by the presentation boundary. */
-export type ConversationItem =
-  | { readonly key: ConversationItemKey; readonly kind: "user"; readonly text: TranscriptText }
-  | { readonly key: ConversationItemKey; readonly kind: "assistant"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
-  | { readonly key: ConversationItemKey; readonly kind: "thinking"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
-  | { readonly key: ConversationItemKey; readonly kind: "tool"; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
-  | { readonly key: ConversationItemKey; readonly kind: "notice"; readonly code: "transport-unavailable" | "projection-unavailable" | "context-compacted" };
+export type ConversationToolRendering = "native-built-in" | "native-generic" | "renderer-override";
+
+export interface ConversationToolPresentation {
+  readonly callKey: ConversationCallKey;
+  readonly tool: ToolDisplayName;
+  readonly phase: "running" | "completed" | "failed";
+  readonly arguments?: SafePresentationJson;
+  readonly result?: {
+    readonly content: readonly TranscriptText[];
+    readonly details?: SafePresentationJson;
+    readonly isError: boolean;
+  };
+  readonly preview?: TranscriptText;
+  readonly rendering: ConversationToolRendering;
+}
+
+export type ConversationAssistantBlock =
+  | { readonly kind: "text"; readonly text: TranscriptText }
+  | { readonly kind: "thinking"; readonly text: TranscriptText }
+  | { readonly kind: "tool"; readonly presentation: ConversationToolPresentation };
+
+export type ConversationTurn =
+  | { readonly key: ConversationTurnKey; readonly kind: "user"; readonly text: TranscriptText }
+  | { readonly key: ConversationTurnKey; readonly kind: "assistant"; readonly phase: "partial" | "final"; readonly stopReason?: ConversationStopReason; readonly blocks: readonly ConversationAssistantBlock[] }
+  | { readonly key: ConversationTurnKey; readonly kind: "notice"; readonly code: "transport-unavailable" | "projection-unavailable" | "context-compacted" };
+
+export interface ConversationHeader {
+  readonly ordinal: AgentOrdinal;
+  readonly model: ModelLabel;
+  readonly context: ContextLabel;
+  readonly taskLabel: TaskLabel;
+  readonly state: AgentDisplayState;
+}
 
 /** Atomic, correlation-free input to the read-only child-conversation UI. */
 export interface ConversationSnapshot {
   readonly revision: ConversationRevision;
-  readonly items: readonly ConversationItem[];
+  readonly turns: readonly ConversationTurn[];
   readonly truncatedBefore: boolean;
   readonly availability: "live" | "stopped" | "unavailable";
-  readonly row: AgentRow;
+  readonly header: ConversationHeader;
   readonly routeAvailable: boolean;
+  readonly renderingCwd?: PresentationCwd;
 }
 
 export interface ManagedSelectedTranscriptSource extends SelectedTranscriptSource {

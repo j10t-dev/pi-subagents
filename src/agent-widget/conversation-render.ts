@@ -1,7 +1,7 @@
 import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { Markdown, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
-import type { ConversationItem } from "../agent-observation.ts";
+import type { ConversationAssistantBlock, ConversationTurn } from "../agent-observation.ts";
 import { MAX_CONVERSATION_LAYOUT_LINES } from "../constants.ts";
 import {
   viewportLineCount,
@@ -17,6 +17,7 @@ export interface ChildConversationRender {
   readonly layout: ConversationLayout;
 }
 
+
 /** Pure text-cell rendering over correlation-free conversation state. */
 export function renderChildConversation(
   model: ChildConversationModel,
@@ -26,8 +27,8 @@ export function renderChildConversation(
 ): ChildConversationRender {
   const columns = Number(width);
   const header = [
-    theme.fg("accent", `${model.conversation.row.ordinal} · ${model.conversation.row.model} · ${model.conversation.row.context} · ${model.conversation.row.state}`),
-    theme.fg("muted", String(model.conversation.row.taskLabel)),
+    theme.fg("accent", `${model.conversation.header.ordinal} · ${model.conversation.header.model} · ${model.conversation.header.context} · ${model.conversation.header.state}`),
+    theme.fg("muted", String(model.conversation.header.taskLabel)),
   ].map((line) => bounded(line, columns));
   const status = [bounded(theme.fg(statusColour(model), statusText(model)), columns)];
   const footer = [bounded(theme.fg("dim", footerText(model)), columns)];
@@ -64,7 +65,7 @@ function layoutTranscript(model: ChildConversationModel, theme: Theme, width: nu
   if (model.conversation.truncatedBefore) {
     append(wrapped(theme.fg("warning", "Earlier source history omitted"), width));
   }
-  for (const item of model.conversation.items) append(renderItem(item, model, theme, width));
+  for (const turn of model.conversation.turns) append(renderTurn(turn, model, theme, width));
 
   const ordered: string[] = [];
   const firstLine = retainedLines === MAX_CONVERSATION_LAYOUT_LINES ? nextLine : 0;
@@ -76,32 +77,43 @@ function layoutTranscript(model: ChildConversationModel, theme: Theme, width: nu
   return Object.freeze([marker, ...ordered.slice(1)]);
 }
 
-function renderItem(
-  item: ConversationItem,
+function renderTurn(
+  turn: ConversationTurn,
   model: ChildConversationModel,
   theme: Theme,
   width: number,
 ): readonly string[] {
-  switch (item.kind) {
-    case "user":
-      return wrapped(theme.fg("userMessageText", `You · ${item.text}`), width);
-    case "assistant": {
-      const label = bounded(theme.fg("accent", `Assistant · ${item.phase}`), width);
-      const markdown = new Markdown(item.text, 0, 0, getMarkdownTheme());
+  switch (turn.kind) {
+    case "user": return wrapped(theme.fg("userMessageText", `You · ${stripOsc133(turn.text)}`), width);
+    case "notice": return wrapped(theme.fg("warning", noticeText(turn.code)), width);
+    case "assistant": return turn.blocks.flatMap((block) => renderAssistantBlock(block, turn.phase, model, theme, width));
+  }
+}
+
+function renderAssistantBlock(
+  block: ConversationAssistantBlock,
+  phase: "partial" | "final",
+  model: ChildConversationModel,
+  theme: Theme,
+  width: number,
+): readonly string[] {
+  switch (block.kind) {
+    case "text": {
+      const label = bounded(theme.fg("accent", `Assistant · ${phase}`), width);
+      const markdown = new Markdown(stripOsc133(block.text), 0, 0, getMarkdownTheme());
       return [label, ...markdown.render(Math.max(1, width)).map((line) => bounded(line, width))];
     }
     case "thinking":
       return model.thinkingVisible
-        ? wrapped(theme.fg("thinkingText", `Thinking · ${item.phase} · ${item.text}`), width)
+        ? wrapped(theme.fg("thinkingText", `Thinking · ${stripOsc133(block.text)}`), width)
         : [];
     case "tool": {
-      const colour = item.phase === "failed" ? "error" : item.phase === "completed" ? "success" : "warning";
-      const lines = wrapped(theme.fg(colour, `Tool · ${item.tool} · ${item.phase}`), width);
-      if (!model.toolsExpanded || item.preview === undefined) return lines;
-      return [...lines, ...wrapped(theme.fg("toolOutput", item.preview), width)];
+      const presentation = block.presentation;
+      const colour = presentation.phase === "failed" ? "error" : presentation.phase === "completed" ? "success" : "warning";
+      const lines = wrapped(theme.fg(colour, `Tool · ${presentation.tool} · ${presentation.phase}`), width);
+      if (!model.toolsExpanded || presentation.preview === undefined) return lines;
+      return [...lines, ...wrapped(theme.fg("toolOutput", stripOsc133(presentation.preview)), width)];
     }
-    case "notice":
-      return wrapped(theme.fg("warning", noticeText(item.code)), width);
   }
 }
 
@@ -120,7 +132,7 @@ function statusColour(model: ChildConversationModel): "success" | "warning" | "m
   return model.conversation.routeAvailable && model.conversation.availability !== "unavailable" ? "success" : "warning";
 }
 
-function noticeText(code: Extract<ConversationItem, { kind: "notice" }>["code"]): string {
+function noticeText(code: Extract<ConversationTurn, { kind: "notice" }>["code"]): string {
   switch (code) {
     case "context-compacted": return "Context compacted";
     case "transport-unavailable": return "Transport unavailable";
@@ -135,10 +147,41 @@ function footerText(model: ChildConversationModel): string {
 
 function wrapped(text: string, width: number): string[] {
   if (width === 0) return [];
-  const lines = wrapTextWithAnsi(text, width);
+  const lines = wrapTextWithAnsi(stripOsc133(text), width);
   return (lines.length === 0 ? [""] : lines).map((line) => bounded(line, width));
 }
 
 function bounded(line: string, width: number): string {
-  return truncateToWidth(line, width, "");
+  return truncateToWidth(stripOsc133(line), width, "");
+}
+
+/** Removes OSC 133 shell-integration sequences without disturbing unrelated terminal styling. */
+function stripOsc133(value: string): string {
+  let output = "";
+  let index = 0;
+  while (index < value.length) {
+    if (value[index] !== "\u001b" || value[index + 1] !== "]" || !value.startsWith("133;", index + 2)) {
+      output += value[index]!;
+      index += 1;
+      continue;
+    }
+    let cursor = index + 6;
+    let terminated = false;
+    while (cursor < value.length) {
+      if (value[cursor] === "\u0007") {
+        cursor += 1;
+        terminated = true;
+        break;
+      }
+      if (value[cursor] === "\u001b" && value[cursor + 1] === "\\") {
+        cursor += 2;
+        terminated = true;
+        break;
+      }
+      cursor += 1;
+    }
+    if (!terminated) break;
+    index = cursor;
+  }
+  return output;
 }
