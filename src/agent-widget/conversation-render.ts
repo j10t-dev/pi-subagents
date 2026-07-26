@@ -2,6 +2,7 @@ import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { Markdown, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 import type { ConversationItem } from "../agent-observation.ts";
+import { MAX_CONVERSATION_LAYOUT_LINES } from "../constants.ts";
 import {
   viewportLineCount,
   visualLineCount,
@@ -9,8 +10,6 @@ import {
   type TerminalRows,
 } from "../domain.ts";
 import type { ChildConversationModel, ConversationLayout } from "./conversation-model.ts";
-
-export const MAX_VISUAL_TRANSCRIPT_LINES = 4_096;
 
 export interface ChildConversationRender {
   readonly lines: readonly string[];
@@ -50,16 +49,31 @@ export function renderChildConversation(
 }
 
 function layoutTranscript(model: ChildConversationModel, theme: Theme, width: number): readonly string[] {
-  const lines: string[] = [];
+  const lines = new Array<string>(MAX_CONVERSATION_LAYOUT_LINES);
+  let retainedLines = 0;
+  let totalLines = 0;
+  let nextLine = 0;
+  const append = (next: readonly string[]): void => {
+    for (const line of next) {
+      lines[nextLine] = bounded(line, width);
+      nextLine = (nextLine + 1) % MAX_CONVERSATION_LAYOUT_LINES;
+      retainedLines = Math.min(retainedLines + 1, MAX_CONVERSATION_LAYOUT_LINES);
+      totalLines += 1;
+    }
+  };
   if (model.conversation.truncatedBefore) {
-    lines.push(...wrapped(theme.fg("warning", "Earlier source history omitted"), width));
+    append(wrapped(theme.fg("warning", "Earlier source history omitted"), width));
   }
-  for (const item of model.conversation.items) {
-    lines.push(...renderItem(item, model, theme, width));
+  for (const item of model.conversation.items) append(renderItem(item, model, theme, width));
+
+  const ordered: string[] = [];
+  const firstLine = retainedLines === MAX_CONVERSATION_LAYOUT_LINES ? nextLine : 0;
+  for (let index = 0; index < retainedLines; index += 1) {
+    ordered.push(lines[(firstLine + index) % MAX_CONVERSATION_LAYOUT_LINES]!);
   }
-  if (lines.length <= MAX_VISUAL_TRANSCRIPT_LINES) return Object.freeze(lines.map((line) => bounded(line, width)));
+  if (totalLines <= MAX_CONVERSATION_LAYOUT_LINES) return Object.freeze(ordered);
   const marker = bounded(theme.fg("warning", "Visual beginning omitted"), width);
-  return Object.freeze([marker, ...lines.slice(-(MAX_VISUAL_TRANSCRIPT_LINES - 1)).map((line) => bounded(line, width))]);
+  return Object.freeze([marker, ...ordered.slice(1)]);
 }
 
 function renderItem(

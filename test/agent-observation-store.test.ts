@@ -242,7 +242,7 @@ describe("AgentObservationStore", () => {
 
     expect(direct.entries[0]).toMatchObject({ transcriptFile: transcriptFileName("child.jsonl") });
     expect(direct.health).toEqual({ kind: "healthy" });
-    expect(JSON.stringify(direct.entries[0]!.transcriptFile)).not.toContain("/state/owner/sessions");
+    expect(JSON.stringify(direct)).not.toContain("/state/owner/sessions");
   });
 
   test("degrades projection health but retains the row when the session basename is unsafe", () => {

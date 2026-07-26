@@ -267,7 +267,10 @@ describe("transcriptFileName", () => {
 
   test("admits the exact byte bound and throws on every rejected basename", () => {
     const longest = `${"x".repeat(Number(MAX_TRANSCRIPT_FILE_NAME_BYTES) - 6)}.jsonl`;
+    const longestMultibyte = `${"界".repeat(83)}.jsonl`;
     expect(transcriptFileName(longest)).toBe(longest as TranscriptFileName);
+    expect(transcriptFileName(longestMultibyte)).toBe(longestMultibyte as TranscriptFileName);
+    expect(tryTranscriptFileName(`${"界".repeat(84)}.jsonl`)).toBeUndefined();
     expect(() => transcriptFileName("dir/child.jsonl")).toThrow(/transcript file name/);
   });
 });

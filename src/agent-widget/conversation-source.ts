@@ -26,11 +26,12 @@ export function createSelectedTranscriptSource(
 ): ManagedSelectedTranscriptSource {
   const listeners = new Set<(snapshot: SelectedTranscriptSnapshot) => void>();
   let disposed = false;
-  let revision = 1;
+  const initialTranscript = transcript.snapshot();
+  let revision = Number(initialTranscript.revision) === 0 ? 0 : 1;
   let currentRow = row;
   let routeAvailable = true;
   let unsubscribe: (() => void) | undefined;
-  let published: SelectedTranscriptSnapshot = frozen(revision, transcript.snapshot(), currentRow, true);
+  let published: SelectedTranscriptSnapshot = frozen(revision, initialTranscript, currentRow, true);
 
   transcript.setDisplayState(row.state);
 
@@ -44,7 +45,11 @@ export function createSelectedTranscriptSource(
     for (const listener of [...listeners]) {
       if (!listeners.has(listener)) continue;
       try {
-        listener(published);
+        const result: unknown = listener(published);
+        if (isThenable(result)) {
+          listeners.delete(listener);
+          void Promise.resolve(result).catch(() => undefined);
+        }
       } catch {
         listeners.delete(listener);
       }
@@ -100,6 +105,11 @@ export function createSelectedTranscriptSource(
       transcript.dispose();
     },
   };
+}
+
+function isThenable(value: unknown): boolean {
+  return typeof value === "object" && value !== null
+    && typeof (value as { readonly then?: unknown }).then === "function";
 }
 
 function sameRoute(left: TranscriptRoute, right: TranscriptRoute): boolean {

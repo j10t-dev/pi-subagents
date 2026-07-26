@@ -322,7 +322,7 @@ export function agentOrdinal(value: string): AgentOrdinal {
 export function tryTranscriptFileName(value: string): TranscriptFileName | undefined {
   const bytes = new TextEncoder().encode(value).byteLength;
   if (bytes === 0 || bytes > Number(MAX_TRANSCRIPT_FILE_NAME_BYTES)) return undefined;
-  if (!value.endsWith(TRANSCRIPT_FILE_SUFFIX) || value === "." || value === "..") return undefined;
+  if (value === "." || value === ".." || !value.endsWith(TRANSCRIPT_FILE_SUFFIX)) return undefined;
   if (TRANSCRIPT_FILE_NAME_UNSAFE_PATTERN.test(value) || basename(value) !== value) return undefined;
   return value as TranscriptFileName;
 }

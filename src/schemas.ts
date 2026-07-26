@@ -14,7 +14,12 @@ import {
   uiRequestId,
 } from "./domain.ts";
 import type { AgentId, Milliseconds, SessionEntryId, ThinkingLevel, UIRequestId, Usage } from "./domain.ts";
-import { MAX_COMPLETION_OUTPUT_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_MAX_DEPTH } from "./constants.ts";
+import {
+  MAX_COMPLETION_OUTPUT_BYTES,
+  MAX_ERROR_MESSAGE_BYTES,
+  MAX_MAX_DEPTH,
+  MAX_TRANSCRIPT_SOURCE_ITEMS,
+} from "./constants.ts";
 
 type LiteralSchemas<T extends readonly string[]> = {
   -readonly [K in keyof T]: TLiteral<T[K]>;
@@ -414,7 +419,7 @@ export type SettingsDocumentDto = Static<typeof SettingsDocumentSchema>;
  * Extra properties are tolerated; only the fields this projection reads are validated.
  */
 export interface TranscriptSessionHeaderRecord {
-  readonly version: 1 | 2 | 3;
+  readonly version: 2 | 3;
   readonly sessionId: AgentId;
 }
 
@@ -458,11 +463,11 @@ const EntryLineageSchema = {
   parentId: Type.Union([SessionEntryIdSchema, Type.Null()]),
 } as const;
 
-/** Version 1 omits the field entirely; the migration that introduced it started at 2. */
+/** Only transcript formats with native entry IDs are available to the conversation view. */
 export const TranscriptSessionHeaderSchema = Type.Object({
   type: Type.Literal("session"),
   id: AgentIdSchema,
-  version: Type.Optional(Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)])),
+  version: Type.Union([Type.Literal(2), Type.Literal(3)]),
 });
 
 const TextContentSchema = Type.Object({ type: Type.Literal("text"), text: Type.String() });
@@ -475,17 +480,20 @@ const ToolCallContentSchema = Type.Object({
 
 const TranscriptUserMessageSchema = Type.Object({
   role: Type.Literal("user"),
-  content: Type.Union([Type.String(), Type.Array(Type.Unknown())]),
+  content: Type.Union([
+    Type.String(),
+    Type.Array(Type.Unknown(), { maxItems: MAX_TRANSCRIPT_SOURCE_ITEMS }),
+  ]),
 });
 const TranscriptAssistantMessageSchema = Type.Object({
   role: Type.Literal("assistant"),
-  content: Type.Array(Type.Unknown()),
+  content: Type.Array(Type.Unknown(), { maxItems: MAX_TRANSCRIPT_SOURCE_ITEMS }),
 });
 const TranscriptToolResultMessageSchema = Type.Object({
   role: Type.Literal("toolResult"),
   toolCallId: NativeCorrelationSchema,
   toolName: NativeCorrelationSchema,
-  content: Type.Array(Type.Unknown()),
+  content: Type.Array(Type.Unknown(), { maxItems: MAX_TRANSCRIPT_SOURCE_ITEMS }),
   isError: Type.Optional(Type.Boolean()),
 });
 const TranscriptOtherMessageSchema = Type.Object({ role: Type.String() });
@@ -502,7 +510,7 @@ const TranscriptCompactionEntrySchema = Type.Object({
   ...EntryLineageSchema,
   summary: Type.Optional(Type.String()),
   firstKeptEntryId: Type.Optional(SessionEntryIdSchema),
-  retainedTail: Type.Optional(Type.Array(Type.Unknown())),
+  retainedTail: Type.Optional(Type.Array(Type.Unknown(), { maxItems: MAX_TRANSCRIPT_SOURCE_ITEMS })),
 });
 const TranscriptOtherEntrySchema = Type.Object({ type: Type.String(), ...EntryLineageSchema });
 const KNOWN_ENTRY_TYPES = new Set(["message", "compaction"]);
@@ -510,7 +518,7 @@ const KNOWN_ENTRY_TYPES = new Set(["message", "compaction"]);
 /** Decodes one complete session header record; an unsupported version is not a header. */
 export function decodeTranscriptSessionHeader(value: unknown): TranscriptSessionHeaderRecord | undefined {
   if (!Value.Check(TranscriptSessionHeaderSchema, value)) return undefined;
-  return { version: value.version ?? 1, sessionId: agentId(value.id) };
+  return { version: value.version, sessionId: agentId(value.id) };
 }
 
 /** Decodes one complete session entry record; a malformed record is rejected as a whole. */

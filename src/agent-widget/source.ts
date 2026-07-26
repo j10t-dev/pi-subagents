@@ -11,7 +11,7 @@ import {
   MAX_WATCH_RETRY_INTERVAL_MS,
   WATCH_FALLBACK_INTERVAL_MS,
 } from "../constants.ts";
-import type { AgentCount, AgentId, AgentOrdinal, AbsolutePath } from "../domain.ts";
+import type { AgentCount, AgentId, AgentOrdinal, AbsolutePath, TranscriptRoute } from "../domain.ts";
 import { createRecursiveAgentIndex } from "../recursive-agent-index.ts";
 import {
   createNodeTranscriptFileSystem,
@@ -70,7 +70,11 @@ export function createAgentWidgetSource(
     ...(deps.onDiagnostic === undefined ? {} : { onDiagnostic: deps.onDiagnostic }),
   });
   current = index.snapshot();
-  let selected: { readonly ordinal: AgentOrdinal; readonly source: ManagedSelectedTranscriptSource } | undefined;
+  let selected: {
+    readonly ordinal: AgentOrdinal;
+    readonly route: TranscriptRoute;
+    readonly source: ManagedSelectedTranscriptSource;
+  } | undefined;
 
   /** Re-binds the open conversation to the freshly projected rows, if one is open. */
   function updateSelection(): void {
@@ -96,11 +100,20 @@ export function createAgentWidgetSource(
   return {
     snapshot: (): AgentWidgetSnapshot => current,
     transcriptSource: (ordinal: AgentOrdinal): SelectedTranscriptSource | undefined => {
-      if (selected?.ordinal === ordinal) return selected.source;
       const selectedRoute = index.transcriptRoute(ordinal);
       const selectedRow = current.rows.find((row) => row.ordinal === ordinal);
-      if (selectedRoute === undefined || selectedRow === undefined) return undefined;
-      selected?.source.dispose();
+      if (selectedRoute === undefined || selectedRow === undefined) {
+        const stale = selected;
+        selected = undefined;
+        stale?.source.dispose();
+        return undefined;
+      }
+      if (selected?.ordinal === ordinal
+        && sameRoute(selected.route, selectedRoute)
+        && selected.source.snapshot().routeAvailable) return selected.source;
+      const stale = selected;
+      selected = undefined;
+      stale?.source.dispose();
       const authoritative = createSessionTranscriptSource(selectedRoute, {
         agentDir: deps.agentDir,
         onDiagnostic: deps.onDiagnostic ?? (() => {}),
@@ -117,7 +130,7 @@ export function createAgentWidgetSource(
           selectedRoute.direct ? port.transcriptSource(selectedRoute.childSessionId) : undefined,
         ),
       );
-      selected = { ordinal, source };
+      selected = { ordinal, route: selectedRoute, source };
       return source;
     },
     subscribe: (onChange: () => void): (() => void) => {
@@ -150,4 +163,11 @@ export function createAgentWidgetSource(
       if (failure !== undefined) throw failure;
     },
   };
+}
+
+function sameRoute(left: TranscriptRoute, right: TranscriptRoute): boolean {
+  return left.ownerSessionId === right.ownerSessionId
+    && left.childSessionId === right.childSessionId
+    && left.fileName === right.fileName
+    && left.direct === right.direct;
 }

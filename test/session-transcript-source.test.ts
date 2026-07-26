@@ -1,3 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, test } from "bun:test";
 
 import {
@@ -5,6 +10,7 @@ import {
   transcriptText,
   type AgentDisplayState,
   type AuthoritativeTranscriptSource,
+  type TranscriptListener,
 } from "../src/agent-observation.ts";
 import {
   MAX_RPC_RECORD_BYTES,
@@ -62,7 +68,17 @@ const ROUTE: TranscriptRoute = Object.freeze({
 
 const encoder = new TextEncoder();
 
-function header(id = CHILD, version?: number): string {
+function runtimeThenableListener(onThen: () => void): TranscriptListener {
+  const listener = () => ({
+    then: (_resolve: (value: unknown) => void, reject: (reason: unknown) => void) => {
+      onThen();
+      reject(new Error("listener rejection"));
+    },
+  });
+  return listener as TranscriptListener;
+}
+
+function header(id = CHILD, version = 2): string {
   return JSON.stringify({
     type: "session",
     ...(version === undefined ? {} : { version }),
@@ -131,6 +147,7 @@ class FakeTranscriptFileSystem implements TranscriptFileSystem {
   /** Serves at most this many bytes per read so split code points are exercised. */
   maxReadBytes = Number.POSITIVE_INFINITY;
   failNextRead: string | undefined;
+  private failAtReadRequest: number | undefined;
   bytesServed = 0;
   private readonly nodes = new WeakMap<TranscriptDirectoryHandle, FakeNode>();
   private nextIdentity = 1;
@@ -140,6 +157,11 @@ class FakeTranscriptFileSystem implements TranscriptFileSystem {
 
   /** Handles opened and not yet closed; every settled refresh must return to zero. */
   get openHandles(): number { return this.liveHandles }
+
+  /** Fails the numbered future read request, after earlier requests can mutate reader state. */
+  failReadRequest(offsetFromNow: number): void {
+    this.failAtReadRequest = this.reads.length + offsetFromNow;
+  }
 
   /** Pauses exactly one read after it is requested, exposing a deterministic in-flight boundary. */
   pauseNextRead(): { readonly started: Promise<void>; readonly release: () => void } {
@@ -297,6 +319,10 @@ class FakeTranscriptFileSystem implements TranscriptFileSystem {
           await pause.wait;
         }
         return this.operation(() => {
+          if (this.failAtReadRequest === this.reads.length) {
+            this.failAtReadRequest = undefined;
+            throw failure("EIO");
+          }
           const pendingFailure = this.failNextRead;
           if (pendingFailure !== undefined) { this.failNextRead = undefined; throw failure(pendingFailure) }
           if (node.kind !== "file") throw failure("EBADF");
@@ -445,8 +471,6 @@ function startedOver(text: string, options: {
 
 describe("decodeTranscriptSessionHeader", () => {
   test.each([
-    ["version 1 omitting the field", { type: "session", id: CHILD }, 1],
-    ["version 1 stating the field", { type: "session", id: CHILD, version: 1 }, 1],
     ["version 2", { type: "session", id: CHILD, version: 2 }, 2],
     ["version 3", { type: "session", id: CHILD, version: 3 }, 3],
   ] as const)("decodes %s", (_name, value, version) => {
@@ -454,6 +478,8 @@ describe("decodeTranscriptSessionHeader", () => {
   });
 
   test.each([
+    ["a version-1 header omitting version", { type: "session", id: CHILD }],
+    ["an explicit version-1 header", { type: "session", id: CHILD, version: 1 }],
     ["an entry record", { type: "message", id: "11111111", parentId: null }],
     ["an unsupported future version", { type: "session", id: CHILD, version: 4 }],
     ["a non-integer version", { type: "session", id: CHILD, version: 1.5 }],
@@ -484,6 +510,13 @@ describe("decodeTranscriptSessionEntry", () => {
     expect(decodeTranscriptSessionEntry(value)).toMatchObject({
       message: { role: "user", content: [{ kind: "text", text: "look" }, { kind: "ignored" }] },
     });
+  });
+
+  test("rejects content arrays above the per-source item bound before mapping them", () => {
+    const content = Array.from({ length: MAX_TRANSCRIPT_SOURCE_ITEMS + 1 }, () => ({ type: "text", text: "x" }));
+    const value: unknown = JSON.parse(messageEntry("22222222", null, assistantMessage(content)));
+
+    expect(decodeTranscriptSessionEntry(value)).toBeUndefined();
   });
 
   test("preserves ordered assistant text, thinking and tool calls", () => {
@@ -656,6 +689,30 @@ describe("createSessionTranscriptSource", () => {
     started.dispose();
   });
 
+  test.each(["self", "two"] as const)("rejects a %s-entry lineage cycle without replacing the last valid snapshot", async (cycle) => {
+    const agentDir = mkdtempSync(join(tmpdir(), "session-transcript-cycle-"));
+    const probe = fileURLToPath(new URL("fixtures/session-transcript-cycle-probe.ts", import.meta.url));
+    const child = Bun.spawn(["bun", probe, agentDir, cycle], { stdout: "pipe", stderr: "pipe" });
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, 3_000);
+    try {
+      const status = await child.exited;
+      const stdout = await new Response(child.stdout).text();
+      const stderr = await new Response(child.stderr).text();
+      expect({ timedOut, status, stderr }).toEqual({ timedOut: false, status: 0, stderr: "" });
+      expect(JSON.parse(stdout)).toMatchObject({
+        availability: "unavailable",
+        items: [{ kind: "user", text: "retained question" }],
+      });
+    } finally {
+      clearTimeout(timeout);
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  }, 5_000);
+
   test("marks a branch whose ancestor is unavailable as truncated without fabricating a run", async () => {
     const started = startedOver(jsonl(
       header(),
@@ -730,6 +787,176 @@ describe("createSessionTranscriptSource", () => {
     started.dispose();
   });
 
+  test("caps projected items during construction without retaining correlation after the user is evicted", async () => {
+    const blocks = Array.from(
+      { length: MAX_TRANSCRIPT_SOURCE_ITEMS },
+      (_, index) => ({ type: "text", text: `answer-${index}` }),
+    );
+    const started = startedOver(jsonl(
+      header(),
+      messageEntry("11111111", null, userMessage("question")),
+      messageEntry("22222222", "11111111", assistantMessage(blocks)),
+    ));
+    await started.filesystem.settleReads();
+
+    expect(started.source.snapshot().items).toHaveLength(MAX_TRANSCRIPT_SOURCE_ITEMS);
+    expect(started.source.snapshot().truncatedBefore).toBe(true);
+    expect(started.source.snapshot().items.every((item) => !("runId" in item))).toBe(true);
+    started.dispose();
+  });
+
+  test("evicts retained decoded entries incrementally by byte size", async () => {
+    const records = [header()];
+    let parent: string | null = null;
+    for (let index = 0; index < 80; index += 1) {
+      const id = (index + 0x20000000).toString(16).padStart(8, "0");
+      records.push(messageEntry(id, parent, assistantMessage([{ type: "text", text: `entry-${index}-${"x".repeat(4_096)}` }])));
+      parent = id;
+    }
+    const started = startedOver(jsonl(...records));
+    await started.filesystem.settleReads();
+
+    started.filesystem.append(jsonl(
+      messageEntry("aaaaaaaa", "20000000", assistantMessage([{ type: "text", text: "branch leaf" }])),
+    ));
+    await started.refresh();
+
+    expect(started.source.snapshot()).toMatchObject({
+      truncatedBefore: true,
+      items: [{ kind: "assistant", text: transcriptText("branch leaf") }],
+    });
+    expect(started.source.snapshot().items[0]).not.toHaveProperty("runId");
+    started.dispose();
+  });
+
+  test.each([
+    [
+      "user",
+      [messageEntry("11111111", null, userMessage("u".repeat(300 * 1_024)))],
+      "user",
+      "u".repeat(8_192),
+    ],
+    [
+      "assistant",
+      [
+        messageEntry("11111111", null, userMessage("question")),
+        messageEntry("22222222", "11111111", assistantMessage([{ type: "text", text: "a".repeat(300 * 1_024) }])),
+      ],
+      "assistant",
+      "a".repeat(8_192),
+    ],
+    [
+      "thinking",
+      [
+        messageEntry("11111111", null, userMessage("question")),
+        messageEntry("22222222", "11111111", assistantMessage([{ type: "thinking", thinking: "t".repeat(300 * 1_024) }])),
+      ],
+      "thinking",
+      "t".repeat(8_192),
+    ],
+    [
+      "tool-result",
+      [
+        messageEntry("11111111", null, userMessage("question")),
+        messageEntry("22222222", "11111111", assistantMessage([
+          { type: "toolCall", id: "call-large", name: "read", arguments: {} },
+        ])),
+        messageEntry("33333333", "22222222", toolResultMessage("call-large", "read", "p".repeat(300 * 1_024))),
+      ],
+      "tool",
+      "p".repeat(8_192),
+    ],
+  ] as const)("bounds a large %s text leaf without evicting its latest projection", async (
+    _name,
+    records,
+    expectedKind,
+    expectedVisible,
+  ) => {
+    const text = jsonl(header(), ...records);
+    expect(encoder.encode(text).byteLength).toBeLessThan(Number(MAX_RPC_RECORD_BYTES));
+    const started = startedOver(text);
+    await started.filesystem.settleReads();
+
+    const latest = started.source.snapshot().items.at(-1);
+    expect(latest?.kind).toBe(expectedKind);
+    const visible = latest?.kind === "tool" ? latest.preview : latest?.kind === "notice" ? undefined : latest?.text;
+    expect(String(visible)).toBe(expectedVisible);
+    expect(visible).not.toHaveLength(0);
+    expect(encoder.encode(visible ?? "").byteLength).toBeLessThanOrEqual(8_192);
+    started.dispose();
+  });
+
+  test("reports aggregate omission while keeping the latest assistant text suffix", async () => {
+    const content = Array.from({ length: 40 }, (_, index) => ({
+      type: "text",
+      text: `block-${index}-${"x".repeat(8_192)}`,
+    }));
+    const text = jsonl(
+      header(),
+      messageEntry("22222222", null, assistantMessage(content)),
+    );
+    expect(encoder.encode(text).byteLength).toBeLessThan(Number(MAX_RPC_RECORD_BYTES));
+    const started = startedOver(text);
+    await started.filesystem.settleReads();
+
+    const snapshot = started.source.snapshot();
+    const latest = snapshot.items.at(-1);
+    expect(latest?.kind).toBe("assistant");
+    expect(latest?.kind === "assistant" ? String(latest.text) : undefined)
+      .toBe(`block-39-${"x".repeat(8_183)}`);
+    expect(snapshot.items).not.toHaveLength(0);
+    expect(snapshot.truncatedBefore).toBe(true);
+    started.dispose();
+  });
+
+  test("reports aggregate omission while keeping a mixed text, thinking and tool-call suffix", async () => {
+    const content = Array.from({ length: 24 }, (_, index) => [
+      { type: "text", text: `text-${index}-${"x".repeat(8_192)}` },
+      { type: "thinking", thinking: `thinking-${index}-${"y".repeat(8_192)}` },
+      { type: "toolCall", id: `call-${index}`, name: `tool-${index}`, arguments: {} },
+    ]).flat();
+    const text = jsonl(
+      header(),
+      messageEntry("22222222", null, assistantMessage(content)),
+    );
+    expect(encoder.encode(text).byteLength).toBeLessThan(Number(MAX_RPC_RECORD_BYTES));
+    const started = startedOver(text);
+    await started.filesystem.settleReads();
+
+    const snapshot = started.source.snapshot();
+    expect(snapshot.items.slice(-3)).toMatchObject([
+      { kind: "assistant", text: transcriptText(`text-23-${"x".repeat(8_184)}`) },
+      { kind: "thinking", text: transcriptText(`thinking-23-${"y".repeat(8_180)}`) },
+      { kind: "tool", tool: toolDisplayName("tool-23"), phase: "running" },
+    ]);
+    expect(snapshot.truncatedBefore).toBe(true);
+    started.dispose();
+  });
+
+  test("charges narrowed decoded fields so large ignored metadata cannot evict the latest leaf", async () => {
+    const latest = JSON.stringify({
+      type: "message",
+      id: "22222222",
+      parentId: "11111111",
+      timestamp: "t",
+      message: assistantMessage([{ type: "text", text: "latest answer" }]),
+      ignoredMetadata: "x".repeat(Number(MAX_TRANSCRIPT_SOURCE_BYTES) + 1_024),
+    });
+    expect(encoder.encode(latest).byteLength).toBeLessThan(Number(MAX_RPC_RECORD_BYTES));
+    const started = startedOver(jsonl(
+      header(),
+      messageEntry("11111111", null, userMessage("question")),
+      latest,
+    ));
+    await started.filesystem.settleReads();
+
+    expect(started.source.snapshot().items).toMatchObject([
+      { kind: "user", text: transcriptText("question") },
+      { kind: "assistant", text: transcriptText("latest answer") },
+    ]);
+    started.dispose();
+  });
+
   test("evicts multibyte projected text by encoded UTF-8 bytes", async () => {
     const records = [header()];
     let parent: string | null = null;
@@ -771,6 +998,38 @@ describe("createSessionTranscriptSource", () => {
     expect(started.source.snapshot().items).toMatchObject([
       { kind: "user" },
       { kind: "assistant", text: transcriptText("café") },
+    ]);
+    started.dispose();
+  });
+
+  test("rolls back a valid record and incomplete tail when a later read fails transiently", async () => {
+    const started = startedOver(jsonl(header()));
+    await started.filesystem.settleReads();
+    const valid = messageEntry("11111111", null, userMessage("question"));
+    const trailing = messageEntry(
+      "22222222",
+      "11111111",
+      assistantMessage([{ type: "text", text: "answer after retry" }]),
+    );
+    const split = trailing.length - 12;
+    started.filesystem.maxReadBytes = 128;
+    started.filesystem.append(`${valid}\n${trailing.slice(0, split)}`);
+    started.filesystem.failReadRequest(3);
+
+    await started.refresh();
+    expect(started.source.snapshot()).toMatchObject({ items: [], availability: "unavailable" });
+
+    await started.refresh();
+    expect(started.source.snapshot()).toMatchObject({
+      items: [{ kind: "user", text: transcriptText("question") }],
+      availability: "live",
+    });
+
+    started.filesystem.append(`${trailing.slice(split)}\n`);
+    await started.refresh();
+    expect(started.source.snapshot().items).toMatchObject([
+      { kind: "user", text: transcriptText("question") },
+      { kind: "assistant", text: transcriptText("answer after retry") },
     ]);
     started.dispose();
   });
@@ -1012,6 +1271,20 @@ describe("createSessionTranscriptSource", () => {
     started.dispose();
   });
 
+  test("removes and consumes a rejecting thenable subscriber", async () => {
+    const started = startedOver(conversationText());
+    await started.filesystem.settleReads();
+    let rejectionConsumed = false;
+    started.source.subscribe(runtimeThenableListener(() => { rejectionConsumed = true }));
+
+    started.filesystem.append(jsonl(messageEntry("44444444", "33333333", userMessage("next"))));
+    await started.refresh();
+    await Promise.resolve();
+
+    expect(rejectionConsumed).toBe(true);
+    started.dispose();
+  });
+
   test("removes throwing and thenable subscribers without blocking healthy ones", async () => {
     const started = startedOver(conversationText());
     await started.filesystem.settleReads();
@@ -1196,7 +1469,7 @@ describe("createSessionTranscriptSource", () => {
     started.dispose();
   });
 
-  test("withholds proof when the final append arrives before the coalesced refresh settles", async () => {
+  test("proves the final append after a terminal transition without another state change", async () => {
     const started = startedOver(conversationText(), { displayState: AgentState.Running });
     await started.filesystem.settleReads();
 
@@ -1206,12 +1479,22 @@ describe("createSessionTranscriptSource", () => {
 
     expect(started.source.snapshot().items.at(-1))
       .toMatchObject({ kind: "user", text: transcriptText("final append") });
-    expect(started.source.postTerminalEndReached()).toBe(false);
+    expect(started.source.postTerminalEndReached()).toBe(true);
+    started.dispose();
+  });
 
-    started.source.setDisplayState(AgentState.Running);
+  test("proves an append observed before the terminal transition without another state change", async () => {
+    const started = startedOver(conversationText(), { displayState: AgentState.Running });
+    await started.filesystem.settleReads();
+
+    started.filesystem.append(jsonl(messageEntry("44444444", "33333333", userMessage("final append"))));
+    started.watchFactory.live.emit("change");
     started.source.setDisplayState(CompletionState.Completed);
     started.clock.advance(Number(TRANSCRIPT_REFRESH_WINDOW_MS));
     await started.filesystem.settleReads();
+
+    expect(started.source.snapshot().items.at(-1))
+      .toMatchObject({ kind: "user", text: transcriptText("final append") });
     expect(started.source.postTerminalEndReached()).toBe(true);
     started.dispose();
   });
@@ -1255,7 +1538,7 @@ describe("createSessionTranscriptSource", () => {
     started.dispose();
   });
 
-  test("re-proves the end of file only after rebuilding a replaced transcript", async () => {
+  test("re-proves the end of file after one stable confirmation of a replaced transcript", async () => {
     const started = startedOver(conversationText(), { displayState: AgentState.Running });
     await started.filesystem.settleReads();
     started.source.setDisplayState(CompletionState.Completed);
@@ -1267,7 +1550,7 @@ describe("createSessionTranscriptSource", () => {
     await started.refresh();
 
     expect(started.source.snapshot().items).toMatchObject([{ kind: "user", text: transcriptText("replaced") }]);
-    expect(started.source.postTerminalEndReached()).toBe(false);
+    expect(started.source.postTerminalEndReached()).toBe(true);
     started.dispose();
   });
 });

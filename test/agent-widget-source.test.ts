@@ -122,7 +122,7 @@ class RecordingTranscriptAdapters implements TranscriptFileSystem, TranscriptFil
   readonly watchedDirectories: string[] = [];
   activeWatches = 0;
   disposedWatches = 0;
-  private readonly bytes = new TextEncoder().encode(`${JSON.stringify({ type: "session", id: "agent-b" })}\n`);
+  private readonly bytes = new TextEncoder().encode(`${JSON.stringify({ type: "session", version: 2, id: "agent-b" })}\n`);
   private readonly directory: TranscriptDirectoryHandle = {
     stat: async () => ({ directory: true }),
     close: async () => {},
@@ -301,6 +301,102 @@ describe("createAgentWidgetSource", () => {
     expect(live.listeners.size).toBe(0);
     expect(adapters.activeWatches).toBe(0);
     directUnsubscribe?.();
+    source.dispose();
+  });
+
+  test("reopens a reused ordinal only against its current exact route", async () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Parent task");
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-b", transcriptFile: "agent-b.jsonl" }]);
+    const adapters = new RecordingTranscriptAdapters();
+    const source = createAgentWidgetSource(store as SubagentObservationPort, {
+      agentDir: AGENT_DIR,
+      rootSessionId: ROOT_SESSION,
+      maxRows: MAX_WIDGET_ROWS,
+      transcriptFileSystem: adapters,
+      transcriptWatcher: adapters,
+      transcriptClock: adapters,
+    });
+
+    const first = source.transcriptSource(agentOrdinal("A1.2"));
+    const firstUnsubscribe = first?.subscribe(() => {});
+    await Bun.sleep(0);
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-c", transcriptFile: "agent-c.jsonl" }]);
+    await waitForIndexRefresh();
+
+    expect(first?.snapshot().routeAvailable).toBe(false);
+    const reopened = source.transcriptSource(agentOrdinal("A1.2"));
+    const reopenedUnsubscribe = reopened?.subscribe(() => {});
+    await Bun.sleep(0);
+    expect(reopened).not.toBe(first);
+    expect(reopened?.snapshot()).toMatchObject({
+      row: { ordinal: agentOrdinal("A1.2") },
+      routeAvailable: true,
+    });
+    expect(adapters.fileNames.at(-1)).toBe("agent-c.jsonl");
+    firstUnsubscribe?.();
+    reopenedUnsubscribe?.();
+    source.dispose();
+  });
+
+  test("recreates a latched unavailable selection when the exact same route returns", async () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Parent task");
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-b", transcriptFile: "agent-b.jsonl" }]);
+    const adapters = new RecordingTranscriptAdapters();
+    const source = createAgentWidgetSource(store as SubagentObservationPort, {
+      agentDir: AGENT_DIR,
+      rootSessionId: ROOT_SESSION,
+      maxRows: MAX_WIDGET_ROWS,
+      transcriptFileSystem: adapters,
+      transcriptWatcher: adapters,
+      transcriptClock: adapters,
+    });
+
+    const first = source.transcriptSource(agentOrdinal("A1.2"));
+    const firstUnsubscribe = first?.subscribe(() => {});
+    await Bun.sleep(0);
+    writePublished("agent-a", []);
+    await waitForIndexRefresh();
+    expect(first?.snapshot().routeAvailable).toBe(false);
+
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-b", transcriptFile: "agent-b.jsonl" }]);
+    await waitForIndexRefresh();
+    const recovered = source.transcriptSource(agentOrdinal("A1.2"));
+    const recoveredUnsubscribe = recovered?.subscribe(() => {});
+    await Bun.sleep(0);
+
+    expect(recovered).not.toBe(first);
+    expect(recovered?.snapshot().routeAvailable).toBe(true);
+    expect(adapters.fileNames).toEqual(["agent-b.jsonl", "agent-b.jsonl"]);
+    firstUnsubscribe?.();
+    recoveredUnsubscribe?.();
+    source.dispose();
+  });
+
+  test("disposes a stale selection when an explicit open has no current route", async () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Parent task");
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-b", transcriptFile: "agent-b.jsonl" }]);
+    const adapters = new RecordingTranscriptAdapters();
+    const source = createAgentWidgetSource(store as SubagentObservationPort, {
+      agentDir: AGENT_DIR,
+      rootSessionId: ROOT_SESSION,
+      maxRows: MAX_WIDGET_ROWS,
+      transcriptFileSystem: adapters,
+      transcriptWatcher: adapters,
+      transcriptClock: adapters,
+    });
+
+    const first = source.transcriptSource(agentOrdinal("A1.2"));
+    first?.subscribe(() => {});
+    await Bun.sleep(0);
+    expect(adapters.activeWatches).toBe(1);
+    writePublished("agent-a", []);
+    await waitForIndexRefresh();
+
+    expect(source.transcriptSource(agentOrdinal("A1.2"))).toBeUndefined();
+    expect(adapters.activeWatches).toBe(0);
     source.dispose();
   });
 

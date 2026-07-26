@@ -123,27 +123,28 @@ describe("createChildConversationController", () => {
     const direct = new MutableSelectedSource(log);
     const nested = new MutableSelectedSource(log);
     const opens: string[] = [];
+    const agentSource = widgetSource(direct, nested, opens);
     const tui = new TUI(new FakeTerminal());
     let component: Component | undefined;
     let options: OverlayOptions | undefined;
     let child = fakeHandle("child", log);
     tui.showOverlay = (next, nextOptions) => { log.push("overlay"); component = next; options = nextOptions; return child };
     const controller = createChildConversationController({
-      source: () => widgetSource(direct, nested, opens), tui, theme, keybindings: keybindings(),
+      tui, theme, keybindings: keybindings(),
       onDiagnostic: (code) => { log.push(`diagnostic:${code}`) },
       createCoalescer: (runner) => ({ request: runner, dispose: () => { log.push("coalescer:dispose") } }),
     });
 
-    expect(controller.open(agentOrdinal("A1"))).toBeUndefined();
+    expect(controller.open(agentOrdinal("A1"), agentSource)).toBeUndefined();
     expect(options).toEqual(childConversationOverlayOptions);
     expect(options).toEqual({ width: "100%", maxHeight: "100%", row: 0, col: 0, margin: 0 });
     expect(Bun.stripANSI(component!.render(80).join("\n"))).toContain("Loading conversation");
-    controller.open(agentOrdinal("A1.2"));
+    controller.open(agentOrdinal("A1.2"), agentSource);
     expect(opens).toEqual(["A1"]);
 
     controller.close();
     child = fakeHandle("nested", log);
-    controller.open(agentOrdinal("A1.2"));
+    controller.open(agentOrdinal("A1.2"), agentSource);
     expect(opens).toEqual(["A1", "A1.2"]);
     controller.dispose();
   });
@@ -156,11 +157,12 @@ describe("createChildConversationController", () => {
     let component: ChildConversationComponent | undefined;
     let queued: (() => void) | undefined;
     tui.showOverlay = (next) => { component = next as ChildConversationComponent; return fakeHandle("child", log) };
+    const agentSource = widgetSource(direct, nested, []);
     const controller = createChildConversationController({
-      source: () => widgetSource(direct, nested, []), tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
+      tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
       createCoalescer: (runner) => ({ request: () => { queued = runner }, dispose: () => { queued = undefined } }),
     });
-    controller.open(agentOrdinal("A1"));
+    controller.open(agentOrdinal("A1"), agentSource);
 
     direct.publish(selected(1));
     direct.publish(selected(2));
@@ -187,11 +189,12 @@ describe("createChildConversationController", () => {
     const sibling = fakeHandle("sibling", log);
     let captured: ChildConversationComponent | undefined;
     tui.showOverlay = (next) => { captured = next as ChildConversationComponent; return child };
+    const agentSource = widgetSource(direct, nested, []);
     const controller = createChildConversationController({
-      source: () => widgetSource(direct, nested, []), tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
+      tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
       createCoalescer: (runner) => ({ request: runner, dispose: () => {} }),
     });
-    controller.open(agentOrdinal("A1"));
+    controller.open(agentOrdinal("A1"), agentSource);
 
     captured!.handleInput("\u001b");
 
@@ -210,11 +213,12 @@ describe("createChildConversationController", () => {
     let captured: ChildConversationComponent | undefined;
     tui.showOverlay = (next) => { captured = next as ChildConversationComponent; return child };
     tui.hideOverlay = () => { throw new Error("global hideOverlay must not be called") };
+    const agentSource = widgetSource(direct, nested, []);
     const controller = createChildConversationController({
-      source: () => widgetSource(direct, nested, []), tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
+      tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
       createCoalescer: (runner) => ({ request: runner, dispose: () => { log.push("coalescer:dispose") } }),
     });
-    controller.open(agentOrdinal("A1"));
+    controller.open(agentOrdinal("A1"), agentSource);
     const originalDispose = captured!.dispose.bind(captured);
     captured!.dispose = () => { log.push("component:dispose"); originalDispose() };
 
@@ -225,7 +229,8 @@ describe("createChildConversationController", () => {
     expect(log).not.toContain("hide:sibling");
     expect(sibling.isHidden()).toBe(false);
     expect(log.indexOf("hide:child")).toBeLessThan(log.indexOf("unsubscribe"));
-    expect(log.indexOf("component:dispose")).toBeLessThan(log.indexOf("unsubscribe"));
+    expect(log.indexOf("unsubscribe")).toBeLessThan(log.indexOf("component:dispose"));
+    expect(log.indexOf("unsubscribe")).toBeLessThan(log.indexOf("coalescer:dispose"));
   });
 
   test("reports a missing selected source once and leaves overlay focus untouched", () => {
@@ -233,12 +238,17 @@ describe("createChildConversationController", () => {
     const tui = new TUI(new FakeTerminal());
     let overlays = 0;
     tui.showOverlay = () => { overlays += 1; return fakeHandle("unused", []) };
+    const unavailableSource = widgetSource(
+      new MutableSelectedSource([]),
+      new MutableSelectedSource([]),
+      [],
+    );
     const controller = createChildConversationController({
-      source: () => undefined, tui, theme, keybindings: keybindings(), onDiagnostic: (code) => { diagnostics.push(code) },
+      tui, theme, keybindings: keybindings(), onDiagnostic: (code) => { diagnostics.push(code) },
     });
 
-    controller.open(agentOrdinal("A9"));
-    controller.open(agentOrdinal("A9"));
+    controller.open(agentOrdinal("A9"), unavailableSource);
+    controller.open(agentOrdinal("A9"), unavailableSource);
 
     expect(overlays).toBe(0);
     expect(diagnostics).toEqual(["conversation_unavailable"]);
@@ -251,12 +261,13 @@ describe("createChildConversationController", () => {
     tui.setFocus(parent);
     const direct = new MutableSelectedSource([]);
     const nested = new MutableSelectedSource([]);
+    const agentSource = widgetSource(direct, nested, []);
     const controller = createChildConversationController({
-      source: () => widgetSource(direct, nested, []), tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
+      tui, theme, keybindings: keybindings(), onDiagnostic: () => {},
       createCoalescer: (runner) => ({ request: runner, dispose: () => {} }),
     });
 
-    controller.open(agentOrdinal("A1"));
+    controller.open(agentOrdinal("A1"), agentSource);
     expect(parent.focused).toBe(false);
     controller.close();
     expect(parent.focused).toBe(true);

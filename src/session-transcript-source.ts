@@ -50,7 +50,9 @@ import {
 import {
   decodeTranscriptSessionEntry,
   decodeTranscriptSessionHeader,
+  type TranscriptSessionContentRecord,
   type TranscriptSessionEntryRecord,
+  type TranscriptSessionMessageRecord,
 } from "./schemas.ts";
 import { TranscriptDiagnosticCode } from "./widget-diagnostics.ts";
 
@@ -158,8 +160,9 @@ export function createSessionTranscriptSource(
   let published: TranscriptSnapshot = frozenSnapshot(0, [], false, "live");
   let displayState: AgentDisplayState = AgentState.Running;
   let terminalGeneration = 0;
-  /** Set by any file event; a change seen after termination means the run may not have ended. */
-  let changedSinceTerminal = false;
+  /** File-observation generations let one successful read consume only changes it could see. */
+  let changeGeneration = 0;
+  let consumedChangeGeneration = 0;
   let endReached = false;
   let everDetached = false;
   let routeAvailable = true;
@@ -192,6 +195,7 @@ export function createSessionTranscriptSource(
 
   async function refreshOnce(): Promise<void> {
     const generation = terminalGeneration;
+    const observedChangeGeneration = changeGeneration;
     const terminalAtStart = isTerminalDisplayState(displayState);
     const result = await reader.read();
     if (disposed) return;
@@ -203,14 +207,17 @@ export function createSessionTranscriptSource(
     }
     const proofBefore = endReached;
     if (result.rebuilt) endReached = false;
+    consumedChangeGeneration = Math.max(consumedChangeGeneration, observedChangeGeneration);
     const terminalNow = isTerminalDisplayState(displayState);
-    const proved = terminalAtStart
+    const stableTerminalRead = terminalAtStart
       && terminalNow
       && generation === terminalGeneration
-      && !changedSinceTerminal
-      && !pending
-      && routeAvailable
-      && !result.rebuilt;
+      && consumedChangeGeneration === changeGeneration
+      && routeAvailable;
+    // A replacement or shrinkage read establishes the new identity. Queue one stable read of that
+    // same identity before treating its current size as post-terminal EOF.
+    if (result.rebuilt && stableTerminalRead) pending = true;
+    const proved = stableTerminalRead && !pending && !result.rebuilt;
     endReached = proved;
     publish(result.items, result.truncatedBefore, terminalNow ? "stopped" : "live", proofBefore !== endReached);
   }
@@ -240,7 +247,10 @@ export function createSessionTranscriptSource(
       try {
         const result: unknown = listener(published);
         // A listener that defers its work cannot be awaited by a serial refresh.
-        if (isThenable(result)) listeners.delete(listener);
+        if (isThenable(result)) {
+          listeners.delete(listener);
+          void Promise.resolve(result).catch(() => undefined);
+        }
       } catch {
         listeners.delete(listener);
       }
@@ -279,7 +289,7 @@ export function createSessionTranscriptSource(
 
   function onFileEvent(): void {
     if (disposed) return;
-    changedSinceTerminal = true;
+    changeGeneration += 1;
     const proofChanged = clearEndReached();
     if (proofChanged) publish(published.items, published.truncatedBefore, published.availability, true);
     coalescer.request();
@@ -305,7 +315,7 @@ export function createSessionTranscriptSource(
       if (disposed) return;
       if (!tryInstallWatch()) startPolling();
       // Polling is already rate limited by its own delay, so it refreshes without coalescing.
-      changedSinceTerminal = true;
+      changeGeneration += 1;
       const proofChanged = clearEndReached();
       if (proofChanged) publish(published.items, published.truncatedBefore, published.availability, true);
       requestRefresh();
@@ -337,7 +347,7 @@ export function createSessionTranscriptSource(
       if (isTerminalDisplayState(state)) {
         if (wasTerminal) return;
         terminalGeneration += 1;
-        changedSinceTerminal = false;
+        consumedChangeGeneration = changeGeneration;
         const proofChanged = clearEndReached();
         if (proofChanged) publish(published.items, published.truncatedBefore, published.availability, true);
         coalescer.request();
@@ -400,6 +410,8 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
   let consumed = 0;
   let tail: Uint8Array = EMPTY_BYTES;
   let entries: TranscriptSessionEntryRecord[] = [];
+  let entryBytes: number[] = [];
+  let retainedEntryBytes = 0;
   let truncated = false;
 
   function forget(): void {
@@ -407,6 +419,8 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
     consumed = 0;
     tail = EMPTY_BYTES;
     entries = [];
+    entryBytes = [];
+    retainedEntryBytes = 0;
     truncated = false;
   }
 
@@ -444,11 +458,31 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
   }
 
   async function readFile(file: TranscriptReadHandle, stat: TranscriptFileIdentity): Promise<ReadResult> {
+    const checkpoint = {
+      identity,
+      consumed,
+      tail,
+      entries: [...entries],
+      entryBytes: [...entryBytes],
+      retainedEntryBytes,
+      truncated,
+    };
+    const rejectAtomically = (failure: ReadResult): ReadResult => {
+      identity = checkpoint.identity;
+      consumed = checkpoint.consumed;
+      tail = checkpoint.tail;
+      entries = checkpoint.entries;
+      entryBytes = checkpoint.entryBytes;
+      retainedEntryBytes = checkpoint.retainedEntryBytes;
+      truncated = checkpoint.truncated;
+      return failure;
+    };
+    try {
     const size = Number(stat.size);
     // The header is revalidated on every refresh, not only on a rebuild: it is the only proof
     // that this handle still holds a transcript belonging to the routed child session.
     const header = await readHeader(file, size);
-    if ("kind" in header) return header;
+    if ("kind" in header) return rejectAtomically(header);
     // Header revalidation and the suffix share one authoritative recovery budget. The header
     // read may have consumed a whole chunk past its LF, so charge every inspected byte.
     const recoveryBytes = Math.max(0, Number(MAX_SESSION_RECOVERY_BYTES) - header.inspectedBytes);
@@ -491,17 +525,24 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
         if (scan[index] !== LINE_FEED) continue;
         const accepted = accept(scan.subarray(lineStart, index));
         lineStart = index + 1;
-        if (accepted !== undefined) return accepted;
+        if (accepted !== undefined) return rejectAtomically(accepted);
       }
       carry = scan.slice(lineStart);
       if (carry.byteLength > Number(MAX_RPC_RECORD_BYTES)) {
-        return { kind: "failed", code: TranscriptDiagnosticCode.Oversized };
+        return rejectAtomically({ kind: "failed", code: TranscriptDiagnosticCode.Oversized });
       }
     }
     consumed = position;
     tail = carry;
     const projection = projectBranch(entries, truncated);
+    if (projection === undefined) {
+      return rejectAtomically({ kind: "failed", code: TranscriptDiagnosticCode.Malformed });
+    }
     return { kind: "read", items: projection.items, truncatedBefore: projection.truncatedBefore, rebuilt: rebuilding };
+    } catch (cause) {
+      rejectAtomically({ kind: "failed", code: TranscriptDiagnosticCode.ReadRefused });
+      throw cause;
+    }
   }
 
   /** Reads the leading record and proves it names this route's child session. */
@@ -546,17 +587,83 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
     const value = parseJson(record);
     if (value === undefined) return { kind: "failed", code: TranscriptDiagnosticCode.Malformed };
     if (decodeTranscriptSessionHeader(value) !== undefined) return undefined;
-    const entry = decodeTranscriptSessionEntry(value);
-    if (entry === undefined) return { kind: "failed", code: TranscriptDiagnosticCode.Malformed };
+    const decoded = decodeTranscriptSessionEntry(value);
+    if (decoded === undefined) return { kind: "failed", code: TranscriptDiagnosticCode.Malformed };
+    const bounded = boundRetainedEntry(decoded);
+    const entry = bounded.entry;
+    if (bounded.truncatedBefore) truncated = true;
+    const narrowedBytes = encodedBytes(entry);
     entries.push(entry);
-    if (entries.length > MAX_TRANSCRIPT_SOURCE_ITEMS) {
-      entries = entries.slice(entries.length - MAX_TRANSCRIPT_SOURCE_ITEMS);
+    entryBytes.push(narrowedBytes);
+    retainedEntryBytes += narrowedBytes;
+    while (entries.length > MAX_TRANSCRIPT_SOURCE_ITEMS
+      || retainedEntryBytes > Number(MAX_TRANSCRIPT_SOURCE_BYTES)) {
+      entries.shift();
+      retainedEntryBytes -= entryBytes.shift() ?? 0;
       truncated = true;
     }
     return undefined;
   }
 
   return { sessionsDirectory, read, forget };
+}
+
+interface BoundedRetainedEntry {
+  readonly entry: TranscriptSessionEntryRecord;
+  readonly truncatedBefore: boolean;
+}
+
+/** Bounds the exact representation retained for lineage projection before charging its byte budget. */
+function boundRetainedEntry(entry: TranscriptSessionEntryRecord): BoundedRetainedEntry {
+  if (entry.kind !== "message" || entry.message.role === "non-conversation") {
+    return { entry, truncatedBefore: false };
+  }
+  const message = boundRetainedMessage(entry.message);
+  const emptyMessage = { ...message, content: [] } as TranscriptSessionMessageRecord;
+  let retainedBytes = encodedBytes({ ...entry, message: emptyMessage });
+  const retainedContent: TranscriptSessionContentRecord[] = [];
+  for (let index = message.content.length - 1; index >= 0; index -= 1) {
+    const block = message.content[index]!;
+    const additionalBytes = encodedBytes(block) + (retainedContent.length === 0 ? 0 : 1);
+    if (retainedBytes + additionalBytes > Number(MAX_TRANSCRIPT_SOURCE_BYTES)) break;
+    retainedContent.unshift(block);
+    retainedBytes += additionalBytes;
+  }
+  return {
+    entry: { ...entry, message: { ...message, content: retainedContent } },
+    truncatedBefore: retainedContent.length < message.content.length,
+  };
+}
+
+/** Keeps only display-relevant, bounded message fields while retaining native correlation IDs. */
+function boundRetainedMessage(message: Exclude<TranscriptSessionMessageRecord, { readonly role: "non-conversation" }>): Exclude<TranscriptSessionMessageRecord, { readonly role: "non-conversation" }> {
+  if (message.role === "user") {
+    return { role: "user", content: [{ kind: "text", text: safeTranscriptText(joinText(message.content)) }] };
+  }
+  if (message.role === "tool-result") {
+    return {
+      role: "tool-result",
+      callId: message.callId,
+      tool: trySafeToolDisplayName(message.tool) ?? "",
+      content: [{ kind: "text", text: safeTranscriptText(joinText(message.content)) }],
+      error: message.error,
+    };
+  }
+  const content: TranscriptSessionContentRecord[] = [];
+  for (const block of message.content) {
+    if (block.kind === "text" || block.kind === "thinking") {
+      content.push({ kind: block.kind, text: safeTranscriptText(block.text) });
+      continue;
+    }
+    if (block.kind !== "tool-call") continue;
+    const tool = trySafeToolDisplayName(block.tool);
+    if (tool !== undefined) content.push({ kind: "tool-call", callId: block.callId, tool });
+  }
+  return { role: "assistant", content };
+}
+
+function encodedBytes(value: unknown): number {
+  return encoder.encode(JSON.stringify(value)).byteLength;
 }
 
 /** Validates the two route-derived directory components; an invalid one refuses the source. */
@@ -582,14 +689,23 @@ interface BranchProjection {
  * reversed path. A run is correlated only by a retained user entry; a leading tail whose user
  * entry fell outside the suffix stays uncorrelated rather than borrowing another entry's ID.
  */
-function projectBranch(entries: readonly TranscriptSessionEntryRecord[], truncated: boolean): BranchProjection {
+function projectBranch(
+  entries: readonly TranscriptSessionEntryRecord[],
+  truncated: boolean,
+): BranchProjection | undefined {
   const retained = new Map<SessionEntryId, TranscriptSessionEntryRecord>();
-  for (const entry of entries) retained.set(entry.id, entry);
+  for (const entry of entries) {
+    if (retained.has(entry.id)) return undefined;
+    retained.set(entry.id, entry);
+  }
 
   const branch: TranscriptSessionEntryRecord[] = [];
+  const visited = new Set<SessionEntryId>();
   let cursor = entries.at(-1);
   let truncatedBefore = truncated;
   while (cursor !== undefined) {
+    if (branch.length >= retained.size || visited.has(cursor.id)) return undefined;
+    visited.add(cursor.id);
     branch.push(cursor);
     const parentId = cursor.parentId;
     if (parentId === null) break;
@@ -601,19 +717,34 @@ function projectBranch(entries: readonly TranscriptSessionEntryRecord[], truncat
 
   const items: TranscriptItem[] = [];
   const toolPositions = new Map<string, number>();
+  let nextSequence = 0;
+  const appendItem = (item: TranscriptItem): number => {
+    if (items.length >= MAX_TRANSCRIPT_SOURCE_ITEMS) {
+      items.shift();
+      truncatedBefore = true;
+      for (const [callId, position] of toolPositions) {
+        if (position === 0) toolPositions.delete(callId);
+        else toolPositions.set(callId, position - 1);
+      }
+    }
+    const position = items.length;
+    items.push(Object.freeze({ ...item, sequence: transcriptSequence(nextSequence) }) as TranscriptItem);
+    nextSequence += 1;
+    return position;
+  };
   let currentRun: SessionEntryId | undefined;
   for (const entry of branch) {
     if (entry.kind === "non-conversation") continue;
     if (entry.kind === "compaction") {
-      items.push({ sequence: transcriptSequence(items.length), kind: "notice", code: "context-compacted" });
+      appendItem({ sequence: transcriptSequence(0), kind: "notice", code: "context-compacted" });
       continue;
     }
     const message = entry.message;
     if (message.role === "non-conversation") continue;
     if (message.role === "user") {
       currentRun = entry.id;
-      items.push({
-        sequence: transcriptSequence(items.length),
+      appendItem({
+        sequence: transcriptSequence(0),
         runId: runId(entry.id),
         kind: "user",
         text: safeTranscriptText(joinText(message.content)),
@@ -623,8 +754,8 @@ function projectBranch(entries: readonly TranscriptSessionEntryRecord[], truncat
     if (message.role === "assistant") {
       for (const block of message.content) {
         if (block.kind === "text" || block.kind === "thinking") {
-          items.push({
-            sequence: transcriptSequence(items.length),
+          appendItem({
+            sequence: transcriptSequence(0),
             ...(currentRun === undefined ? {} : { runId: runId(currentRun) }),
             kind: block.kind === "text" ? "assistant" : "thinking",
             phase: "final",
@@ -635,14 +766,14 @@ function projectBranch(entries: readonly TranscriptSessionEntryRecord[], truncat
         if (block.kind !== "tool-call") continue;
         const tool = trySafeToolDisplayName(block.tool);
         if (tool === undefined) continue;
-        toolPositions.set(block.callId, items.length);
-        items.push({
-          sequence: transcriptSequence(items.length),
+        const position = appendItem({
+          sequence: transcriptSequence(0),
           ...(currentRun === undefined ? {} : { runId: runId(currentRun) }),
           kind: "tool",
           tool,
           phase: "running",
         });
+        toolPositions.set(block.callId, position);
       }
       continue;
     }
@@ -669,10 +800,42 @@ function evictToBounds(items: readonly TranscriptItem[], truncatedBefore: boolea
     bytes += itemBytes(items[index]);
     if (bytes > MAX_TRANSCRIPT_SOURCE_BYTES) { first = index + 1; break }
   }
+  const historyOmitted = truncatedBefore || first > 0;
+  const retained = items.slice(first);
   return {
-    items: Object.freeze(items.slice(first)),
-    truncatedBefore: truncatedBefore || first > 0,
+    items: Object.freeze(historyOmitted ? stripLeadingCorrelation(retained) : retained),
+    truncatedBefore: historyOmitted,
   };
+}
+
+/** A retained tail cannot keep a run ID once its identifying user item has been omitted. */
+function stripLeadingCorrelation(items: readonly TranscriptItem[]): TranscriptItem[] {
+  const result: TranscriptItem[] = [];
+  let leading = true;
+  for (const item of items) {
+    if (item.kind === "user") leading = false;
+    if (!leading || item.kind === "notice" || item.kind === "user" || item.runId === undefined) {
+      result.push(item);
+      continue;
+    }
+    if (item.kind === "tool") {
+      result.push(Object.freeze({
+        sequence: item.sequence,
+        kind: "tool",
+        tool: item.tool,
+        phase: item.phase,
+        ...(item.preview === undefined ? {} : { preview: item.preview }),
+      }));
+      continue;
+    }
+    result.push(Object.freeze({
+      sequence: item.sequence,
+      kind: item.kind,
+      phase: item.phase,
+      text: item.text,
+    }));
+  }
+  return result;
 }
 
 function itemBytes(item: TranscriptItem | undefined): number {

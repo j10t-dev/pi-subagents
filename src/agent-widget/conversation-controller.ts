@@ -22,13 +22,12 @@ export const childConversationOverlayOptions: Readonly<OverlayOptions> = Object.
 });
 
 export interface ChildConversationController {
-  open(ordinal: AgentOrdinal): void;
+  open(ordinal: AgentOrdinal, source: AgentWidgetSource): void;
   close(): void;
   dispose(): void;
 }
 
 export interface ChildConversationControllerOptions {
-  readonly source: () => AgentWidgetSource | undefined;
   readonly tui: TUI;
   readonly theme: Theme;
   readonly keybindings: KeybindingsManager;
@@ -58,10 +57,10 @@ export function createChildConversationController(
   };
 
   const controller: ChildConversationController = {
-    open: (ordinal): void => {
+    open: (ordinal, widgetSource): void => {
       if (disposed || source !== undefined || component !== undefined || overlayHandle !== undefined) return;
       let selected: SelectedTranscriptSource | undefined;
-      try { selected = options.source()?.transcriptSource(ordinal) }
+      try { selected = widgetSource.transcriptSource(ordinal) }
       catch { report(WidgetDiagnosticCode.SourceFailed); return }
       if (selected === undefined) {
         if (!unavailableReported) {
@@ -109,6 +108,11 @@ export function createChildConversationController(
       overlayHandle = undefined;
       if (heldHandle !== undefined) contain(() => heldHandle.hide(), WidgetDiagnosticCode.ComponentFailed);
 
+      const heldUnsubscribe = unsubscribe;
+      unsubscribe = undefined;
+      if (heldUnsubscribe !== undefined) contain(() => heldUnsubscribe(), WidgetDiagnosticCode.SourceFailed);
+      source = undefined;
+
       const heldComponent = component;
       component = undefined;
       if (heldComponent !== undefined) contain(() => heldComponent.dispose(), WidgetDiagnosticCode.ComponentFailed);
@@ -116,11 +120,6 @@ export function createChildConversationController(
       const heldCoalescer = coalescer;
       coalescer = undefined;
       if (heldCoalescer !== undefined) contain(() => heldCoalescer.dispose(), WidgetDiagnosticCode.ComponentFailed);
-
-      const heldUnsubscribe = unsubscribe;
-      unsubscribe = undefined;
-      if (heldUnsubscribe !== undefined) contain(() => heldUnsubscribe(), WidgetDiagnosticCode.SourceFailed);
-      source = undefined;
     },
 
     dispose: (): void => {

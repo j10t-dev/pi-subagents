@@ -706,6 +706,7 @@ describe("editor composition and focus", () => {
     const originalDispose = feed.source.dispose.bind(feed.source);
     feed.source.dispose = () => { lifecycle.push("source:dispose"); originalDispose() };
     const opens: string[] = [];
+    const openedSources: AgentWidgetSource[] = [];
     let closeEvents = 0;
     let captured: Parameters<NonNullable<AgentWidgetDeps["createConversationController"]>>[0] | undefined;
     const h = harness({
@@ -713,7 +714,7 @@ describe("editor composition and focus", () => {
       createConversationController: (options) => {
         captured = options;
         return {
-          open: (ordinal) => { opens.push(String(ordinal)) },
+          open: (ordinal, source) => { opens.push(String(ordinal)); openedSources.push(source) },
           close: () => { closeEvents += 1 },
           dispose: () => { lifecycle.push("controller:dispose") },
         };
@@ -729,10 +730,11 @@ describe("editor composition and focus", () => {
     h.setEditorText("unchanged draft");
     (h.component()!.handleInput as (data: string) => void)("\r");
     expect(opens).toEqual(["A1"]);
+    expect(openedSources).toEqual([feed.source]);
     expect(h.editorText()).toBe("unchanged draft");
     expect(h.widgets.at(-1)?.content).toBeDefined();
 
-    captured?.source();
+    expect(captured).not.toHaveProperty("source");
     expect(h.lines().join("\n")).toContain("A1");
     const closesBeforeShutdown = closeEvents;
     h.shutdown();

@@ -13,7 +13,9 @@ import {
 
 /** Removes transcript correlation before any state can reach presentation code. */
 export function projectConversationSnapshot(selected: SelectedTranscriptSnapshot): ConversationSnapshot {
-  const revision = conversationRevision(Number(selected.revision));
+  const revision = conversationRevision(
+    Number(selected.transcript.revision) === 0 ? 0 : Number(selected.revision),
+  );
   const items = Object.freeze(selected.transcript.items.map((item, index) => projectItem(item, revision, index)));
   return Object.freeze({
     revision,

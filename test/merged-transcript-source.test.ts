@@ -39,6 +39,11 @@ function expectTranscript(actual: readonly TranscriptItem[], expected: readonly 
   expect(actual.map((item) => ({ ...item, sequence: 0 }))).toEqual(expected.map((item) => ({ ...item, sequence: 0 })));
 }
 
+function runtimeThenableListener(create: () => unknown): TranscriptListener {
+  const listener = () => create();
+  return listener as TranscriptListener;
+}
+
 class MutableSource implements TranscriptSource {
   readonly listeners = new Set<TranscriptListener>();
   private revision = 0;
@@ -179,12 +184,55 @@ describe("createMergedTranscriptSource", () => {
     expectTranscript(items(merged).filter((item) => item.kind === "tool"), [tool(firstRun, 7), tool(firstRun, 99)]);
   });
 
+  test("retains valid authoritative history when that source becomes unavailable beside live data", () => {
+    const authoritative = new MutableAuthoritativeSource([
+      ...runItems(firstRun, "committed"),
+      ...runItems(currentRun, "durable current"),
+    ]);
+    const live = new MutableSource(runItems(currentRun, "live current"));
+    const merged = createMergedTranscriptSource(authoritative, live);
+
+    authoritative.emit(authoritative.snapshot().items, { availability: "unavailable" });
+
+    expectTranscript(items(merged), [
+      ...runItems(firstRun, "committed"),
+      ...runItems(currentRun, "live current"),
+    ]);
+  });
+
+  test("appends the latest live run once when authoritative segmentation does not contain it", () => {
+    const authoritative = new MutableAuthoritativeSource(runItems(firstRun, "committed"));
+    const live = new MutableSource(runItems(currentRun, "live current"));
+    const merged = createMergedTranscriptSource(authoritative, live);
+
+    expectTranscript(items(merged), [
+      ...runItems(firstRun, "committed"),
+      ...runItems(currentRun, "live current"),
+    ]);
+  });
+
   test("retains a valid current live run when the authoritative source becomes unavailable", () => {
     const authoritative = new MutableAuthoritativeSource(runItems(firstRun, "committed"));
     const live = new MutableSource(runItems(currentRun, "live"));
     const merged = createMergedTranscriptSource(authoritative, live);
     authoritative.emit([], { availability: "unavailable" });
     expectTranscript(items(merged), runItems(currentRun, "live"));
+  });
+
+  test("retains a latest unproved authoritative run when live becomes unavailable and empty", () => {
+    const authoritative = new MutableAuthoritativeSource([
+      ...runItems(firstRun, "committed"),
+      ...runItems(currentRun, "unproved current"),
+    ]);
+    const live = new MutableSource(runItems(currentRun, "live"));
+    const merged = createMergedTranscriptSource(authoritative, live);
+
+    live.emit([], { availability: "unavailable" });
+
+    expectTranscript(items(merged), [
+      ...runItems(firstRun, "committed"),
+      ...runItems(currentRun, "unproved current"),
+    ]);
   });
 
   test("retains committed authoritative runs when the live source becomes unavailable", () => {
@@ -226,12 +274,12 @@ describe("createMergedTranscriptSource", () => {
     const authoritative = new MutableAuthoritativeSource(runItems(firstRun, "committed"));
     const merged = createMergedTranscriptSource(authoritative);
     let rejectionHandled = false;
-    merged.subscribe(() => ({
+    merged.subscribe(runtimeThenableListener(() => ({
       then: (_resolve: (value: unknown) => void, reject: (reason: unknown) => void) => {
         rejectionHandled = true;
         reject(new Error("listener rejection"));
       },
-    }));
+    })));
 
     authoritative.emit([...runItems(firstRun, "committed"), ...runItems(currentRun, "current")]);
     await Promise.resolve();
@@ -243,7 +291,7 @@ describe("createMergedTranscriptSource", () => {
     const merged = createMergedTranscriptSource(authoritative);
     let healthy = 0;
     merged.subscribe(() => { throw new Error("listener failure"); });
-    merged.subscribe(() => Promise.resolve());
+    merged.subscribe(runtimeThenableListener(() => Promise.resolve()));
     merged.subscribe(() => { healthy += 1; });
     authoritative.emit([...runItems(firstRun, "committed"), ...runItems(currentRun, "current")]);
     authoritative.emit([...runItems(firstRun, "committed"), ...runItems(currentRun, "next")]);

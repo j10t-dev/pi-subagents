@@ -32,6 +32,12 @@ spawn_agent({ task: "Retrieve the current temperature.", tools: ["web_fetch"] })
 spawn_agent({ task: "Reason without tools.", tools: [] })
 ```
 
+## Child conversation view
+
+In TUI mode, move focus to the subagent widget, select a direct or nested row and press `Enter` to open its read-only conversation. Use arrow or page keys to scroll, `g`/`G` for the retained beginning or live tail, `Ctrl+T` to toggle thinking, `Ctrl+O` to expand tool output, and `Esc` to restore the parent editor and widget state.
+
+The authoritative reader supports Pi transcript formats 2 and 3, whose records carry native entry IDs. Version-1 transcript files are unavailable to this view; the extension does not fabricate correlation IDs. Lifecycle operation and completion delivery remain unaffected.
+
 ## Configuration
 
 The default concurrency limit is `4`. Override it in global `~/.pi/agent/settings.json` without adding an extension path:

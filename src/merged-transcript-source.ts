@@ -103,10 +103,14 @@ export function createMergedTranscriptSource(
       disposed = true;
       listeners.clear();
       detach();
-      let failure: unknown;
+      let failure: Error | undefined;
       for (const source of [authoritative, managed(live)]) {
         if (source === undefined) continue;
-        try { source.dispose(); } catch (cause) { failure ??= cause; }
+        try {
+          source.dispose();
+        } catch (cause) {
+          failure ??= cause instanceof Error ? cause : new Error(String(cause), { cause });
+        }
       }
       if (failure !== undefined) throw failure;
     },
@@ -130,9 +134,12 @@ function buildSnapshot(
 ): TranscriptSnapshot {
   const durable = authoritative.snapshot();
   const observed = live?.snapshot();
-  const selected: TranscriptItem[] = durable.availability === "unavailable"
-    ? [...(observed?.items ?? durable.items)]
-    : mergeDurable(durable.items, authoritative.postTerminalEndReached(), observed?.items, live !== undefined);
+  const selected = mergeDurable(
+    durable.items,
+    authoritative.postTerminalEndReached(),
+    observed?.items,
+    observed !== undefined && observed.availability !== "unavailable",
+  );
   const bounded = bound(selected, durable.truncatedBefore || observed?.truncatedBefore === true);
   return freezeSnapshot(revision, bounded.items, bounded.truncatedBefore, availability(durable, observed));
 }
@@ -141,17 +148,22 @@ function mergeDurable(
   authoritative: readonly TranscriptItem[],
   ended: boolean,
   live: readonly TranscriptItem[] | undefined,
-  hasLive: boolean,
+  liveAvailable: boolean,
 ): TranscriptItem[] {
   const parts = segmentAuthoritative(authoritative, ended);
-  const liveByRun = new Map<string, readonly TranscriptItem[]>();
-  let latestLive: readonly TranscriptItem[] | undefined;
+  const liveByRun = new Map<RunSegment["runId"], readonly TranscriptItem[]>();
+  let latestLive: RunSegment | undefined;
   for (const segment of segmentLive(live ?? [])) {
     liveByRun.set(segment.runId, segment.items);
-    latestLive = segment.items;
+    latestLive = segment;
+  }
+  const hasUsableLive = liveAvailable && latestLive !== undefined;
+  const authoritativeRuns = new Set<RunSegment["runId"]>();
+  for (const part of parts) {
+    if (part.kind === "run") authoritativeRuns.add(part.segment.runId);
   }
   const result: TranscriptItem[] = [];
-  const liveRunEmitted = new Set<string>();
+  const liveRunEmitted = new Set<RunSegment["runId"]>();
   let liveLeadingEmitted = false;
   for (const part of parts) {
     if (part.kind === "notice") {
@@ -159,14 +171,15 @@ function mergeDurable(
       continue;
     }
     if (part.kind === "leading") {
-      if (part.final || !hasLive || latestLive === undefined) result.push(...part.items);
+      if (part.final || !liveAvailable || latestLive === undefined) result.push(...part.items);
       else if (!liveLeadingEmitted) {
-        result.push(...latestLive);
+        result.push(...latestLive.items);
+        liveRunEmitted.add(latestLive.runId);
         liveLeadingEmitted = true;
       }
       continue;
     }
-    if (part.segment.final || !hasLive) {
+    if (part.segment.final || !liveAvailable || latestLive === undefined) {
       result.push(...part.segment.items);
       continue;
     }
@@ -174,7 +187,17 @@ function mergeDurable(
     if (replacement !== undefined && !liveRunEmitted.has(part.segment.runId)) {
       result.push(...replacement);
       liveRunEmitted.add(part.segment.runId);
+    } else if (replacement === undefined && latestLive !== undefined && latestLive.runId !== part.segment.runId) {
+      // A different live run proves this retained authoritative segment is prior history.
+      result.push(...part.segment.items);
     }
+  }
+  if (hasUsableLive
+    && latestLive !== undefined
+    && !liveRunEmitted.has(latestLive.runId)
+    && !authoritativeRuns.has(latestLive.runId)
+    && !(ended && authoritativeRuns.size === 0 && parts.some((part) => part.kind === "leading"))) {
+    result.push(...latestLive.items);
   }
   return result;
 }

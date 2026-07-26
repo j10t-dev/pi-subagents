@@ -4,9 +4,11 @@ import type {
   AgentDisplayState,
   AgentRow,
   ManagedTranscriptSource,
+  SelectedTranscriptSnapshot,
   TranscriptListener,
   TranscriptSnapshot,
 } from "../src/agent-observation.ts";
+import { projectConversationSnapshot } from "../src/agent-widget/conversation-projection.ts";
 import { createSelectedTranscriptSource } from "../src/agent-widget/conversation-source.ts";
 import {
   AgentState,
@@ -21,6 +23,18 @@ import {
   type TaskLabel,
   type TranscriptRoute,
 } from "../src/domain.ts";
+
+type SelectedListener = (snapshot: SelectedTranscriptSnapshot) => void;
+
+function runtimeThenableListener(onThen: () => void): SelectedListener {
+  const listener = () => ({
+    then: (_resolve: (value: unknown) => void, reject: (reason: unknown) => void) => {
+      onThen();
+      reject(new Error("listener rejection"));
+    },
+  });
+  return listener as SelectedListener;
+}
 
 const ROUTE: TranscriptRoute = Object.freeze({
   ownerSessionId: agentId("owner-session"),
@@ -58,7 +72,11 @@ class FakeManagedTranscriptSource implements ManagedTranscriptSource {
   routeLosses = 0;
   disposals = 0;
   private readonly listeners = new Set<TranscriptListener>();
-  private current = snapshotAt(1);
+  private current: TranscriptSnapshot;
+
+  constructor(initialRevision = 1) {
+    this.current = snapshotAt(initialRevision);
+  }
 
   get subscribers(): number { return this.listeners.size }
 
@@ -81,12 +99,12 @@ class FakeManagedTranscriptSource implements ManagedTranscriptSource {
   }
 }
 
-function selectedOver(options: { readonly ordinal?: string } = {}): {
+function selectedOver(options: { readonly ordinal?: string; readonly transcriptRevision?: number } = {}): {
   readonly transcript: FakeManagedTranscriptSource;
   readonly source: ReturnType<typeof createSelectedTranscriptSource>;
   readonly initialRow: AgentRow;
 } {
-  const transcript = new FakeManagedTranscriptSource();
+  const transcript = new FakeManagedTranscriptSource(options.transcriptRevision);
   const initialRow = row(options);
   const source = createSelectedTranscriptSource(
     agentOrdinal(options.ordinal ?? "A1.2"),
@@ -98,6 +116,15 @@ function selectedOver(options: { readonly ordinal?: string } = {}): {
 }
 
 describe("createSelectedTranscriptSource", () => {
+  test("preserves transcript revision-zero loading through selected row updates and projection", () => {
+    const { source } = selectedOver({ transcriptRevision: 0 });
+    source.update({ route: ROUTE, row: row({ taskLabel: "Updated while loading" }) });
+
+    expect(Number(source.snapshot().revision)).toBeGreaterThan(0);
+    expect(Number(projectConversationSnapshot(source.snapshot()).revision)).toBe(0);
+    source.dispose();
+  });
+
   test("publishes the initial row, transcript and route availability together", () => {
     const { source, transcript, initialRow } = selectedOver();
 
@@ -206,6 +233,21 @@ describe("createSelectedTranscriptSource", () => {
 
     expect(source.snapshot().transcript).toEqual(snapshotAt(3));
     expect(notifications).toBe(1);
+    source.dispose();
+  });
+
+  test("removes and consumes a rejecting thenable subscriber", async () => {
+    const { source, transcript } = selectedOver();
+    let rejectionConsumed = false;
+    let calls = 0;
+    source.subscribe(runtimeThenableListener(() => { rejectionConsumed = true; calls += 1 }));
+
+    transcript.publish(snapshotAt(2));
+    await Promise.resolve();
+    transcript.publish(snapshotAt(3));
+
+    expect(rejectionConsumed).toBe(true);
+    expect(calls).toBe(1);
     source.dispose();
   });
 

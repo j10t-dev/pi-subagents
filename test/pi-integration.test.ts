@@ -27,10 +27,13 @@ import { createProductionController, launchAfterSurrender } from "../src/pi-comp
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
 import { createAgentWidgetSource } from "../src/agent-widget/source.ts";
 import {
+  contextLabel,
+  deriveModelLabel,
   deriveTaskLabel,
   directAgentRow,
   unknownModelLabel,
   type AgentObservation,
+  type SelectedTranscriptSource,
   type SubagentObservationPort,
   type TranscriptItem,
 } from "../src/agent-observation.ts";
@@ -48,6 +51,7 @@ import {
   contextPercent,
   delegationDepth,
   milliseconds,
+  modelSpec,
   runCapacity,
   transcriptFileName,
   type AgentId,
@@ -58,7 +62,6 @@ import {
   observationSlotDirectory,
   observationSnapshotPath,
   readKnownChildSnapshots,
-  type ObservationRow,
   type ObservationSnapshot,
 } from "../src/observation-snapshot-path.ts";
 import { absolutePath } from "../src/paths.ts";
@@ -875,9 +878,14 @@ describe("deterministic network-free real-Pi matrix", () => {
         omitted: agentCount(0),
         degraded: false,
         agents: [{
-          ordinal: agentOrdinal("A1"), sessionId: nestedId,
-          model: "mock:h" as ObservationRow["model"], context: "?%" as ObservationRow["context"],
-          taskLabel: "nested committed" as ObservationRow["taskLabel"], state: AgentState.Running,
+          ordinal: agentOrdinal("A1"),
+          sessionId: nestedId,
+          model: deriveModelLabel(modelSpec("mock-provider/mock"), "high"),
+          context: contextLabel({ kind: "unavailable" }),
+          taskLabel: deriveTaskLabel("nested committed", {
+            knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(),
+          }),
+          state: AgentState.Running,
           transcriptFile: transcriptFileName(basename(nestedFile)),
         }],
       });
@@ -890,14 +898,23 @@ describe("deterministic network-free real-Pi matrix", () => {
       });
       const direct = source.transcriptSource(agentOrdinal("A1"));
       const directUnsubscribe = direct?.subscribe(() => {});
-      await Bun.sleep(20);
-      expect(direct?.snapshot().transcript.items)
-        .toContainEqual(expect.objectContaining({ kind: "assistant", phase: "partial", text: "🙂".repeat(2_048) }));
+      if (direct === undefined) throw new Error("direct selected transcript was unavailable");
+      await waitForSelectedTranscript(
+        direct,
+        (item) => item.kind === "assistant" && item.phase === "partial" && item.text === "🙂".repeat(2_048),
+        "direct live assistant partial",
+      );
 
       const committed = source.transcriptSource(agentOrdinal("A1.1"));
       const committedUnsubscribe = committed?.subscribe(() => {});
-      await Bun.sleep(20);
-      expect(committed?.snapshot().transcript.items).toContainEqual(expect.objectContaining({ kind: "user", text: "nested committed" }));
+      if (committed === undefined) throw new Error("nested selected transcript was unavailable");
+      await waitForSelectedTranscript(
+        committed,
+        (item) => item.kind === "user" && item.text === "nested committed",
+        "nested committed user message",
+      );
+      expect(committed.snapshot().transcript.items)
+        .toContainEqual(expect.objectContaining({ kind: "user", text: "nested committed" }));
       directUnsubscribe?.();
       committedUnsubscribe?.();
     } finally {
@@ -1263,6 +1280,19 @@ describe("deterministic network-free real-Pi matrix", () => {
     });
   }, 40_000);
 });
+
+async function waitForSelectedTranscript(
+  source: SelectedTranscriptSource,
+  accept: (item: TranscriptItem) => boolean,
+  expected: string,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (source.snapshot().transcript.items.some(accept)) return;
+    await Bun.sleep(5);
+  }
+  throw new Error(`selected transcript did not publish ${expected}`);
+}
 
 async function waitForTranscriptItems(
   controller: ReturnType<typeof createProductionController>,

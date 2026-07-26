@@ -136,6 +136,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     const tracked = new Set<AgentId>();
     const seen = new Set<AgentId>();
     const nextRoutes = new Map<AgentOrdinal, TranscriptRoute>();
+    const reservedRouteOrdinals = new Set<AgentOrdinal>();
     const nextRetained = new Map<AgentId, RetainedSlot>();
     const maximumRows = Math.min(Number(this.dependencies.maxRows), Number(MAX_WIDGET_ROWS));
     let admittedCount = 0;
@@ -163,6 +164,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
       seen,
       tracked,
       nextRoutes,
+      reservedRouteOrdinals,
     );
 
     let levelStart = 0;
@@ -234,6 +236,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
         seen,
         tracked,
         nextRoutes,
+        reservedRouteOrdinals,
       );
       if (admittedCount >= maximumRows && ownerQueue.length > levelEnd) {
         preserveRetainedUnprocessedOwners(this.retained, nextRetained, ownerQueue, levelEnd);
@@ -340,6 +343,7 @@ function admitCandidates(
   seen: Set<AgentId>,
   tracked: Set<AgentId>,
   nextRoutes: Map<AgentOrdinal, TranscriptRoute>,
+  reservedRouteOrdinals: Set<AgentOrdinal>,
 ): number {
   for (const candidate of candidates) {
     seen.add(candidate.owner);
@@ -349,15 +353,16 @@ function admitCandidates(
   for (const candidate of [...candidates].sort(compareCandidatesByLocalOrdinal)) {
     if (candidate.parent === undefined) roots.push(candidate.node);
     else candidate.parent.children.push(candidate.node);
+    const ordinal = candidate.node.row.ordinal;
+    const firstClaimant = !reservedRouteOrdinals.has(ordinal);
+    reservedRouteOrdinals.add(ordinal);
     const route = candidate.transcriptFile === undefined ? undefined : Object.freeze({
       ownerSessionId: candidate.ownerSessionId,
       childSessionId: candidate.node.sessionId,
       fileName: candidate.transcriptFile,
       direct: candidate.parent === undefined,
     });
-    if (route !== undefined && !nextRoutes.has(candidate.node.row.ordinal)) {
-      nextRoutes.set(candidate.node.row.ordinal, route);
-    }
+    if (route !== undefined && firstClaimant) nextRoutes.set(ordinal, route);
   }
   return candidates.length;
 }

@@ -337,7 +337,6 @@ function startAggregator(
   const ensureConversationController = (): void => {
     if (conversationController !== undefined || tuiRef === undefined || themeRef === undefined || keybindingsRef === undefined) return;
     conversationController = guard(() => (deps.createConversationController ?? createChildConversationController)({
-      source: () => currentSource,
       tui: tuiRef!,
       theme: themeRef!,
       keybindings: keybindingsRef!,
@@ -396,7 +395,10 @@ function startAggregator(
           currentView,
           applyModel,
           returnFocusToEditor,
-          (ordinal) => conversationController?.open(ordinal),
+          (ordinal) => {
+            const source = currentSource;
+            if (source !== undefined) conversationController?.open(ordinal, source);
+          },
           forwardShortcut,
           () => report(WidgetDiagnosticCode.ComponentFailed),
         );

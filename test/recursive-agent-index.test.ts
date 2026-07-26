@@ -1091,9 +1091,15 @@ describe("RecursiveAgentIndex", () => {
   test("reconstructs a completed three-level tree after fresh index creation", () => {
     const parent = agentId("completed-parent");
     const child = agentId("completed-child");
-    writeSnapshot(snapshot(parent, [observationRow("A2", child, CompletionState.Completed)]));
-    writeSnapshot(snapshot(child, [observationRow("A3", "completed-grandchild", CompletionState.Completed)]));
-    const directProjection = direct([projection(parent, "A1", CompletionState.Completed)]);
+    writeSnapshot(snapshot(parent, [
+      observationRow("A2", child, CompletionState.Completed, "A2", transcriptFileName("child.jsonl")),
+    ]));
+    writeSnapshot(snapshot(child, [
+      observationRow("A3", "completed-grandchild", CompletionState.Completed, "A3", transcriptFileName("grandchild.jsonl")),
+    ]));
+    const directProjection = direct([
+      projection(parent, "A1", CompletionState.Completed, "A1", transcriptFileName("parent.jsonl")),
+    ]);
 
     const first = fixture(directProjection);
     first.index.refresh();
@@ -1104,6 +1110,12 @@ describe("RecursiveAgentIndex", () => {
       expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.2", "A1.2.3"]);
       expect(index.snapshot().rows.map((row) => Number(row.depth))).toEqual([0, 1, 2]);
       expect(index.snapshot()).toMatchObject({ total: agentCount(3), omitted: agentCount(0), degraded: false });
+      expect(index.transcriptRoute(agentOrdinal("A1.2.3"))).toEqual({
+        ownerSessionId: child,
+        childSessionId: agentId("completed-grandchild"),
+        fileName: transcriptFileName("grandchild.jsonl"),
+        direct: false,
+      });
     }
   });
 
@@ -1251,6 +1263,16 @@ describe("RecursiveAgentIndex", () => {
     expect(index.transcriptRoute(agentOrdinal("A1.2"))).toBeUndefined();
 
     index.dispose();
+    expect(index.transcriptRoute(agentOrdinal("A1"))).toBeUndefined();
+  });
+
+  test("reserves a duplicate ordinal when its first admitted row has no transcript locator", () => {
+    const { index } = fixture(direct([
+      projection("first-claimant", "A1", AgentState.Running, "A1"),
+      projection("second-claimant", "A1", AgentState.Running, "A1", transcriptFileName("second.jsonl")),
+    ]));
+    index.refresh();
+
     expect(index.transcriptRoute(agentOrdinal("A1"))).toBeUndefined();
   });
 
