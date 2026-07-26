@@ -279,7 +279,7 @@ describe("CompletionService.await", () => {
   });
 });
 
-describe("CompletionService back-ping notification", () => {
+describe("CompletionService notification candidates", () => {
   test("same native run ID from two agents is independently published", async () => {
     const service = new CompletionService();
     await Promise.all([service.publish(completion()), service.publish(completion({ agentId: OTHER_AGENT }))]);
@@ -293,37 +293,40 @@ describe("CompletionService back-ping notification", () => {
     expect(service.queuedCount()).toBe(1);
     expect(completionArray(await service.awaitReady())).toHaveLength(1);
   });
-  test("notifies on an empty-to-non-empty transition with no active receiver", async () => {
+  test("creates a candidate on an empty-to-non-empty transition with no active receiver", async () => {
     const service = new CompletionService();
-    const result = await service.publish(completion());
-    expect(result.shouldNotify).toBe(true);
+    const first = completion();
+    await service.publish(first);
+    expect(await service.readyNotification()).toEqual({ epoch: completionKey(first), readyCount: agentCount(1) });
   });
 
-  test("suppresses further notifications while the queue stays non-empty", async () => {
+  test("retains one candidate while the queue stays non-empty", async () => {
     const service = new CompletionService();
-    await service.publish(completion());
-    const second = await service.publish(completion({ agentId: OTHER_AGENT }));
-    expect(second.shouldNotify).toBe(false);
+    const first = completion();
+    await service.publish(first);
+    await service.publish(completion({ agentId: OTHER_AGENT }));
+    expect(await service.readyNotification()).toEqual({ epoch: completionKey(first), readyCount: agentCount(2) });
   });
 
-  test("an active receiver suppresses the notification entirely", async () => {
+  test("an active receiver suppresses the notification candidate entirely", async () => {
     const service = new CompletionService();
     service.upsertAgent(running());
 
     const receivePromise = service.awaitReady();
-    const result = await service.publish(completion());
+    await service.publish(completion());
 
-    expect(result.shouldNotify).toBe(false);
+    expect(await service.readyNotification()).toBeUndefined();
     await receivePromise;
   });
 
-  test("draining the queue allows the next empty-to-non-empty transition to notify again", async () => {
+  test("draining the queue allows the next empty-to-non-empty candidate", async () => {
     const service = new CompletionService();
     await service.publish(completion());
     await service.awaitReady();
 
-    const result = await service.publish(completion({ agentId: OTHER_AGENT }));
-    expect(result.shouldNotify).toBe(true);
+    const next = completion({ agentId: OTHER_AGENT });
+    await service.publish(next);
+    expect(await service.readyNotification()).toEqual({ epoch: completionKey(next), readyCount: agentCount(1) });
   });
 });
 

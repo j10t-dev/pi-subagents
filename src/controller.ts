@@ -39,7 +39,7 @@ import { RunController, classifyTerminal, type RunRecord, type RunRuntime, type 
 import type { RpcRunClient } from "./rpc-client.ts";
 import { absolutePath } from "./paths.ts";
 import { classifyAssignmentEntries } from "./assignment-identity.ts";
-import { delayWithAbort, waitWithAbort } from "./async-primitives.ts";
+import { delayWithAbort, Mutex, waitWithAbort } from "./async-primitives.ts";
 import {
   ASSIGNMENT_IDENTITY_POLL_MS,
   ASSIGNMENT_IDENTITY_TIMEOUT_MS,
@@ -193,7 +193,7 @@ export class SubagentController {
   private readonly restoredStartedAppends = new Set<ReturnType<typeof agentRunKey>>();
   private readonly restoredRecords = new Map<AgentId, RestoredTerminalObligation>();
   private readonly durableCompletions = new Map<ReturnType<typeof agentRunKey>, AgentCompletion>();
-  private readonly pendingNotifications = new Set<ReturnType<typeof agentRunKey>>();
+  private readonly notificationMutex = new Mutex();
   private readonly identityDeadline: () => AbortSignal;
   private readonly identityDelay: (milliseconds: Milliseconds, signal: AbortSignal) => Promise<void>;
   private readonly onCompletionDelivered: (key: ReturnType<typeof agentRunKey>) => void;
@@ -332,10 +332,6 @@ export class SubagentController {
       try { this.onCompletionDelivered(key); }
       catch { /* observation acknowledgement cannot affect lifecycle delivery */ }
     }
-    if (result.remainingCompletions > 0 && !this.suppressPings) {
-      try { await this.ping(result.remainingCompletions); }
-      catch { /* the remaining queue stays visible to the next publish or drain */ }
-    }
     return result;
   }
 
@@ -348,16 +344,31 @@ export class SubagentController {
   async publish(completion: AgentCompletion): Promise<void> {
     const key = agentRunKey(completion.agentId, completion.runId);
     this.durableCompletions.set(key, completion);
-    const result = await this.completions.publish(completion);
+    await this.completions.publish(completion);
     this.observation.publishCompletion(completion);
-    if (result.shouldNotify) this.pendingNotifications.add(key);
-    if (!this.pendingNotifications.has(key) || this.suppressPings) return;
-    // A failed ping keeps the key pending: the queue entry is already durable and visible to the
-    // next `await_agent`, and a re-publication of the same completion retries the notification.
-    try {
-      await this.ping(result.queueSize);
-      this.pendingNotifications.delete(key);
-    } catch { /* retried by the next publication of this completion */ }
+    await this.flushReadyNotification();
+  }
+
+  async parentSettled(): Promise<void> {
+    await this.flushReadyNotification();
+  }
+
+  private async flushReadyNotification(): Promise<void> {
+    await this.notificationMutex.runExclusive(async () => {
+      const parent = this.parent;
+      if (this.suppressPings || parent === undefined || parent.isBusy()) return;
+      const candidate = await this.completions.readyNotification();
+      if (candidate === undefined || this.suppressPings || parent.isBusy()) return;
+      try {
+        await parent.sendMessage(readyMessage(candidate.readyCount), {
+          deliverAs: "followUp",
+          triggerTurn: true,
+        });
+        await this.completions.acknowledgeReadyNotification(candidate.epoch);
+      } catch {
+        // The unacknowledged service candidate remains retryable.
+      }
+    });
   }
 
   restore(): Promise<void> {
@@ -778,12 +789,6 @@ export class SubagentController {
     return true;
   }
 
-  private async ping(count: number): Promise<void> {
-    if (this.parent === undefined) return;
-    const text = `${count} agent completion${count === 1 ? " is" : "s are"} ready. Call await_agent to collect ${count === 1 ? "it" : "them"}.`;
-    await this.parent.sendMessage(text, { deliverAs: "followUp", triggerTurn: !this.parent.isBusy() });
-  }
-
   private warnContainment(agentIdValue: AgentId): void {
     this.parent?.warn?.(`containment_failed: receipt for agent ${agentIdValue} could not be verified`);
   }
@@ -849,6 +854,10 @@ export class SubagentController {
     this.restoredRecords.delete(record.agentId);
     return nativeRunId;
   }
+}
+
+function readyMessage(count: number): string {
+  return `${count} agent completion${count === 1 ? " is" : "s are"} ready. Call await_agent to collect ${count === 1 ? "it" : "them"}.`;
 }
 
 function inertObservation(): AgentObservationMutationPort {

@@ -1532,30 +1532,126 @@ describe("parent lifecycle wiring", () => {
     expect(controller.status()).toBe(expected);
   });
 
-  test("runtime back-pings use followUp while busy and triggerTurn while idle, once per epoch", async () => {
-    const sent: object[] = [];
+  test("busy publication defers one completion notification until parent settlement", async () => {
     let busy = true;
-    const c = new SubagentController({ parent: { isBusy: () => busy, sendMessage: async (_text, options) => { sent.push(options); } } });
-    await c.publish(completion("deadbeef"));
-    await c.publish(completion("cafebabe"));
-    expect(sent).toEqual([{ deliverAs: "followUp", triggerTurn: false }]);
-    await c.awaitReady();
-    expect(sent[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
-    await c.awaitReady();
+    const sent: Array<{ text: string; options: object }> = [];
+    const controller = new SubagentController({
+      parent: {
+        isBusy: () => busy,
+        sendMessage: async (text, options) => { sent.push({ text, options }); },
+      },
+    });
+
+    await controller.publish(completion("deadbeef"));
+    expect(sent).toEqual([]);
     busy = false;
-    await c.publish(completion("facefeed"));
-    expect(sent[2]).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    await controller.parentSettled();
+    expect(sent).toEqual([{
+      text: "1 agent completion is ready. Call await_agent to collect it.",
+      options: { deliverAs: "followUp", triggerTurn: true },
+    }]);
+    await controller.parentSettled();
+    expect(sent).toHaveLength(1);
   });
 
-  test("ping failure does not duplicate queue publication and can be retried", async () => {
-    let pings = 0;
-    const c = new SubagentController({ parent: { isBusy: () => false, sendMessage: async () => { if (++pings === 1) throw new Error("ping failed"); } } });
-    const value = completion("deadbeef");
-    await expect(c.publish(value)).resolves.toBeUndefined();
-    expect(c.completions.queuedCount()).toBe(1);
-    await expect(c.publish(value)).resolves.toBeUndefined();
-    expect(c.completions.queuedCount()).toBe(1);
-    expect(pings).toBe(2);
+  test("a blocked receiver consumes its completion without host notification", async () => {
+    const sent: string[] = [];
+    const controller = new SubagentController({ parent: { isBusy: () => false, sendMessage: async (text) => { sent.push(text); } } });
+    controller.completions.upsertAgent({ agentId: testAgentId("a"), state: AgentState.Running, transcriptPath: testSessionPath("/tmp/pi-subagents-test/a"), currentRunId: testRunId("deadbeef") });
+
+    const waiting = controller.awaitReady();
+    await controller.publish(completion("deadbeef"));
+    await expect(waiting).resolves.toMatchObject({ completion: { runId: testRunId("deadbeef") } });
+    expect(sent).toEqual([]);
+    await controller.parentSettled();
+    expect(sent).toEqual([]);
+  });
+
+  test("collection before settlement suppresses delivery", async () => {
+    let busy = true;
+    const sent: string[] = [];
+    const controller = new SubagentController({ parent: { isBusy: () => busy, sendMessage: async (text) => { sent.push(text); } } });
+
+    await controller.publish(completion("deadbeef"));
+    await controller.awaitReady();
+    busy = false;
+    await controller.parentSettled();
+    expect(sent).toEqual([]);
+  });
+
+  test("one notification reports two queued completions in its epoch", async () => {
+    let busy = true;
+    const sent: string[] = [];
+    const controller = new SubagentController({ parent: { isBusy: () => busy, sendMessage: async (text) => { sent.push(text); } } });
+
+    await controller.publish(completion("deadbeef"));
+    await controller.publish(completion("cafebabe"));
+    busy = false;
+    await controller.parentSettled();
+    expect(sent).toEqual(["2 agent completions are ready. Call await_agent to collect them."]);
+  });
+
+  test("partial collection reports its remainder without a back-ping", async () => {
+    const sent: string[] = [];
+    const controller = new SubagentController({ parent: { isBusy: () => true, sendMessage: async (text) => { sent.push(text); } } });
+
+    await controller.publish(completion("deadbeef"));
+    await controller.publish(completion("cafebabe"));
+    expect(Number((await controller.awaitReady()).remainingCompletions)).toBe(1);
+    expect(sent).toEqual([]);
+  });
+
+  test("idle publication sends an automatic collection turn", async () => {
+    const sent: Array<{ text: string; options: object }> = [];
+    const controller = new SubagentController({ parent: { isBusy: () => false, sendMessage: async (text, options) => { sent.push({ text, options }); } } });
+
+    await controller.publish(completion("deadbeef"));
+    expect(sent).toEqual([{
+      text: "1 agent completion is ready. Call await_agent to collect it.",
+      options: { deliverAs: "followUp", triggerTurn: true },
+    }]);
+  });
+
+  test("a failed notification retries the same candidate on settlement", async () => {
+    let sends = 0;
+    const controller = new SubagentController({ parent: { isBusy: () => false, sendMessage: async () => { if (++sends === 1) throw new Error("send failed"); } } });
+
+    await controller.publish(completion("deadbeef"));
+    expect(controller.completions.queuedCount()).toBe(1);
+    await controller.parentSettled();
+    expect(sends).toBe(2);
+  });
+
+  test("concurrent settlement flushes serialise one host send", async () => {
+    let busy = true;
+    const sending = deferred<void>();
+    const entered = deferred<void>();
+    let sends = 0;
+    const controller = new SubagentController({ parent: {
+      isBusy: () => busy,
+      sendMessage: async () => { sends++; entered.resolve(); await sending.promise; },
+    } });
+
+    await controller.publish(completion("deadbeef"));
+    busy = false;
+    const first = controller.parentSettled();
+    await entered.promise;
+    const second = controller.parentSettled();
+    sending.resolve();
+    await Promise.all([first, second]);
+    expect(sends).toBe(1);
+  });
+
+  test("shutdown suppresses later settlement dispatch", async () => {
+    let busy = true;
+    const sent: string[] = [];
+    const controller = new SubagentController({ parent: { isBusy: () => busy, sendMessage: async (text) => { sent.push(text); } } });
+
+    await controller.publish(completion("deadbeef"));
+    await controller.shutdown();
+    busy = false;
+    await controller.parentSettled();
+    expect(sent).toEqual([]);
   });
 
   test("restoration sends no message and leaves the completion collectable", async () => {

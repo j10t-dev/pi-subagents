@@ -135,6 +135,24 @@ describe("controller orchestration scenarios", () => {
     expect(completionArray(await waiting)).toEqual([expect.objectContaining({ agentId: A, runId: R1 })]);
   });
 
+  test("01a parent await collects a child completion without later notification delivery", async () => {
+    const service = new CompletionService();
+    const messages: string[] = [];
+    const host = new SubagentController({
+      completions: service,
+      parent: { isBusy: () => false, sendMessage: async (text) => { messages.push(text); } },
+    });
+    service.upsertAgent(summary(A, AgentState.Running, R1));
+
+    const awaiting = host.awaitReady();
+    await host.publish(completion(A, R1, "child terminal output"));
+    const result = await awaiting;
+    await host.parentSettled();
+
+    expect(result).toMatchObject({ completion: { agentId: A, runId: R1 }, remainingCompletions: 0 });
+    expect(messages).toEqual([]);
+  });
+
   test("02 B completes first, is received and resumed before A is received", async () => {
     const service = new CompletionService();
     service.upsertAgent(summary(A, AgentState.Running, R1));

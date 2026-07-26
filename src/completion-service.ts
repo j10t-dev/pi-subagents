@@ -47,12 +47,6 @@ export interface CompletionAuthoritySnapshot {
   readonly pendingDelivery: ReadonlySet<AgentRunKey>;
 }
 
-export interface PublishResult {
-  /** True only on an empty-to-non-empty queue transition with no active receiver. */
-  shouldNotify: boolean;
-  queueSize: number;
-}
-
 export interface ReadyNotificationCandidate {
   readonly epoch: AgentRunKey;
   readonly readyCount: AgentCount;
@@ -84,7 +78,6 @@ export class CompletionService {
   private readonly agents = new Map<AgentId, AgentSummary>();
   private waitingReceiver: CompletionWaiter | undefined;
   private notificationEpoch: AgentRunKey | undefined;
-  private notifiedSinceEmpty = false;
   private liveOperationsStarted = false;
 
 
@@ -101,15 +94,12 @@ export class CompletionService {
     });
   }
 
-  /**
-   * Publishes a terminal completion. Wakes an active receiver if one is waiting; otherwise
-   * reports whether this is an empty-to-non-empty transition that should trigger a back-ping.
-   */
-  async publish(completion: AgentCompletion): Promise<PublishResult> {
+  /** Publishes a terminal completion and creates an eligible notification candidate when needed. */
+  async publish(completion: AgentCompletion): Promise<void> {
     this.liveOperationsStarted = true;
-    return this.mutex.runExclusive(() => {
+    await this.mutex.runExclusive(() => {
       const key = completionKey(completion);
-      if (this.publishedRuns.has(key)) return { shouldNotify: false, queueSize: this.queue.length };
+      if (this.publishedRuns.has(key)) return;
       this.publishedRuns.add(key);
       const wasEmpty = this.queue.length === 0;
       this.queue.push(completion);
@@ -119,15 +109,10 @@ export class CompletionService {
       if (waiting !== undefined) {
         this.waitingReceiver = undefined;
         waiting.wake();
-        return { shouldNotify: false, queueSize: this.queue.length };
+        return;
       }
 
-      if (wasEmpty && !this.notifiedSinceEmpty) {
-        this.notificationEpoch = key;
-        this.notifiedSinceEmpty = true;
-        return { shouldNotify: true, queueSize: this.queue.length };
-      }
-      return { shouldNotify: false, queueSize: this.queue.length };
+      if (wasEmpty) this.notificationEpoch = key;
     });
   }
 
@@ -298,7 +283,6 @@ export class CompletionService {
     const completion = this.queue.shift();
     if (completion === undefined) return undefined;
     this.notificationEpoch = undefined;
-    this.notifiedSinceEmpty = false;
     return {
       ...completion,
       output: { ...completion.output },
