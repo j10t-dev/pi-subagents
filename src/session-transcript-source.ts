@@ -9,8 +9,10 @@ import {
   trySafeToolDisplayName,
   type AgentDisplayState,
   type AuthoritativeTranscriptSource,
+  type TranscriptAssistantBlock,
   type TranscriptItem,
   type TranscriptListener,
+  type TranscriptSensitiveValues,
   type TranscriptSnapshot,
 } from "./agent-observation.ts";
 import { createCoalescer } from "./coalescer.ts";
@@ -19,6 +21,7 @@ import {
   MAX_SESSION_RECOVERY_BYTES,
   MAX_TRANSCRIPT_SOURCE_BYTES,
   MAX_TRANSCRIPT_SOURCE_ITEMS,
+  MAX_TOOL_RESULT_BLOCKS,
   STATE_DIR_NAME,
   TRANSCRIPT_FALLBACK_INTERVAL_MS,
   TRANSCRIPT_REFRESH_WINDOW_MS,
@@ -30,8 +33,11 @@ import {
   fileInode,
   fileOffset,
   milliseconds,
+  rpcToolCallId,
   runId,
+  transcriptAssistantGroup,
   transcriptPathSegment,
+  tryPresentationCwd,
   transcriptRevision,
   transcriptSequence,
   utf8Bytes,
@@ -41,6 +47,7 @@ import {
   type FileInode,
   type FileOffset,
   type Milliseconds,
+  type RpcToolCallId,
   type SessionEntryId,
   type TranscriptFileName,
   type TranscriptPathSegment,
@@ -157,7 +164,9 @@ export function createSessionTranscriptSource(
   let refreshing = false;
   let pending = false;
   let revision = 0;
-  let published: TranscriptSnapshot = frozenSnapshot(0, [], false, "live");
+  let sensitiveValues = sourceSensitiveValues(route, deps, new Set<string>());
+  let renderingCwd: AbsolutePath | undefined;
+  let published: TranscriptSnapshot = frozenSnapshot(0, [], false, "live", sensitiveValues, renderingCwd);
   let displayState: AgentDisplayState = AgentState.Running;
   let terminalGeneration = 0;
   /** File-observation generations let one successful read consume only changes it could see. */
@@ -206,6 +215,8 @@ export function createSessionTranscriptSource(
       return;
     }
     const proofBefore = endReached;
+    sensitiveValues = sourceSensitiveValues(route, deps, result.entryIds);
+    renderingCwd = result.renderingCwd;
     if (result.rebuilt) endReached = false;
     consumedChangeGeneration = Math.max(consumedChangeGeneration, observedChangeGeneration);
     const terminalNow = isTerminalDisplayState(displayState);
@@ -235,9 +246,16 @@ export function createSessionTranscriptSource(
     force = false,
   ): void {
     const first = revision === 0;
-    if (!first && !force && !changed(published, items, truncatedBefore, availability)) return;
+    if (!first && !force && !changed(
+      published,
+      items,
+      truncatedBefore,
+      availability,
+      sensitiveValues,
+      renderingCwd,
+    )) return;
     revision += 1;
-    published = frozenSnapshot(revision, items, truncatedBefore, availability);
+    published = frozenSnapshot(revision, items, truncatedBefore, availability, sensitiveValues, renderingCwd);
     notify();
   }
 
@@ -383,7 +401,7 @@ export function createSessionTranscriptSource(
 // --- Bounded branch reading ------------------------------------------------
 
 type ReadResult =
-  | { readonly kind: "read"; readonly items: readonly TranscriptItem[]; readonly truncatedBefore: boolean; readonly rebuilt: boolean }
+  | { readonly kind: "read"; readonly items: readonly TranscriptItem[]; readonly truncatedBefore: boolean; readonly rebuilt: boolean; readonly entryIds: ReadonlySet<string>; readonly renderingCwd?: AbsolutePath }
   | { readonly kind: "failed"; readonly code: TranscriptDiagnosticCode };
 
 interface BranchReader {
@@ -413,6 +431,7 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
   let entryBytes: number[] = [];
   let retainedEntryBytes = 0;
   let truncated = false;
+  let headerCwd: AbsolutePath | undefined;
 
   function forget(): void {
     identity = undefined;
@@ -422,6 +441,7 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
     entryBytes = [];
     retainedEntryBytes = 0;
     truncated = false;
+    headerCwd = undefined;
   }
 
   async function read(): Promise<ReadResult> {
@@ -483,6 +503,7 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
     // that this handle still holds a transcript belonging to the routed child session.
     const header = await readHeader(file, size);
     if ("kind" in header) return rejectAtomically(header);
+    const observedHeaderCwd = headerCwd;
     // Header revalidation and the suffix share one authoritative recovery budget. The header
     // read may have consumed a whole chunk past its LF, so charge every inspected byte.
     const recoveryBytes = Math.max(0, Number(MAX_SESSION_RECOVERY_BYTES) - header.inspectedBytes);
@@ -494,6 +515,7 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
     const rebuilding = rebuilt || rebuildForLargeAppend;
     if (rebuilding) {
       forget();
+      headerCwd = observedHeaderCwd;
       identity = stat;
     }
     const start = rebuilding ? Math.max(0, size - recoveryBytes) : consumed;
@@ -538,7 +560,8 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
     if (projection === undefined) {
       return rejectAtomically({ kind: "failed", code: TranscriptDiagnosticCode.Malformed });
     }
-    return { kind: "read", items: projection.items, truncatedBefore: projection.truncatedBefore, rebuilt: rebuilding };
+    return { kind: "read", items: projection.items, truncatedBefore: projection.truncatedBefore, rebuilt: rebuilding,
+      entryIds: projection.entryIds, ...(headerCwd === undefined ? {} : { renderingCwd: headerCwd }) };
     } catch (cause) {
       rejectAtomically({ kind: "failed", code: TranscriptDiagnosticCode.ReadRefused });
       throw cause;
@@ -569,9 +592,12 @@ function createBranchReader(route: TranscriptRoute, deps: SessionTranscriptSourc
       recordBytes += lineBytes;
       if (end >= 0) {
         const header = decodeRecord(concatParts(parts, recordBytes), decodeTranscriptSessionHeader);
-        return header !== undefined && header.sessionId === route.childSessionId
-          ? { inspectedBytes: position }
-          : { kind: "failed", code: TranscriptDiagnosticCode.ReadRefused };
+        if (header === undefined || header.sessionId !== route.childSessionId) {
+          return { kind: "failed", code: TranscriptDiagnosticCode.ReadRefused };
+        }
+        const admittedCwd = header.cwd === undefined ? undefined : tryPresentationCwd(header.cwd);
+        headerCwd = admittedCwd === undefined ? undefined : admittedCwd as AbsolutePath;
+        return { inspectedBytes: position }; 
       }
     }
     // An empty or headerless file names no session and cannot be attributed to this route.
@@ -646,6 +672,7 @@ function boundRetainedMessage(message: Exclude<TranscriptSessionMessageRecord, {
       callId: message.callId,
       tool: trySafeToolDisplayName(message.tool) ?? "",
       content: [{ kind: "text", text: safeTranscriptText(joinText(message.content)) }],
+      ...(message.details === undefined ? {} : { details: message.details }),
       error: message.error,
     };
   }
@@ -657,7 +684,8 @@ function boundRetainedMessage(message: Exclude<TranscriptSessionMessageRecord, {
     }
     if (block.kind !== "tool-call") continue;
     const tool = trySafeToolDisplayName(block.tool);
-    if (tool !== undefined) content.push({ kind: "tool-call", callId: block.callId, tool });
+    if (tool !== undefined) content.push({ kind: "tool-call", callId: block.callId, tool,
+      ...(block.arguments === undefined ? {} : { arguments: block.arguments }) });
   }
   return { role: "assistant", content };
 }
@@ -682,6 +710,7 @@ function sameFile(current: TranscriptFileIdentity | undefined, next: TranscriptF
 interface BranchProjection {
   readonly items: readonly TranscriptItem[];
   readonly truncatedBefore: boolean;
+  readonly entryIds: ReadonlySet<string>;
 }
 
 /**
@@ -716,15 +745,16 @@ function projectBranch(
   branch.reverse();
 
   const items: TranscriptItem[] = [];
-  const toolPositions = new Map<string, number>();
+  const toolBlocks = new Map<string, { readonly item: number; readonly block: number }>();
   let nextSequence = 0;
+  let nextGroup = 0;
   const appendItem = (item: TranscriptItem): number => {
     if (items.length >= MAX_TRANSCRIPT_SOURCE_ITEMS) {
       items.shift();
       truncatedBefore = true;
-      for (const [callId, position] of toolPositions) {
-        if (position === 0) toolPositions.delete(callId);
-        else toolPositions.set(callId, position - 1);
+      for (const [callId, position] of toolBlocks) {
+        if (position.item === 0) toolBlocks.delete(callId);
+        else toolBlocks.set(callId, { ...position, item: position.item - 1 });
       }
     }
     const position = items.length;
@@ -735,65 +765,55 @@ function projectBranch(
   let currentRun: SessionEntryId | undefined;
   for (const entry of branch) {
     if (entry.kind === "non-conversation") continue;
-    if (entry.kind === "compaction") {
-      appendItem({ sequence: transcriptSequence(0), kind: "notice", code: "context-compacted" });
-      continue;
-    }
+    if (entry.kind === "compaction") { appendItem({ sequence: transcriptSequence(0), kind: "notice", code: "context-compacted" }); continue; }
     const message = entry.message;
     if (message.role === "non-conversation") continue;
     if (message.role === "user") {
       currentRun = entry.id;
-      appendItem({
-        sequence: transcriptSequence(0),
-        runId: runId(entry.id),
-        kind: "user",
-        text: safeTranscriptText(joinText(message.content)),
-      });
+      appendItem({ sequence: transcriptSequence(0), runId: runId(entry.id), kind: "user", text: safeTranscriptText(joinText(message.content)) });
       continue;
     }
     if (message.role === "assistant") {
+      const blocks: TranscriptAssistantBlock[] = [];
       for (const block of message.content) {
         if (block.kind === "text" || block.kind === "thinking") {
-          appendItem({
-            sequence: transcriptSequence(0),
-            ...(currentRun === undefined ? {} : { runId: runId(currentRun) }),
-            kind: block.kind === "text" ? "assistant" : "thinking",
-            phase: "final",
-            text: safeTranscriptText(block.text),
-          });
+          blocks.push({ kind: block.kind, phase: "final", text: safeTranscriptText(block.text) });
           continue;
         }
         if (block.kind !== "tool-call") continue;
         const tool = trySafeToolDisplayName(block.tool);
         if (tool === undefined) continue;
-        const position = appendItem({
-          sequence: transcriptSequence(0),
-          ...(currentRun === undefined ? {} : { runId: runId(currentRun) }),
-          kind: "tool",
-          tool,
-          phase: "running",
-        });
-        toolPositions.set(block.callId, position);
+        const callId = tryToolCallId(block.callId);
+        blocks.push({ kind: "tool", presentation: { ...(callId === undefined ? {} : { callId }), tool, phase: "running",
+          ...(block.arguments === undefined ? {} : { arguments: block.arguments }) } });
       }
+      if (blocks.length === 0) continue;
+      const position = appendItem({ sequence: transcriptSequence(0), ...(currentRun === undefined ? {} : { runId: runId(currentRun) }),
+        kind: "assistant", group: transcriptAssistantGroup(nextGroup++), phase: "final", blocks: Object.freeze(blocks) });
+      blocks.forEach((block, index) => { if (block.kind === "tool" && block.presentation.callId !== undefined) toolBlocks.set(String(block.presentation.callId), { item: position, block: index }); });
       continue;
     }
-    const position = toolPositions.get(message.callId);
-    if (position === undefined) continue;
-    const call = items[position];
-    if (call === undefined || call.kind !== "tool") continue;
+    const located = toolBlocks.get(message.callId);
+    if (located === undefined) continue;
+    const owner = items[located.item];
+    if (owner === undefined || owner.kind !== "assistant") continue;
+    const target = owner.blocks[located.block];
+    if (target === undefined || target.kind !== "tool") continue;
+    const content = message.content.filter((block): block is { readonly kind: "text"; readonly text: string } => block.kind === "text")
+      .slice(0, MAX_TOOL_RESULT_BLOCKS).map((block) => safeTranscriptText(block.text));
     const preview = safeTranscriptText(joinText(message.content));
-    items[position] = {
-      ...call,
-      phase: message.error ? "failed" : "completed",
-      ...(preview.length === 0 ? {} : { preview }),
-    };
+    const blocks = owner.blocks.map((block, index) => index !== located.block ? block : Object.freeze({ kind: "tool" as const,
+      presentation: Object.freeze({ ...target.presentation, phase: message.error ? "failed" as const : "completed" as const,
+        result: Object.freeze({ content: Object.freeze(content), ...(message.details === undefined ? {} : { details: message.details }), isError: message.error }),
+        ...(preview.length === 0 ? {} : { preview }) }) }));
+    items[located.item] = Object.freeze({ ...owner, blocks: Object.freeze(blocks) });
   }
 
-  return evictToBounds(items, truncatedBefore);
+  return evictToBounds(items, truncatedBefore, new Set(branch.map((entry) => String(entry.id))));
 }
 
 /** Drops complete oldest items until the retained item and byte bounds hold. */
-function evictToBounds(items: readonly TranscriptItem[], truncatedBefore: boolean): BranchProjection {
+function evictToBounds(items: readonly TranscriptItem[], truncatedBefore: boolean, entryIds: ReadonlySet<string>): BranchProjection {
   let first = Math.max(0, items.length - MAX_TRANSCRIPT_SOURCE_ITEMS);
   let bytes = 0;
   for (let index = items.length - 1; index >= first; index -= 1) {
@@ -805,6 +825,7 @@ function evictToBounds(items: readonly TranscriptItem[], truncatedBefore: boolea
   return {
     items: Object.freeze(historyOmitted ? stripLeadingCorrelation(retained) : retained),
     truncatedBefore: historyOmitted,
+    entryIds,
   };
 }
 
@@ -818,21 +839,13 @@ function stripLeadingCorrelation(items: readonly TranscriptItem[]): TranscriptIt
       result.push(item);
       continue;
     }
-    if (item.kind === "tool") {
-      result.push(Object.freeze({
-        sequence: item.sequence,
-        kind: "tool",
-        tool: item.tool,
-        phase: item.phase,
-        ...(item.preview === undefined ? {} : { preview: item.preview }),
-      }));
-      continue;
-    }
     result.push(Object.freeze({
       sequence: item.sequence,
-      kind: item.kind,
+      kind: "assistant",
+      group: item.group,
       phase: item.phase,
-      text: item.text,
+      ...(item.stopReason === undefined ? {} : { stopReason: item.stopReason }),
+      blocks: item.blocks,
     }));
   }
   return result;
@@ -896,8 +909,23 @@ function frozenSnapshot(
   items: readonly TranscriptItem[],
   truncatedBefore: boolean,
   availability: TranscriptSnapshot["availability"],
+  sensitiveValues: TranscriptSensitiveValues,
+  renderingCwd: AbsolutePath | undefined,
 ): TranscriptSnapshot {
-  return Object.freeze({ revision: transcriptRevision(value), items, truncatedBefore, availability });
+  return Object.freeze({ revision: transcriptRevision(value), items, truncatedBefore, availability, sensitiveValues,
+    ...(renderingCwd === undefined ? {} : { renderingCwd }) });
+}
+
+function sourceSensitiveValues(route: TranscriptRoute, deps: SessionTranscriptSourceDependencies, entryIds: ReadonlySet<string>): TranscriptSensitiveValues {
+  return Object.freeze({
+    nativeIds: Object.freeze(new Set<string>([String(route.ownerSessionId), String(route.childSessionId), ...entryIds])) as ReadonlySet<string>,
+    managedPathsAndNames: Object.freeze(new Set<string>([String(route.fileName), String(deps.agentDir)])) as ReadonlySet<string>,
+  });
+}
+
+/** Retains native correlation privately; an unusable ID leaves the block uncorrelated. */
+function tryToolCallId(value: string): RpcToolCallId | undefined {
+  try { return rpcToolCallId(value); } catch { return undefined; }
 }
 
 function changed(
@@ -905,10 +933,19 @@ function changed(
   items: readonly TranscriptItem[],
   truncatedBefore: boolean,
   availability: TranscriptSnapshot["availability"],
+  sensitiveValues: TranscriptSensitiveValues,
+  renderingCwd: AbsolutePath | undefined,
 ): boolean {
   return current.availability !== availability
     || current.truncatedBefore !== truncatedBefore
+    || current.renderingCwd !== renderingCwd
+    || !sameStringSet(current.sensitiveValues.nativeIds, sensitiveValues.nativeIds)
+    || !sameStringSet(current.sensitiveValues.managedPathsAndNames, sensitiveValues.managedPathsAndNames)
     || !sameItems(current.items, items);
+}
+
+function sameStringSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
 }
 
 /**
@@ -921,16 +958,10 @@ function sameItems(current: readonly TranscriptItem[], next: readonly Transcript
     const other = next[index];
     if (other === undefined || item.kind !== other.kind) return false;
     if (item.kind === "notice") return other.kind === "notice" && item.code === other.code;
-    if (item.kind === "tool") {
-      return other.kind === "tool"
-        && item.tool === other.tool
-        && item.phase === other.phase
-        && item.preview === other.preview
-        && item.runId === other.runId;
-    }
-    return (other.kind === "user" || other.kind === "assistant" || other.kind === "thinking")
-      && item.text === other.text
-      && item.runId === other.runId;
+    if (item.kind === "user") return other.kind === "user" && item.text === other.text && item.runId === other.runId;
+    return other.kind === "assistant" && item.runId === other.runId && item.group === other.group
+      && item.phase === other.phase && item.stopReason === other.stopReason
+      && JSON.stringify(item.blocks) === JSON.stringify(other.blocks);
   });
 }
 

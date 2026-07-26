@@ -16,6 +16,7 @@ import {
   conversationRevision,
   runId,
   selectedTranscriptRevision,
+  transcriptAssistantGroup,
   transcriptRevision,
   transcriptSequence,
   type ContextLabel,
@@ -28,13 +29,17 @@ import {
 function selectedSnapshot(): SelectedTranscriptSnapshot {
   const nativeRun = runId("deadbeef");
   const items: readonly TranscriptItem[] = [
-    { sequence: transcriptSequence(901), kind: "assistant", phase: "final", text: "authoritative answer" as TranscriptText },
-    { sequence: transcriptSequence(902), kind: "thinking", phase: "partial", text: "authoritative thought" as TranscriptText },
-    { sequence: transcriptSequence(903), kind: "tool", tool: "read" as ToolDisplayName, phase: "completed", preview: "safe preview" as TranscriptText },
+    { sequence: transcriptSequence(901), kind: "assistant", group: transcriptAssistantGroup(0), phase: "final", blocks: [
+      { kind: "text", phase: "final", text: "authoritative answer" as TranscriptText },
+      { kind: "thinking", phase: "partial", text: "authoritative thought" as TranscriptText },
+      { kind: "tool", presentation: { tool: "read" as ToolDisplayName, phase: "completed", preview: "safe preview" as TranscriptText } },
+    ] },
     { sequence: transcriptSequence(904), runId: nativeRun, kind: "user", text: "question" as TranscriptText },
-    { sequence: transcriptSequence(905), runId: nativeRun, kind: "assistant", phase: "partial", text: "streaming answer" as TranscriptText },
-    { sequence: transcriptSequence(906), runId: nativeRun, kind: "thinking", phase: "final", text: "finished thought" as TranscriptText },
-    { sequence: transcriptSequence(907), runId: nativeRun, kind: "tool", tool: "bash" as ToolDisplayName, phase: "running" },
+    { sequence: transcriptSequence(905), runId: nativeRun, kind: "assistant", group: transcriptAssistantGroup(1), phase: "partial", blocks: [
+      { kind: "text", phase: "partial", text: "streaming answer" as TranscriptText },
+      { kind: "thinking", phase: "final", text: "finished thought" as TranscriptText },
+      { kind: "tool", presentation: { tool: "bash" as ToolDisplayName, phase: "running" } },
+    ] },
     { sequence: transcriptSequence(908), kind: "notice", code: "context-compacted" },
     { sequence: transcriptSequence(909), kind: "notice", code: "transport-unavailable" },
     { sequence: transcriptSequence(910), kind: "notice", code: "projection-unavailable" },
@@ -54,6 +59,7 @@ function selectedSnapshot(): SelectedTranscriptSnapshot {
       items,
       truncatedBefore: true,
       availability: "unavailable" as const,
+      sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() },
     }, { fileName: "child.jsonl", toolCallId: "tool-call-id" }),
     row,
     routeAvailable: false,

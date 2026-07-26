@@ -355,6 +355,51 @@ describe("classifyInboundRecord", () => {
     expect(classifyInboundRecord(42).ok).toBe(false);
   });
 
+  test("admits bounded tool arguments and text-only result details", () => {
+    expect(classifyInboundRecord({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "read",
+      args: { file: "/home/child/a.ts" },
+    })).toMatchObject({ ok: true, record: { kind: "tool", phase: "running", arguments: { file: "/home/child/a.ts" } } });
+
+    expect(classifyInboundRecord({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "read",
+      isError: true,
+      result: {
+        content: [
+          { type: "image", data: "AAAA", mimeType: "image/png" },
+          { type: "text", text: "line one" },
+        ],
+        details: { lines: 1 },
+      },
+    })).toMatchObject({ ok: true, record: { kind: "tool", phase: "failed", result: {
+      content: ["line one"], details: { lines: 1 }, isError: true,
+    } } });
+  });
+
+  test("keeps tool observations while omitting unusable rich values", () => {
+    const oversized = { blob: "x".repeat(4_097) };
+    const start = classifyInboundRecord({
+      type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: oversized,
+    });
+    expect(start).toMatchObject({ ok: true, record: { kind: "tool", phase: "running" } });
+    if (!start.ok || start.record.kind !== "tool") throw new Error("expected tool start");
+    expect(start.record).not.toHaveProperty("arguments");
+
+    const end = classifyInboundRecord({
+      type: "tool_execution_end", toolCallId: "call-1", toolName: "read", isError: false,
+      result: { content: [{ type: "image", data: "AAAA" }], details: oversized },
+    });
+    expect(end).toMatchObject({ ok: true, record: { kind: "tool", phase: "completed", result: {
+      content: [], isError: false,
+    } } });
+    if (!end.ok || end.record.kind !== "tool") throw new Error("expected tool end");
+    expect(end.record.result).not.toHaveProperty("details");
+  });
+
   test.each([
     [{ type: "message_update", message: assistantMessage(), assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "plan" } }, "assistant-content"],
     [{ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} }, "tool"],

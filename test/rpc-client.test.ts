@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { PassThrough } from "node:stream";
 
 import { AgentErrorCode, agentId, createRunAttemptId, directAgentOrdinal, modelSpec, runId as brandRunId, sessionEntryId, terminalFailureCause, type RunAttemptId } from "../src/domain.ts";
-import type { RpcObservationSink } from "../src/agent-observation.ts";
+import type { RpcObservationEvent, RpcObservationSink } from "../src/agent-observation.ts";
 import { sessionPath as containedSessionPath } from "../src/paths.ts";
 import { AgentObservationStore, createTotalRpcObservationAdapter } from "../src/agent-observation-store.ts";
 import { createContextObservationService, type ContextObservationService } from "../src/context-observation.ts";
@@ -203,6 +203,32 @@ describe("RpcRunClient", () => {
     expect(projected).toEqual(expect.arrayContaining(["thinking", "text", "tool", "agent-settled"]));
     expect(store.observation(AGENT)).toMatchObject({ activity: { kind: "idle" }, context: { kind: "known", percent: 37 } });
     expect(JSON.stringify(store.observation(AGENT)?.activity)).not.toContain("not-copied");
+    await client.shutdown();
+  });
+
+  test("projects bounded tool arguments and text-only result metadata", async () => {
+    const attempt = createRunAttemptId();
+    const tools: Extract<RpcObservationEvent, { kind: "tool" }>[] = [];
+    const sink: RpcObservationSink = {
+      record: (event) => { if (event.kind === "tool") tools.push(event) },
+      bind: () => {},
+      discard: () => {},
+    };
+    const session = containedSessionPath(workDir, join(workDir, "session.jsonl"));
+    const { client } = makeClient("activity-context", workDir, {}, process.execPath, {
+      FAKE_RPC_AGENT_ID: AGENT,
+      FAKE_RPC_SESSION_PATH: String(session),
+    }, undefined, AGENT, sink, attempt);
+    await client.start();
+    await client.prompt("Observe rich tools");
+    await client.waitSettled();
+
+    expect(tools).toEqual([
+      expect.objectContaining({ phase: "running", arguments: { path: "/not-copied" } }),
+      expect.objectContaining({ phase: "completed", result: {
+        content: ["not-copied"], details: {}, isError: false,
+      } }),
+    ]);
     await client.shutdown();
   });
 

@@ -4,6 +4,7 @@ import type {
   ManagedTranscriptSource,
   TranscriptItem,
   TranscriptListener,
+  TranscriptSensitiveValues,
   TranscriptSnapshot,
   TranscriptSource,
 } from "./agent-observation.ts";
@@ -141,7 +142,7 @@ function buildSnapshot(
     observed !== undefined && observed.availability !== "unavailable",
   );
   const bounded = bound(selected, durable.truncatedBefore || observed?.truncatedBefore === true);
-  return freezeSnapshot(revision, bounded.items, bounded.truncatedBefore, availability(durable, observed));
+  return freezeSnapshot(revision, bounded.items, bounded.truncatedBefore, availability(durable, observed), unionSensitive(durable, observed), observed?.renderingCwd ?? durable.renderingCwd);
 }
 
 function mergeDurable(
@@ -293,19 +294,31 @@ function freezeSnapshot(
   items: readonly TranscriptItem[],
   truncatedBefore: boolean,
   availability: TranscriptSnapshot["availability"],
+  sensitiveValues: TranscriptSensitiveValues,
+  renderingCwd: TranscriptSnapshot["renderingCwd"],
 ): TranscriptSnapshot {
+  return Object.freeze({ revision, items: Object.freeze(items.map((item, index) => Object.freeze({ ...item, sequence: transcriptSequence(index) }) as TranscriptItem)),
+    truncatedBefore, availability, sensitiveValues, ...(renderingCwd === undefined ? {} : { renderingCwd }) });
+}
+
+function unionSensitive(durable: TranscriptSnapshot, observed: TranscriptSnapshot | undefined): TranscriptSensitiveValues {
   return Object.freeze({
-    revision,
-    items: Object.freeze(items.map((item, index) => Object.freeze({ ...item, sequence: transcriptSequence(index) }) as TranscriptItem)),
-    truncatedBefore,
-    availability,
+    nativeIds: Object.freeze(new Set<string>([...durable.sensitiveValues.nativeIds, ...(observed?.sensitiveValues.nativeIds ?? [])])) as ReadonlySet<string>,
+    managedPathsAndNames: Object.freeze(new Set<string>([...durable.sensitiveValues.managedPathsAndNames, ...(observed?.sensitiveValues.managedPathsAndNames ?? [])])) as ReadonlySet<string>,
   });
 }
 
 function sameSnapshot(left: TranscriptSnapshot, right: TranscriptSnapshot): boolean {
   return left.availability === right.availability
     && left.truncatedBefore === right.truncatedBefore
+    && left.renderingCwd === right.renderingCwd
+    && sameSet(left.sensitiveValues.nativeIds, right.sensitiveValues.nativeIds)
+    && sameSet(left.sensitiveValues.managedPathsAndNames, right.sensitiveValues.managedPathsAndNames)
     && sameItems(left.items, right.items);
+}
+
+function sameSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
 }
 
 function sameItems(left: readonly TranscriptItem[], right: readonly TranscriptItem[]): boolean {

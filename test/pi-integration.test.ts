@@ -53,6 +53,7 @@ import {
   milliseconds,
   modelSpec,
   runCapacity,
+  transcriptAssistantGroup,
   transcriptFileName,
   type AgentId,
   type RunId,
@@ -359,8 +360,10 @@ describe("installed Pi integration prerequisites", () => {
       expect(observedPayloads.join("\n")).not.toContain("not-copied");
       const firstTranscript = controller.observationPort().transcriptSource(childId)!.snapshot();
       expect(controller.observationPort().directSnapshot()).toMatchObject({ health: { kind: "healthy" } });
-      expect(firstTranscript.items.map((item) => item.kind)).toEqual(["user", "thinking", "assistant", "tool", "assistant"]);
-      expect(JSON.stringify(firstTranscript.items)).not.toContain("not-copied");
+      expect(firstTranscript.items.map((item) => item.kind)).toEqual(["user", "assistant"]);
+      expect((firstTranscript.items[1] as Extract<TranscriptItem, { kind: "assistant" }>).blocks.map((block) => block.kind))
+        .toEqual(["thinking", "text", "tool", "text"]);
+      expect(JSON.stringify(firstTranscript.items)).toContain("not-copied");
 
     } finally {
       try { await controller.shutdown(); } catch { /* fake containment has no kernel cgroup authority */ }
@@ -382,10 +385,14 @@ describe("installed Pi integration prerequisites", () => {
       expect(transcript.availability).toBe("live");
       expect(transcript.items).toEqual([
         expect.objectContaining({ kind: "user", text: "long observation" }),
-        expect.objectContaining({ kind: "assistant", phase: "partial", text: "🙂".repeat(2_048) }),
-        expect.objectContaining({ kind: "tool", phase: "running", tool: "读".repeat(80) }),
+        expect.objectContaining({ kind: "assistant", phase: "partial", blocks: [
+          expect.objectContaining({ kind: "text", phase: "partial", text: "🙂".repeat(2_048) }),
+          expect.objectContaining({ kind: "tool", presentation: expect.objectContaining({ phase: "running", tool: "读".repeat(80) }) }),
+        ] }),
       ]);
-      expect(Buffer.byteLength((transcript.items[1] as { text: string }).text, "utf8")).toBe(8_192);
+      const assistant = transcript.items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+      const text = assistant.blocks[0];
+      expect(Buffer.byteLength(text?.kind === "text" ? text.text : "", "utf8")).toBe(8_192);
       expect(harness.controller.observationPort().observation(started.agentId)?.activity).toMatchObject({
         kind: "tool", tool: "读".repeat(80), phase: "running",
       });
@@ -418,16 +425,18 @@ describe("installed Pi integration prerequisites", () => {
 
       const live = harness.controller.observationPort().transcriptSource(first.agentId)!.snapshot().items;
       expect(live.filter((item) => item.kind === "assistant")).toHaveLength(2);
-      expect(live.filter((item) => item.kind === "tool")).toEqual([
-        expect.objectContaining({ runId: first.runId, tool: "read" }),
-        expect.objectContaining({ runId: second.runId, tool: "read" }),
+      expect(live.filter((item) => item.kind === "assistant" && item.blocks.some((block) => block.kind === "tool"))).toEqual([
+        expect.objectContaining({ runId: first.runId }),
+        expect.objectContaining({ runId: second.runId }),
       ]);
       const merged = mergeAuthoritativeRun(live, {
         firstUserEntryId: second.runId,
         items: [authoritativeAssistant(second.runId, "authoritative second")],
       });
-      expect(merged).toContainEqual(expect.objectContaining({ runId: first.runId, kind: "assistant", text: "observed run one" }));
-      expect(merged).toContainEqual(expect.objectContaining({ runId: second.runId, kind: "assistant", text: "authoritative second" }));
+      expect(merged.some((item) => item.kind === "assistant" && item.runId === first.runId
+        && item.blocks.some((block) => block.kind === "text" && block.text === "observed run one"))).toBe(true);
+      expect(merged.some((item) => item.kind === "assistant" && item.runId === second.runId
+        && item.blocks.some((block) => block.kind === "text" && block.text === "authoritative second"))).toBe(true);
       expect(merged.filter((item) => "runId" in item && item.runId === second.runId && item.kind === "assistant")).toHaveLength(1);
     } finally { await harness.close(); }
   }, 20_000);
@@ -850,9 +859,12 @@ describe("deterministic network-free real-Pi matrix", () => {
       const started = await harness.controller.spawn({ task: "live before durable commit" });
       if (!("runId" in started)) throw new Error("missing production run identity");
       for (let index = 0; index < 200 && !harness.controller.observationPort().transcriptSource(started.agentId)?.snapshot().items
-        .some((item) => item.kind === "assistant" && item.phase === "partial"); index += 1) await Bun.sleep(5);
-      expect(harness.controller.observationPort().transcriptSource(started.agentId)?.snapshot().items)
-        .toContainEqual(expect.objectContaining({ kind: "assistant", phase: "partial", text: "🙂".repeat(2_048) }));
+        .some((item) => item.kind === "assistant" && item.phase === "partial"
+          && item.blocks.some((block) => block.kind === "text" && block.text === "🙂".repeat(2_048))); index += 1) await Bun.sleep(5);
+      expect(harness.controller.observationPort().transcriptSource(started.agentId)?.snapshot().items.some(
+        (item) => item.kind === "assistant" && item.phase === "partial"
+          && item.blocks.some((block) => block.kind === "text" && block.text === "🙂".repeat(2_048)),
+      )).toBe(true);
 
       const nestedSessions = join(harness.root, "pi-subagents", started.agentId, "sessions");
       mkdirSync(nestedSessions, { recursive: true });
@@ -901,7 +913,8 @@ describe("deterministic network-free real-Pi matrix", () => {
       if (direct === undefined) throw new Error("direct selected transcript was unavailable");
       await waitForSelectedTranscript(
         direct,
-        (item) => item.kind === "assistant" && item.phase === "partial" && item.text === "🙂".repeat(2_048),
+        (item) => item.kind === "assistant" && item.phase === "partial"
+          && item.blocks.some((block) => block.kind === "text" && block.text === "🙂".repeat(2_048)),
         "direct live assistant partial",
       );
 
@@ -1319,7 +1332,10 @@ function mergeAuthoritativeRun(
 }
 
 function authoritativeAssistant(run: RunId, text: string): TranscriptItem {
-  return Object.freeze({ sequence: 999 as TranscriptItem["sequence"], runId: run, kind: "assistant", phase: "final", text: text as never });
+  return Object.freeze({ sequence: 999 as TranscriptItem["sequence"], runId: run, kind: "assistant",
+    group: transcriptAssistantGroup(0), phase: "final", blocks: Object.freeze([
+      Object.freeze({ kind: "text" as const, phase: "final" as const, text: text as never }),
+    ]) });
 }
 
 function productionFakeRpcHarness(

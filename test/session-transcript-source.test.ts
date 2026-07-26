@@ -10,6 +10,8 @@ import {
   transcriptText,
   type AgentDisplayState,
   type AuthoritativeTranscriptSource,
+  type TranscriptAssistantBlock,
+  type TranscriptItem,
   type TranscriptListener,
 } from "../src/agent-observation.ts";
 import {
@@ -17,6 +19,7 @@ import {
   MAX_SESSION_RECOVERY_BYTES,
   MAX_TRANSCRIPT_SOURCE_BYTES,
   MAX_TRANSCRIPT_SOURCE_ITEMS,
+  MAX_TOOL_JSON_STRING_BYTES,
   TRANSCRIPT_FALLBACK_INTERVAL_MS,
   TRANSCRIPT_REFRESH_WINDOW_MS,
 } from "../src/constants.ts";
@@ -37,9 +40,11 @@ import {
   type TranscriptFileName,
   type TranscriptPathSegment,
   type TranscriptRoute,
+  type TranscriptText,
+  type ToolDisplayName,
   type Utf8Bytes,
 } from "../src/domain.ts";
-import { decodeTranscriptSessionEntry, decodeTranscriptSessionHeader } from "../src/schemas.ts";
+import { admitBoundedTranscriptJson, decodeTranscriptSessionEntry, decodeTranscriptSessionHeader } from "../src/schemas.ts";
 import {
   createSessionTranscriptSource,
   type TranscriptDirectoryHandle,
@@ -78,13 +83,13 @@ function runtimeThenableListener(onThen: () => void): TranscriptListener {
   return listener as TranscriptListener;
 }
 
-function header(id = CHILD, version = 2): string {
+function header(id = CHILD, version = 2, cwd: string | undefined = "/tmp"): string {
   return JSON.stringify({
     type: "session",
     ...(version === undefined ? {} : { version }),
     id,
     timestamp: "2026-01-01T00:00:00.000Z",
-    cwd: "/tmp",
+    ...(cwd === undefined ? {} : { cwd }),
   });
 }
 
@@ -100,8 +105,13 @@ function assistantMessage(content: readonly unknown[]): unknown {
   return { role: "assistant", content, model: "m", provider: "p", stopReason: "stop", timestamp: 1 };
 }
 
-function toolResultMessage(toolCallId: string, toolName: string, text: string, isError = false): unknown {
-  return { role: "toolResult", toolCallId, toolName, content: [{ type: "text", text }], isError, timestamp: 1 };
+function toolResultMessage(toolCallId: string, toolName: string, text: string, isError = false, details?: unknown): unknown {
+  return { role: "toolResult", toolCallId, toolName, content: [{ type: "text", text }],
+    ...(details === undefined ? {} : { details }), isError, timestamp: 1 };
+}
+
+function toolResultMessageWithContent(toolCallId: string, toolName: string, content: readonly unknown[], isError = false): unknown {
+  return { role: "toolResult", toolCallId, toolName, content, isError, timestamp: 1 };
 }
 
 function jsonl(...records: readonly string[]): string {
@@ -508,7 +518,7 @@ describe("decodeTranscriptSessionEntry", () => {
       { type: "image", data: "AAAA", mimeType: "image/png" },
     ])));
     expect(decodeTranscriptSessionEntry(value)).toMatchObject({
-      message: { role: "user", content: [{ kind: "text", text: "look" }, { kind: "ignored" }] },
+      message: { role: "user", content: [{ kind: "text", text: "look" }, { kind: "image" }] },
     });
   });
 
@@ -534,7 +544,7 @@ describe("decodeTranscriptSessionEntry", () => {
         content: [
           { kind: "thinking", text: "reason" },
           { kind: "text", text: "answer" },
-          { kind: "tool-call", callId: "call-1", tool: "read" },
+          { kind: "tool-call", callId: "call-1", tool: "read", arguments: admitBoundedTranscriptJson({})! },
         ],
       },
     });
@@ -633,15 +643,160 @@ describe("createSessionTranscriptSource", () => {
     expect(started.source.snapshot()).toMatchObject({
       items: [
         { runId: runId("11111111"), kind: "user", text: transcriptText("question") },
-        { runId: runId("11111111"), kind: "thinking", phase: "final", text: transcriptText("reason") },
-        { runId: runId("11111111"), kind: "assistant", phase: "final", text: transcriptText("answer") },
-        { runId: runId("11111111"), kind: "tool", phase: "completed", tool: toolDisplayName("read") },
+        { runId: runId("11111111"), kind: "assistant", phase: "final", blocks: [
+          { kind: "thinking", phase: "final", text: transcriptText("reason") },
+          { kind: "text", phase: "final", text: transcriptText("answer") },
+          { kind: "tool", presentation: { phase: "completed", tool: toolDisplayName("read") } },
+        ] },
       ],
       availability: "live",
       truncatedBefore: false,
     });
     expect(Number(started.source.snapshot().revision)).toBeGreaterThan(0);
     expect(started.filesystem.openHandles).toBe(0);
+    started.dispose();
+  });
+
+  test("groups one assistant entry into a single item preserving block order", async () => {
+    const started = startedOver(jsonl(
+      header(),
+      messageEntry("aaaaaaaa", null, userMessage("Read the file")),
+      messageEntry("bbbbbbbb", "aaaaaaaa", assistantMessage([
+        { type: "thinking", thinking: "consider" },
+        { type: "text", text: "Reading now" },
+        { type: "toolCall", id: "call-1", name: "read", arguments: { file: "/home/child/a.ts" } },
+      ])),
+      messageEntry("cccccccc", "bbbbbbbb", toolResultMessage("call-1", "read", "line one", false, { lines: 1 })),
+    ));
+    await started.filesystem.settleReads();
+
+    const items = started.source.snapshot().items;
+    expect(items.map((item) => item.kind)).toEqual(["user", "assistant"]);
+    const assistant = items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+    expect(assistant.blocks.map((block) => block.kind)).toEqual(["thinking", "text", "tool"]);
+    const tool = assistant.blocks[2] as Extract<TranscriptAssistantBlock, { kind: "tool" }>;
+    expect(tool.presentation.tool).toBe("read" as ToolDisplayName);
+    expect(tool.presentation.phase).toBe("completed");
+    expect(tool.presentation.arguments).toEqual(admitBoundedTranscriptJson({ file: "/home/child/a.ts" }));
+    expect(tool.presentation.result?.content).toEqual(["line one" as TranscriptText]);
+    expect(tool.presentation.result?.details).toEqual(admitBoundedTranscriptJson({ lines: 1 }));
+    expect(tool.presentation.result?.isError).toBe(false);
+    started.dispose();
+  });
+
+  test("a failed tool result marks the block failed and error-flagged", async () => {
+    const started = startedOver(jsonl(
+      header(),
+      messageEntry("aaaaaaaa", null, userMessage("Run it")),
+      messageEntry("bbbbbbbb", "aaaaaaaa", assistantMessage([
+        { type: "toolCall", id: "call-1", name: "bash", arguments: { command: "false" } },
+      ])),
+      messageEntry("cccccccc", "bbbbbbbb", toolResultMessage("call-1", "bash", "exit 1", true)),
+    ));
+    await started.filesystem.settleReads();
+    const assistant = started.source.snapshot().items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+    const tool = assistant.blocks[0] as Extract<TranscriptAssistantBlock, { kind: "tool" }>;
+    expect(tool.presentation.phase).toBe("failed");
+    expect(tool.presentation.result?.isError).toBe(true);
+    started.dispose();
+  });
+
+  test("oversized arguments are omitted while the tool block and result survive", async () => {
+    const started = startedOver(jsonl(
+      header(),
+      messageEntry("aaaaaaaa", null, userMessage("Run it")),
+      messageEntry("bbbbbbbb", "aaaaaaaa", assistantMessage([
+        { type: "toolCall", id: "call-1", name: "read", arguments: { blob: "x".repeat(MAX_TOOL_JSON_STRING_BYTES + 1) } },
+      ])),
+      messageEntry("cccccccc", "bbbbbbbb", toolResultMessage("call-1", "read", "ok")),
+    ));
+    await started.filesystem.settleReads();
+    const assistant = started.source.snapshot().items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+    const tool = assistant.blocks[0] as Extract<TranscriptAssistantBlock, { kind: "tool" }>;
+    expect(tool.presentation.arguments).toBeUndefined();
+    expect(tool.presentation.result?.content).toEqual(["ok" as TranscriptText]);
+    started.dispose();
+  });
+
+  test("image result blocks are rejected at admission", async () => {
+    const started = startedOver(jsonl(
+      header(),
+      messageEntry("aaaaaaaa", null, userMessage("Screenshot")),
+      messageEntry("bbbbbbbb", "aaaaaaaa", assistantMessage([
+        { type: "toolCall", id: "call-1", name: "read", arguments: { file: "/home/child/a.png" } },
+      ])),
+      messageEntry("cccccccc", "bbbbbbbb", toolResultMessageWithContent("call-1", "read", [
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+        { type: "text", text: "described" },
+      ])),
+    ));
+    await started.filesystem.settleReads();
+    const assistant = started.source.snapshot().items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+    const tool = assistant.blocks[0] as Extract<TranscriptAssistantBlock, { kind: "tool" }>;
+    expect(tool.presentation.result?.content).toEqual(["described" as TranscriptText]);
+    started.dispose();
+  });
+
+  test("the snapshot publishes this source's sensitive values and the header working directory", async () => {
+    const started = startedOver(jsonl(header(CHILD, 2, "/home/child/project"), messageEntry("aaaaaaaa", null, userMessage("Hello"))));
+    await started.filesystem.settleReads();
+    const snapshot = started.source.snapshot();
+    expect(snapshot.renderingCwd).toBe("/home/child/project" as AbsolutePath);
+    expect(snapshot.sensitiveValues.nativeIds.has("aaaaaaaa")).toBe(true);
+    expect([...snapshot.sensitiveValues.managedPathsAndNames].some((value) => value.endsWith(".jsonl"))).toBe(true);
+    started.dispose();
+  });
+
+  test("a header without a usable working directory publishes none", async () => {
+    const started = startedOver(jsonl(header(CHILD, 2, "relative/dir"), messageEntry("aaaaaaaa", null, userMessage("Hello"))));
+    await started.filesystem.settleReads();
+    expect(started.source.snapshot().renderingCwd).toBeUndefined();
+    started.dispose();
+  });
+
+  test("republishes when only the authoritative header working directory changes", async () => {
+    const started = startedOver(jsonl(
+      header(CHILD, 2, "/home/child/one"),
+      messageEntry("aaaaaaaa", null, userMessage("Hello")),
+    ));
+    await started.filesystem.settleReads();
+    const before = started.source.snapshot();
+    let notifications = 0;
+    started.source.subscribe(() => { notifications += 1 });
+
+    started.filesystem.replace(jsonl(
+      header(CHILD, 2, "/home/child/two"),
+      messageEntry("aaaaaaaa", null, userMessage("Hello")),
+    ));
+    await started.refresh();
+
+    const after = started.source.snapshot();
+    expect(Number(after.revision)).toBeGreaterThan(Number(before.revision));
+    expect(after.renderingCwd).toBe("/home/child/two" as AbsolutePath);
+    expect(notifications).toBe(1);
+    started.dispose();
+  });
+
+  test("republishes when only authoritative sensitive entry IDs change", async () => {
+    const started = startedOver(jsonl(
+      header(),
+      messageEntry("aaaaaaaa", null, userMessage("Hello")),
+    ));
+    await started.filesystem.settleReads();
+    const before = started.source.snapshot();
+    let notifications = 0;
+    started.source.subscribe(() => { notifications += 1 });
+
+    started.filesystem.append(jsonl(JSON.stringify({
+      type: "future_entry", id: "bbbbbbbb", parentId: "aaaaaaaa",
+    })));
+    await started.refresh();
+
+    const after = started.source.snapshot();
+    expect(after.items).toEqual(before.items);
+    expect(Number(after.revision)).toBeGreaterThan(Number(before.revision));
+    expect(after.sensitiveValues.nativeIds.has("bbbbbbbb")).toBe(true);
+    expect(notifications).toBe(1);
     started.dispose();
   });
 
@@ -660,10 +815,12 @@ describe("createSessionTranscriptSource", () => {
     const items = started.source.snapshot().items;
     expect(items).toHaveLength(2);
     expect(items[1]).toMatchObject({
-      kind: "tool",
-      phase: "failed",
-      tool: toolDisplayName("read"),
-      preview: transcriptText("boom"),
+      kind: "assistant",
+      blocks: [{ kind: "tool", presentation: {
+        phase: "failed",
+        tool: toolDisplayName("read"),
+        preview: transcriptText("boom"),
+      } }],
     });
     started.dispose();
   });
@@ -684,7 +841,7 @@ describe("createSessionTranscriptSource", () => {
 
     expect(started.source.snapshot().items).toMatchObject([
       { kind: "user", text: transcriptText("first") },
-      { kind: "assistant", text: transcriptText("second answer") },
+      { kind: "assistant", blocks: [{ kind: "text", text: transcriptText("second answer") }] },
     ]);
     started.dispose();
   });
@@ -741,7 +898,7 @@ describe("createSessionTranscriptSource", () => {
 
     expect(started.source.snapshot().items).toMatchObject([
       { kind: "user", text: transcriptText("before") },
-      { kind: "assistant", text: transcriptText("before answer") },
+      { kind: "assistant", blocks: [{ kind: "text", text: transcriptText("before answer") }] },
       { kind: "notice", code: "context-compacted" },
       { kind: "user", text: transcriptText("after") },
     ]);
@@ -787,7 +944,7 @@ describe("createSessionTranscriptSource", () => {
     started.dispose();
   });
 
-  test("caps projected items during construction without retaining correlation after the user is evicted", async () => {
+  test("one assistant entry remains one item at the maximum block count", async () => {
     const blocks = Array.from(
       { length: MAX_TRANSCRIPT_SOURCE_ITEMS },
       (_, index) => ({ type: "text", text: `answer-${index}` }),
@@ -799,9 +956,35 @@ describe("createSessionTranscriptSource", () => {
     ));
     await started.filesystem.settleReads();
 
-    expect(started.source.snapshot().items).toHaveLength(MAX_TRANSCRIPT_SOURCE_ITEMS);
-    expect(started.source.snapshot().truncatedBefore).toBe(true);
-    expect(started.source.snapshot().items.every((item) => !("runId" in item))).toBe(true);
+    const snapshot = started.source.snapshot();
+    expect(snapshot.items).toHaveLength(2);
+    expect((snapshot.items[1] as Extract<TranscriptItem, { kind: "assistant" }>).blocks).toHaveLength(MAX_TRANSCRIPT_SOURCE_ITEMS);
+    expect(snapshot.truncatedBefore).toBe(false);
+    started.dispose();
+  });
+
+  test("tool positions are rebased when older source items are evicted", async () => {
+    const records = [
+      header(),
+      messageEntry("11111111", null, userMessage("question")),
+      messageEntry("22222222", "11111111", assistantMessage([{ type: "toolCall", id: "call-1", name: "read", arguments: {} }])),
+    ];
+    let parent = "22222222";
+    for (let index = 0; index < MAX_TRANSCRIPT_SOURCE_ITEMS - 2; index += 1) {
+      const id = (index + 0x30000000).toString(16).padStart(8, "0");
+      records.push(messageEntry(id, parent, assistantMessage([{ type: "text", text: `answer-${index}` }])));
+      parent = id;
+    }
+    records.push(messageEntry("aaaaaaaa", parent, toolResultMessage("call-1", "read", "updated")));
+    const started = startedOver(jsonl(...records));
+    await started.filesystem.settleReads();
+
+    const snapshot = started.source.snapshot();
+    const first = snapshot.items[0] as Extract<TranscriptItem, { kind: "assistant" }>;
+    const tool = first.blocks[0] as Extract<TranscriptAssistantBlock, { kind: "tool" }>;
+    expect(snapshot.truncatedBefore).toBe(true);
+    expect(tool.presentation.phase).toBe("completed");
+    expect(tool.presentation.result?.content).toEqual([transcriptText("updated")]);
     started.dispose();
   });
 
@@ -823,7 +1006,7 @@ describe("createSessionTranscriptSource", () => {
 
     expect(started.source.snapshot()).toMatchObject({
       truncatedBefore: true,
-      items: [{ kind: "assistant", text: transcriptText("branch leaf") }],
+      items: [{ kind: "assistant", blocks: [{ kind: "text", text: transcriptText("branch leaf") }] }],
     });
     expect(started.source.snapshot().items[0]).not.toHaveProperty("runId");
     started.dispose();
@@ -878,8 +1061,13 @@ describe("createSessionTranscriptSource", () => {
     await started.filesystem.settleReads();
 
     const latest = started.source.snapshot().items.at(-1);
-    expect(latest?.kind).toBe(expectedKind);
-    const visible = latest?.kind === "tool" ? latest.preview : latest?.kind === "notice" ? undefined : latest?.text;
+    expect(latest?.kind).toBe(expectedKind === "user" ? "user" : "assistant");
+    const block = latest?.kind === "assistant" ? latest.blocks.at(-1) : undefined;
+    const visible = latest?.kind === "user"
+      ? latest.text
+      : block?.kind === "tool"
+        ? block.presentation.preview
+        : block?.text;
     expect(String(visible)).toBe(expectedVisible);
     expect(visible).not.toHaveLength(0);
     expect(encoder.encode(visible ?? "").byteLength).toBeLessThanOrEqual(8_192);
@@ -900,11 +1088,9 @@ describe("createSessionTranscriptSource", () => {
     await started.filesystem.settleReads();
 
     const snapshot = started.source.snapshot();
-    const latest = snapshot.items.at(-1);
-    expect(latest?.kind).toBe("assistant");
-    expect(latest?.kind === "assistant" ? String(latest.text) : undefined)
-      .toBe(`block-39-${"x".repeat(8_183)}`);
-    expect(snapshot.items).not.toHaveLength(0);
+    expect(snapshot.items).toHaveLength(1);
+    const assistant = snapshot.items[0] as Extract<TranscriptItem, { kind: "assistant" }>;
+    expect(assistant.blocks.at(-1)).toMatchObject({ kind: "text", text: transcriptText(`block-39-${"x".repeat(8_183)}`) });
     expect(snapshot.truncatedBefore).toBe(true);
     started.dispose();
   });
@@ -924,10 +1110,12 @@ describe("createSessionTranscriptSource", () => {
     await started.filesystem.settleReads();
 
     const snapshot = started.source.snapshot();
-    expect(snapshot.items.slice(-3)).toMatchObject([
-      { kind: "assistant", text: transcriptText(`text-23-${"x".repeat(8_184)}`) },
+    expect(snapshot.items).toHaveLength(1);
+    const assistant = snapshot.items[0] as Extract<TranscriptItem, { kind: "assistant" }>;
+    expect(assistant.blocks.slice(-3)).toMatchObject([
+      { kind: "text", text: transcriptText(`text-23-${"x".repeat(8_184)}`) },
       { kind: "thinking", text: transcriptText(`thinking-23-${"y".repeat(8_180)}`) },
-      { kind: "tool", tool: toolDisplayName("tool-23"), phase: "running" },
+      { kind: "tool", presentation: { tool: toolDisplayName("tool-23"), phase: "running" } },
     ]);
     expect(snapshot.truncatedBefore).toBe(true);
     started.dispose();
@@ -952,7 +1140,7 @@ describe("createSessionTranscriptSource", () => {
 
     expect(started.source.snapshot().items).toMatchObject([
       { kind: "user", text: transcriptText("question") },
-      { kind: "assistant", text: transcriptText("latest answer") },
+      { kind: "assistant", blocks: [{ kind: "text", text: transcriptText("latest answer") }] },
     ]);
     started.dispose();
   });
@@ -997,7 +1185,7 @@ describe("createSessionTranscriptSource", () => {
 
     expect(started.source.snapshot().items).toMatchObject([
       { kind: "user" },
-      { kind: "assistant", text: transcriptText("café") },
+      { kind: "assistant", blocks: [{ kind: "text", text: transcriptText("café") }] },
     ]);
     started.dispose();
   });
@@ -1029,7 +1217,7 @@ describe("createSessionTranscriptSource", () => {
     await started.refresh();
     expect(started.source.snapshot().items).toMatchObject([
       { kind: "user", text: transcriptText("question") },
-      { kind: "assistant", text: transcriptText("answer after retry") },
+      { kind: "assistant", blocks: [{ kind: "text", text: transcriptText("answer after retry") }] },
     ]);
     started.dispose();
   });
@@ -1111,7 +1299,7 @@ describe("createSessionTranscriptSource", () => {
       .toBeLessThanOrEqual(Number(MAX_SESSION_RECOVERY_BYTES));
     expect(started.source.snapshot().items).toMatchObject([
       { kind: "user", text: transcriptText("late question") },
-      { kind: "assistant", text: transcriptText("late answer") },
+      { kind: "assistant", blocks: [{ kind: "text", text: transcriptText("late answer") }] },
     ]);
     expect(started.source.snapshot().truncatedBefore).toBe(true);
     started.dispose();
@@ -1190,7 +1378,7 @@ describe("createSessionTranscriptSource", () => {
   test("rebuilds from a replacement and from a shrunken file", async () => {
     const started = startedOver(conversationText());
     await started.filesystem.settleReads();
-    expect(started.source.snapshot().items).toHaveLength(4);
+    expect(started.source.snapshot().items).toHaveLength(2);
 
     started.filesystem.replace(jsonl(header(), messageEntry("99999999", null, userMessage("replaced"))));
     await started.refresh();
@@ -1319,7 +1507,7 @@ describe("createSessionTranscriptSource", () => {
     unsubscribe();
     expect(started.watchFactory.live.closed).toBe(1);
     expect(started.clock.pending).toBe(0);
-    expect(started.source.snapshot().items).toHaveLength(4);
+    expect(started.source.snapshot().items).toHaveLength(2);
 
     started.filesystem.append(jsonl(messageEntry("44444444", "33333333", userMessage("resumed"))));
     started.source.subscribe(() => {});

@@ -58,8 +58,10 @@ import { testAbsolutePath, testSessionPath } from "./support/brands.ts";
 const AGENT_DIR = testAbsolutePath(mkdtempSync(join(tmpdir(), "agent-widget-source-")));
 const ROOT_SESSION = agentId("root-session");
 const waitForIndexRefresh = () => Bun.sleep(Number(INDEX_REFRESH_WINDOW_MS) + 40);
+const publicationRevisions = new Map<string, number>();
 
 afterEach(() => {
+  publicationRevisions.clear();
   rmSync(AGENT_DIR, { recursive: true, force: true });
   mkdirSync(AGENT_DIR, { recursive: true });
 });
@@ -83,10 +85,12 @@ function writePublished(owner: string, agents: readonly {
       ? {}
       : { transcriptFile: agent.transcriptFile as NonNullable<ObservationRow["transcriptFile"]> }),
   }));
+  const revision = (publicationRevisions.get(owner) ?? 0) + 1;
+  publicationRevisions.set(owner, revision);
   const encoded = encodeObservationSnapshot({
     sessionId,
     incarnation: incarnationId("source-test"),
-    revision: observationRevision(1),
+    revision: observationRevision(revision),
     total: agentCount(rows.length),
     omitted: agentCount(0),
     degraded: false,
@@ -277,7 +281,8 @@ describe("createAgentWidgetSource", () => {
     const directUnsubscribe = direct?.subscribe(() => {});
     await Bun.sleep(0);
     expect(calls).toEqual(["agent-a"]);
-    expect(direct?.snapshot().transcript.items).toContainEqual(expect.objectContaining({ kind: "assistant", text: "partial" }));
+    expect(direct?.snapshot().transcript.items).toContainEqual(expect.objectContaining({ kind: "assistant",
+      blocks: [expect.objectContaining({ kind: "text", text: "partial" })] }));
     expect(live.listeners.size).toBe(1);
     expect(adapters.activeWatches).toBe(1);
 

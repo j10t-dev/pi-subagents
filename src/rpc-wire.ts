@@ -25,9 +25,11 @@ import {
   literalUnion,
   ToolObservationEventSchema,
   TurnEndObservationSchema,
+  admitBoundedTranscriptJson,
 } from "./schemas.ts";
 import { rpcContentIndex, rpcRequestId, rpcStopReason, rpcToolCallId, truncateUtf8, utf8Bytes, type RpcRequestId } from "./domain.ts";
-import { toolDisplayName, transcriptText, type FinalAssistantBlock } from "./agent-observation.ts";
+import { toolDisplayName, transcriptText, type FinalAssistantBlock, type TranscriptToolResult } from "./agent-observation.ts";
+import { MAX_TOOL_RESULT_BLOCKS } from "./constants.ts";
 import type {
   WireAssistantMessage,
   WireExtensionUIDialog,
@@ -150,7 +152,7 @@ export type RpcInboundRecord =
   | { kind: "assistant-content"; contentIndex: ReturnType<typeof rpcContentIndex>; contentKind: "text" | "thinking"; phase: "end"; text: ReturnType<typeof transcriptText> }
   | { kind: "message_update_other" }
   | { kind: "assistant-end"; message: WireAssistantMessage; finalBlocks: readonly FinalAssistantBlock[]; usage: WireAssistantMessage["usage"]; stopReason: ReturnType<typeof rpcStopReason> }
-  | { kind: "tool"; toolCallId: ReturnType<typeof rpcToolCallId>; tool: ReturnType<typeof toolDisplayName>; phase: "running" | "completed" | "failed" }
+  | { kind: "tool"; toolCallId: ReturnType<typeof rpcToolCallId>; tool: ReturnType<typeof toolDisplayName>; phase: "running" | "completed" | "failed"; arguments?: NonNullable<ReturnType<typeof admitBoundedTranscriptJson>>; result?: TranscriptToolResult }
   | { kind: "turn-end" }
   | { kind: "compaction"; phase: "start" | "end" }
   | { kind: "agent-settled" }
@@ -289,8 +291,22 @@ export function classifyInboundRecord(value: unknown): RpcWireResult {
     case "tool_execution_end": {
       const event = decode(ToolObservationEventSchema, value);
       if (event === undefined) return { ok: false, reason: `malformed ${type} record` };
-      try { return { ok: true, record: { kind: "tool", toolCallId: rpcToolCallId(event.toolCallId), tool: toolDisplayName(event.toolName),
-        phase: event.type === "tool_execution_end" ? (event.isError ? "failed" : "completed") : "running" } }; }
+      try {
+        const argumentsValue = event.type === "tool_execution_start" && event.args !== undefined
+          ? admitBoundedTranscriptJson(event.args)
+          : undefined;
+        const result = event.type === "tool_execution_end"
+          ? projectToolResult(event.result, event.isError)
+          : undefined;
+        return { ok: true, record: {
+          kind: "tool",
+          toolCallId: rpcToolCallId(event.toolCallId),
+          tool: toolDisplayName(event.toolName),
+          phase: event.type === "tool_execution_end" ? (event.isError ? "failed" : "completed") : "running",
+          ...(argumentsValue === undefined ? {} : { arguments: argumentsValue }),
+          ...(result === undefined ? {} : { result }),
+        } };
+      }
       catch { return { ok: false, reason: `malformed ${type} observation fields` }; }
     }
     case "compaction_start":
@@ -313,6 +329,34 @@ export function classifyInboundRecord(value: unknown): RpcWireResult {
     }
     default:
       return { ok: true, record: { kind: "ignored" } };
+  }
+}
+
+function projectToolResult(value: unknown, isError: boolean): TranscriptToolResult | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  try {
+    const candidate = value as { readonly content?: unknown; readonly details?: unknown };
+    const content: ReturnType<typeof transcriptText>[] = [];
+    if (Array.isArray(candidate.content)) {
+      for (const block of candidate.content) {
+        if (content.length >= MAX_TOOL_RESULT_BLOCKS) break;
+        if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
+        const record = block as { readonly type?: unknown; readonly text?: unknown };
+        if (record.type === "text" && typeof record.text === "string") {
+          content.push(boundedObservationText(record.text));
+        }
+      }
+    }
+    const details = candidate.details === undefined
+      ? undefined
+      : admitBoundedTranscriptJson(candidate.details);
+    return Object.freeze({
+      content: Object.freeze(content),
+      ...(details === undefined ? {} : { details }),
+      isError,
+    });
+  } catch {
+    return undefined;
   }
 }
 

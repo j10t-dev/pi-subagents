@@ -149,7 +149,7 @@ function scripted(model: Model<Api>, context: Context): ReturnType<typeof create
   } else if (prompt.includes("CALL_SPAWN")) {
     emitTool(stream, model.id, "spawn_agent", { task: "CHILD_COMPLETE" });
   } else if (prompt.includes("CALL_AWAIT")) {
-    emitTool(stream, model.id, "await_agent", { timeoutMs: 10_000 });
+    emitTool(stream, model.id, "await_agent", { timeoutMs: 15_000 });
   } else if (prompt.includes("CHILD_CONFIRM")) {
     emitTool(stream, model.id, "mock_child_extension", { confirm: true });
   } else if (prompt.includes("REPORT_TOOLS")) {

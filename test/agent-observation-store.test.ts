@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { AgentObservationStore, createTotalRpcObservationAdapter } from "../src/agent-observation-store.ts";
-import type { ObservationReconciliationSnapshot, TranscriptItem } from "../src/agent-observation.ts";
+import type { ObservationReconciliationSnapshot, TranscriptAssistantBlock, TranscriptItem } from "../src/agent-observation.ts";
 import { createContextObservationService } from "../src/context-observation.ts";
 import { rpcContentIndex, rpcStopReason, rpcToolCallId } from "../src/domain.ts";
 import { toolDisplayName, transcriptText } from "../src/agent-observation.ts";
+import { admitBoundedTranscriptJson } from "../src/schemas.ts";
 import {
   AgentState,
   CompletionState,
@@ -479,8 +480,77 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "delta", delta: transcriptText("lo") });
     const after = store.transcriptSource(A)!.snapshot();
     expect(after.items.map(({ kind }) => kind)).toEqual(["user", "assistant"]);
-    expect(after.items[1]).toMatchObject({ sequence: assistantSequence, phase: "partial", text: "Hello", runId: R1 });
+    expect(after.items[1]).toMatchObject({ sequence: assistantSequence, phase: "partial", runId: R1,
+      blocks: [{ kind: "text", phase: "partial", text: "Hello" }] });
     expect(Number(after.revision)).toBeGreaterThan(Number(before.revision));
+  });
+
+  test("one assistant generation becomes one grouped item in source order", () => {
+    const { store, sink } = boundTranscriptStore();
+    sink.record({ kind: "prompt-accepted", text: transcriptText("Do it") });
+    sink.record({ kind: "assistant-start" });
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "end", text: transcriptText("planning") });
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(1), contentKind: "text", phase: "end", text: transcriptText("running read") });
+    sink.record({
+      kind: "tool",
+      toolCallId: rpcToolCallId("call-1"),
+      tool: toolDisplayName("read"),
+      phase: "running",
+      arguments: admitBoundedTranscriptJson({ file: "/home/child/a.ts" })!,
+    });
+    sink.record({ kind: "assistant-end", finalBlocks: [], usage: zeroUsage(), stopReason: rpcStopReason("toolUse") });
+
+    const items = store.transcriptSource(A)!.snapshot().items;
+    const assistant = items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+    expect(assistant.blocks.map((block) => block.kind)).toEqual(["thinking", "text", "tool"]);
+    expect(assistant.stopReason).toBe("toolUse");
+    expect(assistant.phase).toBe("final");
+  });
+
+  test("a tool result updates its block in place without reordering", () => {
+    const { store, sink } = boundTranscriptStore();
+    sink.record({ kind: "prompt-accepted", text: transcriptText("Do it") });
+    sink.record({ kind: "assistant-start" });
+    sink.record({ kind: "tool", toolCallId: rpcToolCallId("call-1"), tool: toolDisplayName("read"), phase: "running" });
+    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "end", text: transcriptText("after") });
+    sink.record({
+      kind: "tool",
+      toolCallId: rpcToolCallId("call-1"),
+      tool: toolDisplayName("read"),
+      phase: "completed",
+      preview: transcriptText("line one"),
+      result: { content: [transcriptText("line one")], isError: false },
+    });
+
+    const assistant = store.transcriptSource(A)!.snapshot().items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+    expect(assistant.blocks.map((block) => block.kind)).toEqual(["tool", "text"]);
+    const tool = assistant.blocks[0] as Extract<TranscriptAssistantBlock, { kind: "tool" }>;
+    expect(tool.presentation.phase).toBe("completed");
+    expect(tool.presentation.result?.content).toEqual([transcriptText("line one")]);
+  });
+
+  test("the live snapshot publishes known identity and the child working directory", () => {
+    const { store } = boundTranscriptStore();
+    const snapshot = store.transcriptSource(A)!.snapshot();
+    expect(snapshot.renderingCwd).toBe(testAbsolutePath("/tmp/pi-subagents-test"));
+    expect(snapshot.sensitiveValues.nativeIds.has(String(A))).toBe(true);
+    expect(snapshot.sensitiveValues.managedPathsAndNames.has("/tmp/pi-subagents-test")).toBe(false);
+  });
+
+  test("live sources republish when globally sensitive identities change", async () => {
+    const { store } = boundTranscriptStore();
+    const source = store.transcriptSource(A)!;
+    const before = source.snapshot();
+    let notifications = 0;
+    source.subscribe(() => { notifications += 1 });
+
+    register(store, agentId("agent-b"), 2);
+    await flush();
+
+    const after = source.snapshot();
+    expect(Number(after.revision)).toBeGreaterThan(Number(before.revision));
+    expect(after.sensitiveValues.nativeIds.has("agent-b")).toBe(true);
+    expect(notifications).toBe(1);
   });
 
   test("assistant delta saturation is a stable no-op and an end snapshot replaces accumulated chunks", () => {
@@ -493,11 +563,13 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "delta", delta: transcriptText("ignored") });
 
     expect(source.snapshot()).toBe(saturated);
-    expect(source.snapshot().items[0]).toMatchObject({ phase: "partial", text: "🙂".repeat(2_048) });
+    expect(source.snapshot().items[0]).toMatchObject({ phase: "partial",
+      blocks: [{ kind: "text", phase: "partial", text: "🙂".repeat(2_048) }] });
 
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "end", text: transcriptText("authoritative final") });
     expect(source.snapshot().items).toEqual([
-      expect.objectContaining({ sequence: saturated.items[0]!.sequence, phase: "final", text: "authoritative final" }),
+      expect.objectContaining({ sequence: saturated.items[0]!.sequence, phase: "partial",
+        blocks: [expect.objectContaining({ phase: "final", text: "authoritative final" })] }),
     ]);
   });
 
@@ -515,8 +587,10 @@ describe("AgentObservationStore", () => {
     const transcript = store.transcriptSource(A)!.snapshot();
     expect(transcript.availability).toBe("live");
     expect(transcript.items).toEqual([
-      expect.objectContaining({ kind: "assistant", text: "🙂".repeat(2_048) }),
-      expect.objectContaining({ kind: "tool", preview: "界".repeat(2_000) }),
+      expect.objectContaining({ kind: "assistant", blocks: [
+        expect.objectContaining({ kind: "text", text: "🙂".repeat(2_048) }),
+        expect.objectContaining({ kind: "tool", presentation: expect.objectContaining({ preview: "界".repeat(2_000) }) }),
+      ] }),
     ]);
     const activity = store.observation(A)!.activity;
     expect(activity).toMatchObject({ kind: "tool", preview: "界".repeat(160) });
@@ -530,7 +604,8 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", delta: transcriptText("lo") });
     sink.record({ kind: "assistant-end", finalBlocks: [], usage: zeroUsage(), stopReason: rpcStopReason("stop") });
     expect(store.transcriptSource(A)!.snapshot().items).toEqual([
-      expect.objectContaining({ kind: "thinking", phase: "final", text: "Hello" }),
+      expect.objectContaining({ kind: "assistant", phase: "final",
+        blocks: [expect.objectContaining({ kind: "thinking", phase: "final", text: "Hello" })] }),
     ]);
   });
 
@@ -541,7 +616,10 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "assistant-end", finalBlocks: [], usage: zeroUsage(), stopReason: rpcStopReason("stop") });
     sink.record({ kind: "assistant-start" });
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "delta", delta: transcriptText("second") });
-    const thinking = store.transcriptSource(A)!.snapshot().items.flatMap((item) => item.kind === "thinking" ? [{ text: item.text, sequence: item.sequence }] : []);
+    const thinking = store.transcriptSource(A)!.snapshot().items.flatMap((item) => item.kind === "assistant"
+      ? item.blocks.filter((block): block is Extract<TranscriptAssistantBlock, { kind: "thinking" }> => block.kind === "thinking")
+        .map((block) => ({ text: block.text, sequence: item.sequence }))
+      : []);
     expect(thinking.map((item) => String(item.text))).toEqual(["first", "second"]);
     expect(thinking[0]!.sequence).not.toBe(thinking[1]!.sequence);
   });
@@ -555,7 +633,8 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "end", text: transcriptText("block snapshot") });
     const blockEnd = source.snapshot();
     expect(blockEnd.items).toEqual([
-      expect.objectContaining({ sequence, kind: "assistant", phase: "final", text: "block snapshot" }),
+      expect.objectContaining({ sequence, kind: "assistant", phase: "partial",
+        blocks: [expect.objectContaining({ phase: "final", text: "block snapshot" })] }),
     ]);
     expect(store.testAdapter().correlationCount(A)).toBe(1);
 
@@ -567,7 +646,8 @@ describe("AgentObservationStore", () => {
       { contentIndex: rpcContentIndex(0), kind: "text", text: transcriptText("message final") },
     ], usage: zeroUsage(), stopReason: rpcStopReason("stop") });
     expect(source.snapshot().items).toEqual([
-      expect.objectContaining({ sequence, kind: "assistant", phase: "final", text: "message final" }),
+      expect.objectContaining({ sequence, kind: "assistant", phase: "final",
+        blocks: [expect.objectContaining({ phase: "final", text: "message final" })] }),
     ]);
     expect(store.testAdapter().correlationCount(A)).toBe(0);
   });
@@ -579,7 +659,7 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "thinking", phase: "end", text: transcriptText("thought block") });
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(1), contentKind: "text", phase: "delta", delta: transcriptText("answer draft") });
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(1), contentKind: "text", phase: "end", text: transcriptText("answer block") });
-    const sequences = store.transcriptSource(A)!.snapshot().items.map((item) => item.sequence);
+    const sequence = store.transcriptSource(A)!.snapshot().items[0]!.sequence;
 
     sink.record({ kind: "assistant-end", finalBlocks: [
       { contentIndex: rpcContentIndex(0), kind: "thinking", text: transcriptText("thought final") },
@@ -587,8 +667,10 @@ describe("AgentObservationStore", () => {
     ], usage: zeroUsage(), stopReason: rpcStopReason("stop") });
 
     expect(store.transcriptSource(A)!.snapshot().items).toEqual([
-      expect.objectContaining({ sequence: sequences[0], kind: "thinking", text: "thought final" }),
-      expect.objectContaining({ sequence: sequences[1], kind: "assistant", text: "answer final" }),
+      expect.objectContaining({ sequence, kind: "assistant", blocks: [
+        expect.objectContaining({ kind: "thinking", text: "thought final" }),
+        expect.objectContaining({ kind: "text", text: "answer final" }),
+      ] }),
     ]);
     expect(store.testAdapter().correlationCount(A)).toBe(0);
   });
@@ -602,8 +684,10 @@ describe("AgentObservationStore", () => {
       { contentIndex: rpcContentIndex(2), kind: "text", text: transcriptText("final answer") },
     ], usage: zeroUsage(), stopReason: rpcStopReason("stop") });
     expect(store.transcriptSource(A)!.snapshot().items).toEqual([
-      expect.objectContaining({ kind: "thinking", phase: "final", text: "final thought" }),
-      expect.objectContaining({ kind: "assistant", phase: "final", text: "final answer" }),
+      expect.objectContaining({ kind: "assistant", phase: "final", blocks: [
+        expect.objectContaining({ kind: "thinking", phase: "final", text: "final thought" }),
+        expect.objectContaining({ kind: "text", phase: "final", text: "final answer" }),
+      ] }),
     ]);
     expect(store.testAdapter().correlationCount(A)).toBe(0);
   });
@@ -614,7 +698,8 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "delta", delta: transcriptText("streamed") });
     sink.record({ kind: "assistant-end", finalBlocks: [], usage: zeroUsage(), stopReason: rpcStopReason("stop") });
     expect(store.transcriptSource(A)!.snapshot().items).toEqual([
-      expect.objectContaining({ kind: "assistant", phase: "final", text: "streamed" }),
+      expect.objectContaining({ kind: "assistant", phase: "final",
+        blocks: [expect.objectContaining({ kind: "text", phase: "final", text: "streamed" })] }),
     ]);
   });
 
@@ -626,7 +711,9 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "tool", toolCallId: id, tool: toolDisplayName("read"), phase: "running", preview: transcriptText("b") });
     sink.record({ kind: "tool", toolCallId: id, tool: toolDisplayName("read"), phase: "completed", preview: transcriptText("done") });
     expect(store.transcriptSource(A)!.snapshot().items).toEqual([
-      expect.objectContaining({ sequence, kind: "tool", phase: "completed", preview: "done" }),
+      expect.objectContaining({ sequence, kind: "assistant", blocks: [
+        expect.objectContaining({ kind: "tool", presentation: expect.objectContaining({ phase: "completed", preview: "done" }) }),
+      ] }),
     ]);
     expect(store.testAdapter().correlationCount(A)).toBe(0);
   });
@@ -674,24 +761,20 @@ describe("AgentObservationStore", () => {
     expect(store.testAdapter().transcriptItemCount()).toBe(3);
   });
 
-  test("open-only pressure fails owner closed, pins the run, then recovers next run", () => {
+  test("one open assistant group consumes one item regardless of its block count", () => {
     const store = new AgentObservationStore({ transcriptBudgets: { perSourceItems: 1, perSourceBytes: 256 * 1024, globalItems: 1, globalBytes: 1024 * 1024 } });
     register(store);
     const { sink } = bindTranscript(store, A, R1, runAttemptId("open"));
     sink.record({ kind: "assistant-start" });
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "delta", delta: transcriptText("open-one") });
-    const firstSequence = Number(store.transcriptSource(A)!.snapshot().items[0]!.sequence);
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(1), contentKind: "text", phase: "delta", delta: transcriptText("open-two") });
-    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ availability: "unavailable", items: [
-      expect.objectContaining({ kind: "notice", code: "projection-unavailable", sequence: firstSequence + 1 }),
+    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ availability: "live", truncatedBefore: false, items: [
+      expect.objectContaining({ kind: "assistant", blocks: [
+        expect.objectContaining({ text: "open-one" }),
+        expect.objectContaining({ text: "open-two" }),
+      ] }),
     ] });
-    expect(store.testAdapter().correlationCount(A)).toBe(0);
-    sink.record({ kind: "prompt-accepted", text: transcriptText("ignored") });
-    store.updateLifecycle({ agentId: A, runId: R1, state: AgentState.Stopped, transcriptPath: testSessionPath("/tmp/pi-subagents-test/agent-a.jsonl") });
-    expect(store.transcriptSource(A)!.snapshot().availability).toBe("unavailable");
-    const R2 = runId("cafebabe");
-    bindTranscript(store, A, R2, runAttemptId("recovery"));
-    expect(store.transcriptSource(A)!.snapshot().availability).toBe("live");
+    expect(store.testAdapter().correlationCount(A)).toBe(2);
   });
 
   test("repeated acceptance of a healthy current run preserves its complete projection identity", () => {
@@ -722,7 +805,7 @@ describe("AgentObservationStore", () => {
     const sink = bindTranscript(store, A, R1, attempt).sink;
     sink.record({ kind: "assistant-start" });
     sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(0), contentKind: "text", phase: "delta", delta: transcriptText("one") });
-    sink.record({ kind: "assistant-content", contentIndex: rpcContentIndex(1), contentKind: "text", phase: "delta", delta: transcriptText("two") });
+    store.failTranscriptProjection(A, R1);
     const source = store.transcriptSource(A)!;
     const failed = source.snapshot();
     const observation = store.observation(A);
@@ -783,6 +866,47 @@ describe("AgentObservationStore", () => {
 
     store.failTranscriptProjection(agentId("agent-b"), runId("cafebabe"));
     expect(store.testAdapter().transcriptItemCount()).toBeLessThanOrEqual(2);
+  });
+
+  test("serialised tool arguments count against grouped source retention", () => {
+    const store = new AgentObservationStore({ transcriptBudgets: { perSourceItems: 100, perSourceBytes: 16, globalItems: 100, globalBytes: 1_024 } });
+    register(store);
+    const sink = bindTranscript(store, A, R1, runAttemptId("argument-bytes")).sink;
+    sink.record({ kind: "tool", toolCallId: rpcToolCallId("call-1"), tool: toolDisplayName("read"), phase: "running",
+      arguments: admitBoundedTranscriptJson({ file: "/home/child/a.ts" })! });
+
+    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ availability: "unavailable", items: [
+      expect.objectContaining({ kind: "notice", code: "projection-unavailable" }),
+    ] });
+  });
+
+  test("serialised tool result details count against grouped source retention", () => {
+    const store = new AgentObservationStore({ transcriptBudgets: { perSourceItems: 100, perSourceBytes: 16, globalItems: 100, globalBytes: 1_024 } });
+    register(store);
+    const sink = bindTranscript(store, A, R1, runAttemptId("detail-bytes")).sink;
+    sink.record({ kind: "tool", toolCallId: rpcToolCallId("call-1"), tool: toolDisplayName("read"), phase: "completed",
+      result: { content: [], details: admitBoundedTranscriptJson({ file: "/home/child/a.ts" })!, isError: false } });
+
+    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ availability: "live", truncatedBefore: true, items: [] });
+  });
+
+  test("serialised rich tool data counts against global store retention", () => {
+    const store = new AgentObservationStore({ transcriptBudgets: { perSourceItems: 100, perSourceBytes: 1_024, globalItems: 100, globalBytes: 40 } });
+    const other = agentId("rich-global-b");
+    register(store);
+    register(store, other, 2);
+    const details = admitBoundedTranscriptJson({ blob: "12345678901234567890" })!;
+    bindTranscript(store, A, R1, runAttemptId("rich-global-a")).sink.record({
+      kind: "tool", toolCallId: rpcToolCallId("call-a"), tool: toolDisplayName("read"), phase: "completed",
+      result: { content: [], details, isError: false },
+    });
+    bindTranscript(store, other, runId("cafebabe"), runAttemptId("rich-global-b")).sink.record({
+      kind: "tool", toolCallId: rpcToolCallId("call-b"), tool: toolDisplayName("read"), phase: "completed",
+      result: { content: [], details, isError: false },
+    });
+
+    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ truncatedBefore: true, items: [] });
+    expect(store.transcriptSource(other)!.snapshot().items).toHaveLength(1);
   });
 
   test("per-source byte pressure evicts closed UTF-8 items to the exact independent cap", () => {
@@ -873,8 +997,8 @@ describe("AgentObservationStore", () => {
     const second = bindTranscript(store, A, R2, runAttemptId("run-two")).sink;
     appendGenerationAndTool(second, "second");
     const items = store.transcriptSource(A)!.snapshot().items;
-    expect(items.filter((item) => "runId" in item && item.runId === R1).map((item) => item.kind)).toEqual(["assistant", "tool"]);
-    expect(items.filter((item) => "runId" in item && item.runId === R2).map((item) => item.kind)).toEqual(["assistant", "tool"]);
+    expect(items.filter((item) => "runId" in item && item.runId === R1).map((item) => item.kind)).toEqual(["assistant", "assistant"]);
+    expect(items.filter((item) => "runId" in item && item.runId === R2).map((item) => item.kind)).toEqual(["assistant", "assistant"]);
   });
 
   test("transport notice occurs once per healthy-to-unavailable epoch", () => {
@@ -1026,10 +1150,14 @@ function appendClosed(store: AgentObservationStore, id: typeof A, run: typeof R1
 }
 
 function transcriptBytes(items: readonly TranscriptItem[]): number {
-  return items.reduce((total, item) => {
-    if (item.kind === "user" || item.kind === "assistant" || item.kind === "thinking") return total + Buffer.byteLength(item.text);
-    return total + (item.kind === "tool" && item.preview !== undefined ? Buffer.byteLength(item.preview) : 0);
-  }, 0);
+  return items.reduce((total, item) => total + (item.kind === "user"
+    ? Buffer.byteLength(item.text)
+    : item.kind === "assistant"
+      ? item.blocks.reduce((bytes, block) => bytes + (block.kind === "tool"
+        ? Buffer.byteLength(block.presentation.preview ?? "")
+          + (block.presentation.result?.content.reduce((sum, text) => sum + Buffer.byteLength(text), 0) ?? 0)
+        : Buffer.byteLength(block.text)), 0)
+      : 0), 0);
 }
 
 function appendGenerationAndTool(sink: ReturnType<AgentObservationStore["createAttemptSink"]>, text: string): void {

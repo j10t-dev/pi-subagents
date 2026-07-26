@@ -3,6 +3,7 @@ import {
   CompletionState,
   agentDepth,
   type AbsolutePath,
+  type BoundedTranscriptJson,
   type ActivityText,
   type AgentCount,
   type AgentDepth,
@@ -34,6 +35,8 @@ import {
   type TranscriptRoute,
   type TranscriptSequence,
   type TranscriptText,
+  type TranscriptAssistantGroup,
+  type ConversationStopReason,
 } from "./domain.ts";
 
 export type AgentDisplayState = AgentState | CompletionState;
@@ -122,12 +125,40 @@ export interface AgentRow {
 export interface AgentWidgetSnapshot { readonly revision: AgentWidgetRevision; readonly rows: readonly AgentRow[]; readonly total: AgentCount; readonly omitted: AgentCount; readonly degraded: boolean }
 export interface AgentWidgetSource { snapshot(): AgentWidgetSnapshot; transcriptSource(ordinal: AgentOrdinal): SelectedTranscriptSource | undefined; subscribe(onChange: () => void): () => void }
 
+export interface TranscriptSensitiveValues {
+  readonly nativeIds: ReadonlySet<string>;
+  readonly managedPathsAndNames: ReadonlySet<string>;
+}
+export interface TranscriptToolResult {
+  readonly content: readonly TranscriptText[];
+  readonly details?: BoundedTranscriptJson;
+  readonly isError: boolean;
+}
+export interface TranscriptToolPresentation {
+  readonly callId?: RpcToolCallId;
+  readonly tool: ToolDisplayName;
+  readonly phase: "running" | "completed" | "failed";
+  readonly arguments?: BoundedTranscriptJson;
+  readonly result?: TranscriptToolResult;
+  readonly preview?: TranscriptText;
+}
+export type TranscriptAssistantBlock =
+  | { readonly kind: "text"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
+  | { readonly kind: "thinking"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
+  | { readonly kind: "tool"; readonly presentation: TranscriptToolPresentation };
 export type TranscriptItem =
   | { readonly sequence: TranscriptSequence; readonly runId: RunId; readonly kind: "user"; readonly text: TranscriptText }
-  | { readonly sequence: TranscriptSequence; readonly runId?: RunId; readonly kind: "assistant" | "thinking"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
-  | { readonly sequence: TranscriptSequence; readonly runId?: RunId; readonly kind: "tool"; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
+  | { readonly sequence: TranscriptSequence; readonly runId?: RunId; readonly kind: "assistant"; readonly group: TranscriptAssistantGroup; readonly phase: "partial" | "final"; readonly stopReason?: ConversationStopReason; readonly blocks: readonly TranscriptAssistantBlock[] }
   | { readonly sequence: TranscriptSequence; readonly kind: "notice"; readonly code: "transport-unavailable" | "projection-unavailable" | "context-compacted" };
-export interface TranscriptSnapshot { readonly revision: TranscriptRevision; readonly items: readonly TranscriptItem[]; readonly truncatedBefore: boolean; readonly availability: "live" | "stopped" | "unavailable" }
+export interface TranscriptSnapshot {
+  readonly revision: TranscriptRevision;
+  readonly items: readonly TranscriptItem[];
+  readonly truncatedBefore: boolean;
+  readonly availability: "live" | "stopped" | "unavailable";
+  readonly sensitiveValues: TranscriptSensitiveValues;
+  /** Candidate child working directory; the projector alone validates and brands it. */
+  readonly renderingCwd?: AbsolutePath;
+}
 export type TranscriptListener = (snapshot: TranscriptSnapshot) => void;
 export interface TranscriptSource { snapshot(): TranscriptSnapshot; subscribe(listener: TranscriptListener): () => void }
 
@@ -200,7 +231,7 @@ export type RpcObservationEvent =
   | { readonly kind: "assistant-start" }
   | AssistantContentObservationEvent
   | { readonly kind: "assistant-end"; readonly finalBlocks: readonly FinalAssistantBlock[]; readonly usage: Usage; readonly stopReason: RpcStopReason }
-  | { readonly kind: "tool"; readonly toolCallId: RpcToolCallId; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
+  | { readonly kind: "tool"; readonly toolCallId: RpcToolCallId; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText; readonly arguments?: BoundedTranscriptJson; readonly result?: TranscriptToolResult }
   | { readonly kind: "turn-end" }
   | { readonly kind: "agent-settled" }
   | { readonly kind: "compaction"; readonly phase: "start" | "end" }

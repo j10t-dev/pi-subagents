@@ -4,8 +4,10 @@ import type {
   AgentDisplayState,
   AuthoritativeTranscriptSource,
   ManagedTranscriptSource,
+  TranscriptAssistantBlock,
   TranscriptItem,
   TranscriptListener,
+  TranscriptSensitiveValues,
   TranscriptSnapshot,
   TranscriptSource,
 } from "../src/agent-observation.ts";
@@ -14,8 +16,10 @@ import { createMergedTranscriptSource } from "../src/merged-transcript-source.ts
 import {
   AgentState,
   runId,
+  transcriptAssistantGroup,
   transcriptRevision,
   transcriptSequence,
+  type AbsolutePath,
   type RunId,
 } from "../src/domain.ts";
 
@@ -25,10 +29,22 @@ function user(run: RunId, text: string): TranscriptItem {
   return Object.freeze({ sequence: transcriptSequence(0), runId: run, kind: "user", text: transcriptText(text) });
 }
 function assistant(run: RunId | undefined, text: string): TranscriptItem {
-  return Object.freeze({ sequence: transcriptSequence(1), ...(run === undefined ? {} : { runId: run }), kind: "assistant", phase: "final", text: transcriptText(text) });
+  return assistantGroup(run, 1, 0, "final", [{ kind: "text", phase: "final", text: transcriptText(text) }]);
+}
+function assistantGroup(
+  run: RunId | undefined,
+  sequence: number,
+  group: number,
+  phase: "partial" | "final",
+  blocks: readonly TranscriptAssistantBlock[],
+): TranscriptItem {
+  return Object.freeze({ sequence: transcriptSequence(sequence), ...(run === undefined ? {} : { runId: run }),
+    kind: "assistant", group: transcriptAssistantGroup(group), phase, blocks: Object.freeze(blocks) });
 }
 function tool(run: RunId, sequence: number): TranscriptItem {
-  return Object.freeze({ sequence: transcriptSequence(sequence), runId: run, kind: "tool", tool: toolDisplayName("read"), phase: "completed" });
+  return assistantGroup(run, sequence, sequence, "final", [
+    { kind: "tool", presentation: { tool: toolDisplayName("read"), phase: "completed" } },
+  ]);
 }
 function notice(): TranscriptItem {
   return Object.freeze({ sequence: transcriptSequence(2), kind: "notice", code: "context-compacted" });
@@ -49,8 +65,13 @@ class MutableSource implements TranscriptSource {
   private revision = 0;
   private current: TranscriptSnapshot;
 
-  constructor(initial: readonly TranscriptItem[] = [], availability: TranscriptSnapshot["availability"] = "live") {
-    this.current = snapshot(this.revision, initial, false, availability);
+  constructor(
+    initial: readonly TranscriptItem[] = [],
+    availability: TranscriptSnapshot["availability"] = "live",
+    sensitiveValues: TranscriptSensitiveValues = emptySensitiveValues(),
+    renderingCwd?: AbsolutePath,
+  ) {
+    this.current = snapshot(this.revision, initial, false, availability, sensitiveValues, renderingCwd);
   }
 
   snapshot(): TranscriptSnapshot { return this.current }
@@ -58,9 +79,16 @@ class MutableSource implements TranscriptSource {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
   }
-  emit(next: readonly TranscriptItem[], options: Partial<Pick<TranscriptSnapshot, "availability" | "truncatedBefore">> = {}): void {
+  emit(next: readonly TranscriptItem[], options: Partial<Pick<TranscriptSnapshot, "availability" | "truncatedBefore" | "sensitiveValues" | "renderingCwd">> = {}): void {
     this.revision += 1;
-    this.current = snapshot(this.revision, next, options.truncatedBefore ?? this.current.truncatedBefore, options.availability ?? this.current.availability);
+    this.current = snapshot(
+      this.revision,
+      next,
+      options.truncatedBefore ?? this.current.truncatedBefore,
+      options.availability ?? this.current.availability,
+      options.sensitiveValues ?? this.current.sensitiveValues,
+      options.renderingCwd ?? this.current.renderingCwd,
+    );
     for (const listener of [...this.listeners]) listener(this.current);
   }
 }
@@ -74,8 +102,20 @@ class MutableAuthoritativeSource extends MutableSource implements AuthoritativeT
   dispose(): void { this.listeners.clear(); }
 }
 
-function snapshot(revision: number, next: readonly TranscriptItem[], truncatedBefore: boolean, availability: TranscriptSnapshot["availability"]): TranscriptSnapshot {
-  return Object.freeze({ revision: transcriptRevision(revision), items: Object.freeze([...next]), truncatedBefore, availability });
+function snapshot(
+  revision: number,
+  next: readonly TranscriptItem[],
+  truncatedBefore: boolean,
+  availability: TranscriptSnapshot["availability"],
+  sensitiveValues: TranscriptSensitiveValues = emptySensitiveValues(),
+  renderingCwd?: AbsolutePath,
+): TranscriptSnapshot {
+  return Object.freeze({ revision: transcriptRevision(revision), items: Object.freeze([...next]), truncatedBefore, availability,
+    sensitiveValues, ...(renderingCwd === undefined ? {} : { renderingCwd }) });
+}
+
+function emptySensitiveValues(): TranscriptSensitiveValues {
+  return Object.freeze({ nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() });
 }
 
 describe("createMergedTranscriptSource", () => {
@@ -178,10 +218,10 @@ describe("createMergedTranscriptSource", () => {
     expectTranscript(items(merged), [...runItems(firstRun, "authoritative"), ...runItems(currentRun, "live")]);
   });
 
-  test("does not deduplicate tool items by sequence or incidental identifiers", () => {
+  test("does not deduplicate tool groups by sequence or incidental identifiers", () => {
     const authoritative = new MutableAuthoritativeSource([user(firstRun, "prompt"), tool(firstRun, 7), tool(firstRun, 99), ...runItems(currentRun, "latest")]);
     const merged = createMergedTranscriptSource(authoritative);
-    expectTranscript(items(merged).filter((item) => item.kind === "tool"), [tool(firstRun, 7), tool(firstRun, 99)]);
+    expectTranscript(items(merged).filter((item) => item.kind === "assistant" && item.blocks[0]?.kind === "tool"), [tool(firstRun, 7), tool(firstRun, 99)]);
   });
 
   test("retains valid authoritative history when that source becomes unavailable beside live data", () => {
@@ -242,6 +282,66 @@ describe("createMergedTranscriptSource", () => {
     authoritative.proveEnd();
     live.emit([], { availability: "unavailable" });
     expectTranscript(items(merged), [...runItems(firstRun, "committed"), ...runItems(currentRun, "committed current")]);
+  });
+
+  test("an assistant group is replaced or retained whole, never split", () => {
+    const authoritative = new MutableAuthoritativeSource([
+      user(currentRun, "Ask"),
+      assistantGroup(currentRun, 1, 0, "partial", [{ kind: "text", phase: "partial", text: transcriptText("half") }]),
+    ]);
+    const live = new MutableSource([
+      user(currentRun, "Ask"),
+      assistantGroup(currentRun, 1, 0, "final", [
+        { kind: "text", phase: "final", text: transcriptText("half then whole") },
+        { kind: "tool", presentation: { tool: toolDisplayName("read"), phase: "completed" } },
+      ]),
+    ]);
+    const merged = createMergedTranscriptSource(authoritative, live);
+    const item = merged.snapshot().items[1] as Extract<TranscriptItem, { kind: "assistant" }>;
+    expect(item.blocks).toHaveLength(2);
+    expect(item.phase).toBe("final");
+  });
+
+  test("the merged snapshot unions both sources' sensitive values", () => {
+    const authoritative = new MutableAuthoritativeSource([], "live", {
+      nativeIds: new Set(["aaaaaaaa"]),
+      managedPathsAndNames: new Set(["child.jsonl"]),
+    });
+    const live = new MutableSource([], "live", {
+      nativeIds: new Set(["bbbbbbbb"]),
+      managedPathsAndNames: new Set(["/state/pi-subagents"]),
+    });
+    const values = createMergedTranscriptSource(authoritative, live).snapshot().sensitiveValues;
+    expect([...values.nativeIds].sort()).toEqual(["aaaaaaaa", "bbbbbbbb"]);
+    expect([...values.managedPathsAndNames].sort()).toEqual(["/state/pi-subagents", "child.jsonl"]);
+  });
+
+  test("the live working directory wins for a direct child and the authoritative one is the fallback", () => {
+    const authoritative = new MutableAuthoritativeSource([], "live", emptySensitiveValues(), "/authoritative/dir" as AbsolutePath);
+    const live = new MutableSource([], "live", emptySensitiveValues(), "/live/dir" as AbsolutePath);
+    expect(createMergedTranscriptSource(authoritative, live).snapshot().renderingCwd).toBe("/live/dir" as AbsolutePath);
+    expect(createMergedTranscriptSource(authoritative).snapshot().renderingCwd).toBe("/authoritative/dir" as AbsolutePath);
+  });
+
+  test("publishes a new merged revision for metadata-only source changes", () => {
+    const authoritative = new MutableAuthoritativeSource([], "live", {
+      nativeIds: new Set(["aaaaaaaa"]), managedPathsAndNames: new Set<string>(),
+    }, "/authoritative/one" as AbsolutePath);
+    const merged = createMergedTranscriptSource(authoritative);
+    const before = merged.snapshot();
+    let notifications = 0;
+    merged.subscribe(() => { notifications += 1 });
+
+    authoritative.emit([], {
+      sensitiveValues: { nativeIds: new Set(["aaaaaaaa", "bbbbbbbb"]), managedPathsAndNames: new Set<string>() },
+      renderingCwd: "/authoritative/two" as AbsolutePath,
+    });
+
+    const after = merged.snapshot();
+    expect(Number(after.revision)).toBeGreaterThan(Number(before.revision));
+    expect(after.renderingCwd).toBe("/authoritative/two" as AbsolutePath);
+    expect(after.sensitiveValues.nativeIds.has("bbbbbbbb")).toBe(true);
+    expect(notifications).toBe(1);
   });
 
   test("propagates truncation and bounds the merged snapshot", () => {

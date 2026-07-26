@@ -30,6 +30,7 @@ import {
   modelSpec,
   runId,
   selectedTranscriptRevision,
+  transcriptAssistantGroup,
   transcriptRevision,
   transcriptSequence,
 } from "../src/domain.ts";
@@ -78,22 +79,19 @@ function selected(row: AgentRow): SelectedTranscriptSnapshot {
     { sequence: transcriptSequence(0), runId: nativeRun, kind: "user", text: transcriptText("Gate question") },
   ];
   for (let index = 0; index < 35; index += 1) {
-    if (index === 20) {
-      items.push({
-        sequence: transcriptSequence(items.length), runId: nativeRun, kind: "thinking",
-        phase: "final", text: transcriptText("CHILD_GATE_THINKING"),
-      });
-      items.push({
-        sequence: transcriptSequence(items.length), runId: nativeRun, kind: "tool", tool: toolDisplayName("read"),
-        phase: "completed", preview: transcriptText("CHILD_GATE_TOOL_PREVIEW"),
-      });
-    }
     items.push({
       sequence: transcriptSequence(items.length),
       runId: nativeRun,
       kind: "assistant",
+      group: transcriptAssistantGroup(index),
       phase: "final",
-      text: transcriptText(`Gate transcript line ${String(index).padStart(2, "0")}`),
+      blocks: index === 20 ? [
+        { kind: "thinking", phase: "final", text: transcriptText("CHILD_GATE_THINKING") },
+        { kind: "tool", presentation: { tool: toolDisplayName("read"), phase: "completed", preview: transcriptText("CHILD_GATE_TOOL_PREVIEW") } },
+        { kind: "text", phase: "final", text: transcriptText(`Gate transcript line ${String(index).padStart(2, "0")}`) },
+      ] : [
+        { kind: "text", phase: "final", text: transcriptText(`Gate transcript line ${String(index).padStart(2, "0")}`) },
+      ],
     });
   }
   return Object.freeze({
@@ -103,6 +101,7 @@ function selected(row: AgentRow): SelectedTranscriptSnapshot {
       items: Object.freeze(items),
       truncatedBefore: false,
       availability: "live",
+      sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() },
     }),
     row,
     routeAvailable: true,

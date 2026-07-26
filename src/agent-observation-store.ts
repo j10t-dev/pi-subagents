@@ -6,6 +6,7 @@ import {
   agentObservationRevision,
   agentRunKey,
   directAgentOrdinal,
+  transcriptAssistantGroup,
   transcriptRevision,
   tryTranscriptFileName,
   transcriptSequence,
@@ -16,6 +17,7 @@ import {
   type AgentOrdinal,
   type AgentRunKey,
   type CompletionState,
+  type ConversationStopReason,
   type ModelSpec,
   type RunId,
   type RunAttemptId,
@@ -98,6 +100,7 @@ interface RetainedAgent {
   readonly ordinal: AgentOrdinal;
   readonly position: number;
   readonly sessionPath: SessionPath;
+  readonly cwd: AbsolutePath;
   readonly model: ModelSpec;
   readonly thinkingLevel: ThinkingLevel;
   candidate: string;
@@ -129,8 +132,8 @@ interface RetainedTranscript {
   readonly source: TranscriptSource;
   readonly entries: TranscriptEntry[];
   readonly listeners: Set<TranscriptListener>;
-  readonly assistant: Map<string, TranscriptEntry>;
-  readonly tools: Map<string, TranscriptEntry>;
+  readonly blockIndex: Map<string, number>;
+  assistantEntry?: TranscriptEntry;
   revision: TranscriptRevision;
   sequence: number;
   generation: number;
@@ -272,6 +275,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       ordinal: input.ordinal,
       position: directPosition(input.ordinal),
       sessionPath: input.sessionPath,
+      cwd: input.cwd,
       model: input.model,
       thinkingLevel: input.thinkingLevel,
       candidate: boundedCandidate(input.assignment),
@@ -421,12 +425,12 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
 
   reconcile(snapshot: ObservationReconciliationSnapshot, purpose: ObservationReconciliationPurpose = "restoration"): void {
     if (this.disposed) return;
-    this.registerSensitiveValuesWithoutCommit(snapshot.sensitiveValues);
+    const sensitiveChanged = this.registerSensitiveValuesWithoutCommit(snapshot.sensitiveValues);
     const authorities = new Map(snapshot.agents.map((agent) => [agent.agentId, agent]));
     const runs = new Map(snapshot.runs.map((run) => [run.agentId, run]));
     const completions = new Map(snapshot.completions.map((completion) => [completion.agentId, completion]));
     const changed: AgentOrdinal[] = [];
-    const changedTranscripts = new Set<RetainedTranscript>();
+    const changedTranscripts = new Set<RetainedTranscript>(sensitiveChanged ? this.transcripts.values() : []);
     const authoritativeIds = new Set(snapshot.spawnSequence);
     for (const [id, agent] of this.agents) {
       if (authoritativeIds.has(id)) continue;
@@ -456,6 +460,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
           ...agent,
           ordinal,
           position: index + 1,
+          cwd: authority.cwd,
           model: authority.model,
           thinkingLevel: authority.thinkingLevel,
           observation: Object.freeze({
@@ -530,7 +535,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       reportProjectionFailure: () => this.reportProjectionFailure(),
       correlationCount: (agentId) => {
         const source = this.transcripts.get(agentId);
-        return source === undefined ? 0 : source.assistant.size + source.tools.size;
+        return source?.blockIndex.size ?? 0;
       },
       transcriptItemCount: () => [...this.transcripts.values()].reduce((total, source) => total + source.entries.length, 0),
     };
@@ -624,7 +629,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       },
     });
     retained = {
-      agentId, source, entries: [], listeners: new Set(), assistant: new Map(), tools: new Map(),
+      agentId, source, entries: [], listeners: new Set(), blockIndex: new Map(),
       revision: transcriptRevision(0), sequence: 0, generation: 0, generationOpen: false,
       truncatedBefore: false, availability, transportHealthy: false, notificationScheduled: false, disposed: false,
     };
@@ -635,7 +640,20 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   private transcriptSnapshot(source: RetainedTranscript): TranscriptSnapshot {
     if (source.snapshot !== undefined) return source.snapshot;
     const items = Object.freeze(source.entries.map((entry) => entry.item));
-    source.snapshot = Object.freeze({ revision: source.revision, items, truncatedBefore: source.truncatedBefore, availability: source.availability });
+    const agent = this.agents.get(source.agentId);
+    const managed = new Set<string>([...this.knownInternalPaths].map(String));
+    if (agent !== undefined) managed.delete(String(agent.cwd));
+    source.snapshot = Object.freeze({
+      revision: source.revision,
+      items,
+      truncatedBefore: source.truncatedBefore,
+      availability: source.availability,
+      sensitiveValues: Object.freeze({
+        nativeIds: Object.freeze(new Set<string>([...this.knownAgentIds, ...this.knownRunIds].map(String))) as ReadonlySet<string>,
+        managedPathsAndNames: Object.freeze(managed) as ReadonlySet<string>,
+      }),
+      ...(agent === undefined ? {} : { renderingCwd: agent.cwd }),
+    });
     return source.snapshot;
   }
 
@@ -673,62 +691,110 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
         break;
       case "assistant-start":
         if (source.generationOpen) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
-        source.generation++; source.generationOpen = true;
+        source.generation++;
+        source.generationOpen = true;
+        source.blockIndex.clear();
+        source.assistantEntry = this.insertTranscript(source, Object.freeze({
+          sequence: this.nextTranscriptSequence(source),
+          runId,
+          kind: "assistant",
+          group: transcriptAssistantGroup(source.generation),
+          phase: "partial",
+          blocks: Object.freeze([]),
+        }), true, affected);
         break;
       case "assistant-content": {
-        if (!source.generationOpen) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
+        if (!source.generationOpen || source.assistantEntry === undefined) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
         if (event.phase === "start") break;
+        const entry = source.assistantEntry;
+        const owner = assistantTranscriptItem(entry.item);
         const key = assistantKey(runId, source.generation, event.contentIndex, event.contentKind);
-        let entry = source.assistant.get(key);
-        if (entry !== undefined && !entry.open) break;
-        const existingItem = entry === undefined ? undefined : assistantTranscriptItem(entry.item);
+        const located = source.blockIndex.get(key);
+        const previous = located === undefined ? undefined : owner.blocks[located];
+        if (previous?.kind === event.contentKind && previous.phase === "final") break;
+        const previousText = previous?.kind === event.contentKind ? previous.text : "";
         const text = event.phase === "delta"
-          ? boundedTranscriptPrefix(`${existingItem?.text ?? ""}${event.delta}`)
+          ? boundedTranscriptPrefix(`${previousText}${event.delta}`)
           : boundedTranscriptPrefix(event.text);
-        const phase = event.phase === "end" ? "final" as const : "partial" as const;
-        if (entry === undefined) {
-          const item = Object.freeze({ sequence: this.nextTranscriptSequence(source), runId,
-            kind: event.contentKind === "text" ? "assistant" as const : "thinking" as const, phase, text });
-          entry = this.insertTranscript(source, item, event.phase === "delta", affected);
-          if (source.disabledRunId !== runId) source.assistant.set(key, entry);
+        const block = Object.freeze({ kind: event.contentKind, phase: event.phase === "end" ? "final" as const : "partial" as const, text });
+        const blocks = [...owner.blocks];
+        if (located === undefined) {
+          source.blockIndex.set(key, blocks.length);
+          blocks.push(block);
         } else {
-          this.replaceTranscript(source, entry, Object.freeze({ ...assistantTranscriptItem(entry.item), phase, text }), event.phase === "delta", affected);
+          blocks[located] = block;
         }
+        this.replaceTranscript(source, entry, Object.freeze({ ...owner, blocks: Object.freeze(blocks) }), true, affected);
         break;
       }
       case "assistant-end": {
-        if (!source.generationOpen) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
-        for (const block of event.finalBlocks) {
-          const key = assistantKey(runId, source.generation, block.contentIndex, block.kind);
-          const entry = source.assistant.get(key);
-          const text = boundedTranscriptPrefix(block.text);
-          if (entry === undefined) {
-            this.insertTranscript(source, Object.freeze({ sequence: this.nextTranscriptSequence(source), runId,
-              kind: block.kind === "text" ? "assistant" as const : "thinking" as const, phase: "final" as const, text }), false, affected);
-          } else if (entry.item.kind === "assistant" || entry.item.kind === "thinking") {
-            this.replaceTranscript(source, entry, Object.freeze({ ...entry.item, phase: "final", text }), false, affected);
+        if (!source.generationOpen || source.assistantEntry === undefined) { this.failTranscript(source, runId, affected, sequenceBefore); this.enforceTranscriptBudgets(source, affected); this.commitTranscripts(affected); return; }
+        const entry = source.assistantEntry;
+        const owner = assistantTranscriptItem(entry.item);
+        const blocks = [...owner.blocks];
+        for (const finalBlock of event.finalBlocks) {
+          const key = assistantKey(runId, source.generation, finalBlock.contentIndex, finalBlock.kind);
+          const located = source.blockIndex.get(key);
+          const block = Object.freeze({ kind: finalBlock.kind, phase: "final" as const, text: boundedTranscriptPrefix(finalBlock.text) });
+          if (located === undefined) {
+            source.blockIndex.set(key, blocks.length);
+            blocks.push(block);
+          } else {
+            blocks[located] = block;
           }
         }
-        const generationPrefix = `${runId}\u0000${source.generation}\u0000`;
-        for (const [key, entry] of source.assistant) {
-          if (!key.startsWith(generationPrefix) || (entry.item.kind !== "assistant" && entry.item.kind !== "thinking")) continue;
-          this.replaceTranscript(source, entry, Object.freeze({ ...entry.item, phase: "final" }), false, affected);
-        }
-        this.releaseAssistantGeneration(source, runId, source.generation);
+        const finalised = blocks.map((block) => block.kind === "tool" || block.phase === "final"
+          ? block
+          : Object.freeze({ ...block, phase: "final" as const }));
+        this.replaceTranscript(source, entry, Object.freeze({
+          ...owner,
+          phase: "final",
+          stopReason: conversationStopReason(event.stopReason),
+          blocks: Object.freeze(finalised),
+        }), false, affected);
+        delete source.assistantEntry;
+        source.blockIndex.clear();
         source.generationOpen = false;
         break;
       }
       case "tool": {
+        if (source.assistantEntry === undefined) {
+          source.generation++;
+          source.blockIndex.clear();
+          source.assistantEntry = this.insertTranscript(source, Object.freeze({
+            sequence: this.nextTranscriptSequence(source),
+            runId,
+            kind: "assistant",
+            group: transcriptAssistantGroup(source.generation),
+            phase: "partial",
+            blocks: Object.freeze([]),
+          }), true, affected);
+        }
+        const entry = source.assistantEntry;
+        const owner = assistantTranscriptItem(entry.item);
         const key = `${runId}\u0000${event.toolCallId}`;
-        let entry = source.tools.get(key);
-        const preview = event.preview === undefined ? undefined : boundedTranscriptPrefix(event.preview);
-        const item = entry === undefined
-          ? Object.freeze({ sequence: this.nextTranscriptSequence(source), runId, kind: "tool" as const, tool: event.tool, phase: event.phase, ...(preview === undefined ? {} : { preview }) })
-          : Object.freeze({ sequence: entry.item.sequence, runId, kind: "tool" as const, tool: event.tool, phase: event.phase, ...(preview === undefined ? {} : { preview }) });
-        if (entry === undefined) entry = this.insertTranscript(source, item, event.phase === "running", affected);
-        else this.replaceTranscript(source, entry, item, event.phase === "running", affected);
-        if (event.phase === "running" && source.disabledRunId !== runId) source.tools.set(key, entry);
-        else source.tools.delete(key);
+        const located = source.blockIndex.get(key);
+        const previous = located === undefined ? undefined : owner.blocks[located];
+        const priorPresentation = previous?.kind === "tool" ? previous.presentation : undefined;
+        const presentation = Object.freeze({
+          ...priorPresentation,
+          callId: event.toolCallId,
+          tool: event.tool,
+          phase: event.phase,
+          ...(event.preview === undefined ? {} : { preview: boundedTranscriptPrefix(event.preview) }),
+          ...(event.arguments === undefined ? {} : { arguments: event.arguments }),
+          ...(event.result === undefined ? {} : { result: event.result }),
+        });
+        const blocks = [...owner.blocks];
+        const block = Object.freeze({ kind: "tool" as const, presentation });
+        if (located === undefined) {
+          source.blockIndex.set(key, blocks.length);
+          blocks.push(block);
+        } else {
+          blocks[located] = block;
+        }
+        this.replaceTranscript(source, entry, Object.freeze({ ...owner, blocks: Object.freeze(blocks) }), source.generationOpen || event.phase === "running", affected);
+        if (event.phase !== "running") source.blockIndex.delete(key);
         break;
       }
       case "transport-unavailable":
@@ -806,7 +872,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   ): boolean {
     if (source === undefined || source.disposed || runId === undefined || source.disabledRunId === runId) return false;
     source.entries.length = 0;
-    source.assistant.clear(); source.tools.clear(); source.generationOpen = false;
+    source.blockIndex.clear(); delete source.assistantEntry; source.generationOpen = false;
     source.disabledRunId = runId; source.transportHealthy = false; source.availability = "unavailable";
     if (sequenceBefore !== undefined) source.sequence = sequenceBefore;
     const item = Object.freeze({ sequence: this.nextTranscriptSequence(source), kind: "notice" as const, code: "projection-unavailable" as const });
@@ -820,20 +886,16 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   private nextTranscriptSequence(source: RetainedTranscript) { return transcriptSequence(++source.sequence); }
 
   private releaseEntryCorrelations(source: RetainedTranscript, entry: TranscriptEntry): void {
-    for (const [key, value] of source.assistant) if (value === entry) source.assistant.delete(key);
-    for (const [key, value] of source.tools) if (value === entry) source.tools.delete(key);
-  }
-
-  private releaseAssistantGeneration(source: RetainedTranscript, runId: RunId, generation: number): void {
-    const prefix = `${runId}\u0000${generation}\u0000`;
-    for (const key of source.assistant.keys()) if (key.startsWith(prefix)) source.assistant.delete(key);
+    if (source.assistantEntry !== entry) return;
+    source.blockIndex.clear();
+    delete source.assistantEntry;
   }
 
   private releaseRunCorrelations(source: RetainedTranscript, runId?: RunId): void {
-    if (runId === undefined) { source.assistant.clear(); source.tools.clear(); return; }
-    const prefix = `${runId}\u0000`;
-    for (const key of source.assistant.keys()) if (key.startsWith(prefix)) source.assistant.delete(key);
-    for (const key of source.tools.keys()) if (key.startsWith(prefix)) source.tools.delete(key);
+    if (runId !== undefined && source.assistantEntry?.item.kind === "assistant"
+      && source.assistantEntry.item.runId !== runId) return;
+    source.blockIndex.clear();
+    delete source.assistantEntry;
   }
 
   private commitTranscripts(sources: Set<RetainedTranscript>): void {
@@ -937,10 +999,10 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
 
   private registerSpawnedWithoutCommit(input: SpawnObservationInput): void {
     if (this.agents.has(input.agentId)) return;
-    this.addSensitiveValues({ agentIds: new Set([input.agentId]), runIds: new Set(), internalPaths: new Set([input.sessionPath, input.cwd]) });
+    this.addSensitiveValues({ agentIds: new Set([input.agentId]), runIds: new Set(), internalPaths: new Set([input.sessionPath, input.cwd]) }, false);
     const retained: RetainedAgent = {
       agentId: input.agentId, ordinal: input.ordinal, position: directPosition(input.ordinal),
-      sessionPath: input.sessionPath, model: input.model,
+      sessionPath: input.sessionPath, cwd: input.cwd, model: input.model,
       thinkingLevel: input.thinkingLevel, candidate: boundedCandidate(input.assignment), lifecycleState: AgentState.Stopped,
       pendingDelivery: false, observation: undefined as never,
     };
@@ -974,11 +1036,11 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     source.disposed = true;
     source.notificationScheduled = false;
     source.listeners.clear();
-    source.assistant.clear(); source.tools.clear();
+    source.blockIndex.clear(); delete source.assistantEntry;
     source.revision = transcriptRevision(Number(source.revision) + 1);
     source.availability = "unavailable";
-    source.snapshot = Object.freeze({ revision: source.revision, items: Object.freeze(source.entries.map((entry) => entry.item)),
-      truncatedBefore: source.truncatedBefore, availability: "unavailable" });
+    delete source.snapshot;
+    source.snapshot = this.transcriptSnapshot(source);
   }
 
   private replaceObservation(agent: RetainedAgent, overrides: Partial<Pick<AgentObservation, "taskLabel" | "activity" | "context">>): boolean {
@@ -1008,15 +1070,18 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     return changed;
   }
 
-  private addSensitiveValues(values: ObservationSensitiveValues): boolean {
+  private addSensitiveValues(values: ObservationSensitiveValues, publishTranscriptMetadata = true): boolean {
     let changed = false;
     for (const id of values.agentIds) if (!this.knownAgentIds.has(id)) { this.knownAgentIds.add(id); changed = true; }
     for (const id of values.runIds) if (!this.knownRunIds.has(id)) { this.knownRunIds.add(id); changed = true; }
     for (const path of values.internalPaths) if (!this.knownInternalPaths.has(path)) { this.knownInternalPaths.add(path); changed = true; }
+    if (changed && publishTranscriptMetadata) this.commitTranscripts(new Set(this.transcripts.values()));
     return changed;
   }
 
-  private registerSensitiveValuesWithoutCommit(values: ObservationSensitiveValues): void { this.addSensitiveValues(values); }
+  private registerSensitiveValuesWithoutCommit(values: ObservationSensitiveValues): boolean {
+    return this.addSensitiveValues(values, false);
+  }
   private labelContext() { return { knownAgentIds: this.knownAgentIds, knownRunIds: this.knownRunIds, knownInternalPaths: this.knownInternalPaths }; }
   private nextRevision(): AgentObservationRevision { return agentObservationRevision(Number(this.revision) + 1); }
 
@@ -1202,16 +1267,41 @@ function boundedTranscriptPrefix(value: string): typeof value & import("./domain
   return output as typeof value & import("./domain.ts").TranscriptText;
 }
 function transcriptItemBytes(item: TranscriptItem): number {
-  if (item.kind === "user" || item.kind === "assistant" || item.kind === "thinking") return transcriptEncoder.encode(item.text).byteLength;
-  if (item.kind === "tool" && item.preview !== undefined) return transcriptEncoder.encode(item.preview).byteLength;
-  return 0;
+  if (item.kind === "user") return transcriptEncoder.encode(item.text).byteLength;
+  if (item.kind !== "assistant") return 0;
+  return item.blocks.reduce((total, block) => {
+    if (block.kind === "text" || block.kind === "thinking") {
+      return total + transcriptEncoder.encode(block.text).byteLength;
+    }
+    const previewBytes = block.presentation.preview === undefined
+      ? 0
+      : transcriptEncoder.encode(block.presentation.preview).byteLength;
+    const argumentBytes = transcriptJsonBytes(block.presentation.arguments);
+    const resultBytes = block.presentation.result?.content.reduce(
+      (bytes, text) => bytes + transcriptEncoder.encode(text).byteLength,
+      0,
+    ) ?? 0;
+    const detailBytes = transcriptJsonBytes(block.presentation.result?.details);
+    return total + previewBytes + argumentBytes + resultBytes + detailBytes;
+  }, 0);
 }
+function transcriptJsonBytes(value: import("./domain.ts").BoundedTranscriptJson | undefined): number {
+  return value === undefined ? 0 : transcriptEncoder.encode(JSON.stringify(value)).byteLength;
+}
+
 function assistantKey(runId: RunId, generation: number, index: import("./domain.ts").RpcContentIndex, kind: "text" | "thinking"): string {
   return `${runId}\u0000${generation}\u0000${index}\u0000${kind}`;
 }
-function assistantTranscriptItem(item: TranscriptItem): Extract<TranscriptItem, { readonly kind: "assistant" | "thinking" }> {
-  if (item.kind !== "assistant" && item.kind !== "thinking") throw new Error("invalid_state: assistant correlation mismatch");
+function assistantTranscriptItem(item: TranscriptItem): Extract<TranscriptItem, { readonly kind: "assistant" }> {
+  if (item.kind !== "assistant") throw new Error("invalid_state: assistant correlation mismatch");
   return item;
+}
+
+function conversationStopReason(value: import("./domain.ts").RpcStopReason): ConversationStopReason {
+  const reason = String(value);
+  return reason === "stop" || reason === "length" || reason === "aborted" || reason === "toolUse"
+    ? reason
+    : "error";
 }
 function oldestEntry(entries: readonly TranscriptEntry[], open: boolean): TranscriptEntry | undefined {
   return entries.filter((entry) => entry.open === open).sort((left, right) => left.order - right.order)[0];
@@ -1228,9 +1318,10 @@ function sameTranscriptItem(left: TranscriptItem, right: TranscriptItem): boolea
   if (left.kind !== right.kind || left.sequence !== right.sequence) return false;
   if (left.kind === "notice" && right.kind === "notice") return left.code === right.code;
   if (left.kind === "user" && right.kind === "user") return left.runId === right.runId && left.text === right.text;
-  if ((left.kind === "assistant" || left.kind === "thinking") && (right.kind === "assistant" || right.kind === "thinking")) {
-    return left.kind === right.kind && left.runId === right.runId && left.phase === right.phase && left.text === right.text;
-  }
-  if (left.kind === "tool" && right.kind === "tool") return left.runId === right.runId && left.tool === right.tool && left.phase === right.phase && left.preview === right.preview;
-  return false;
+  return left.kind === "assistant" && right.kind === "assistant"
+    && left.runId === right.runId
+    && left.group === right.group
+    && left.phase === right.phase
+    && left.stopReason === right.stopReason
+    && JSON.stringify(left.blocks) === JSON.stringify(right.blocks);
 }

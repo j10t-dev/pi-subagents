@@ -55,6 +55,7 @@ function loadingConversationSource(): SelectedTranscriptSource {
     revision: selectedTranscriptRevision(0),
     transcript: Object.freeze({
       revision: transcriptRevision(0), items: [], truncatedBefore: false, availability: "live" as const,
+      sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() },
     }),
     row: snapshotOf(1).rows[0]!,
     routeAvailable: true,

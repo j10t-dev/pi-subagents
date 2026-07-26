@@ -114,9 +114,24 @@ export const AssistantContentEventSchema = Type.Union([
 ]);
 
 export const ToolObservationEventSchema = Type.Union([
-  Type.Object({ type: Type.Literal("tool_execution_start"), toolCallId: Type.String({ minLength: 1, maxLength: 256 }), toolName: Type.String({ minLength: 1, maxLength: 256 }) }),
-  Type.Object({ type: Type.Literal("tool_execution_update"), toolCallId: Type.String({ minLength: 1, maxLength: 256 }), toolName: Type.String({ minLength: 1, maxLength: 256 }) }),
-  Type.Object({ type: Type.Literal("tool_execution_end"), toolCallId: Type.String({ minLength: 1, maxLength: 256 }), toolName: Type.String({ minLength: 1, maxLength: 256 }), isError: Type.Boolean() }),
+  Type.Object({
+    type: Type.Literal("tool_execution_start"),
+    toolCallId: Type.String({ minLength: 1, maxLength: 256 }),
+    toolName: Type.String({ minLength: 1, maxLength: 256 }),
+    args: Type.Optional(Type.Unknown()),
+  }),
+  Type.Object({
+    type: Type.Literal("tool_execution_update"),
+    toolCallId: Type.String({ minLength: 1, maxLength: 256 }),
+    toolName: Type.String({ minLength: 1, maxLength: 256 }),
+  }),
+  Type.Object({
+    type: Type.Literal("tool_execution_end"),
+    toolCallId: Type.String({ minLength: 1, maxLength: 256 }),
+    toolName: Type.String({ minLength: 1, maxLength: 256 }),
+    isError: Type.Boolean(),
+    result: Type.Optional(Type.Unknown()),
+  }),
 ]);
 
 export const TurnEndObservationSchema = Type.Object({ type: Type.Literal("turn_end") });
@@ -435,11 +450,13 @@ export type SettingsDocumentDto = Static<typeof SettingsDocumentSchema>;
 export interface TranscriptSessionHeaderRecord {
   readonly version: 2 | 3;
   readonly sessionId: AgentId;
+  readonly cwd?: string;
 }
 
 export type TranscriptSessionContentRecord =
   | { readonly kind: "text" | "thinking"; readonly text: string }
-  | { readonly kind: "tool-call"; readonly callId: string; readonly tool: string }
+  | { readonly kind: "tool-call"; readonly callId: string; readonly tool: string; readonly arguments?: BoundedTranscriptJson }
+  | { readonly kind: "image" }
   | { readonly kind: "ignored" };
 
 export type TranscriptSessionMessageRecord =
@@ -450,6 +467,7 @@ export type TranscriptSessionMessageRecord =
       readonly callId: string;
       readonly tool: string;
       readonly content: readonly TranscriptSessionContentRecord[];
+      readonly details?: BoundedTranscriptJson;
       readonly error: boolean;
     }
   | { readonly role: "non-conversation" };
@@ -482,6 +500,7 @@ export const TranscriptSessionHeaderSchema = Type.Object({
   type: Type.Literal("session"),
   id: AgentIdSchema,
   version: Type.Union([Type.Literal(2), Type.Literal(3)]),
+  cwd: Type.Optional(Type.String({ maxLength: 4_096 })),
 });
 
 const TextContentSchema = Type.Object({ type: Type.Literal("text"), text: Type.String() });
@@ -490,7 +509,9 @@ const ToolCallContentSchema = Type.Object({
   type: Type.Literal("toolCall"),
   id: NativeCorrelationSchema,
   name: NativeCorrelationSchema,
+  arguments: Type.Optional(Type.Unknown()),
 });
+const ImageContentSchema = Type.Object({ type: Type.Literal("image") });
 
 const TranscriptUserMessageSchema = Type.Object({
   role: Type.Literal("user"),
@@ -508,6 +529,7 @@ const TranscriptToolResultMessageSchema = Type.Object({
   toolCallId: NativeCorrelationSchema,
   toolName: NativeCorrelationSchema,
   content: Type.Array(Type.Unknown(), { maxItems: MAX_TRANSCRIPT_SOURCE_ITEMS }),
+  details: Type.Optional(Type.Unknown()),
   isError: Type.Optional(Type.Boolean()),
 });
 const TranscriptOtherMessageSchema = Type.Object({ role: Type.String() });
@@ -532,7 +554,11 @@ const KNOWN_ENTRY_TYPES = new Set(["message", "compaction"]);
 /** Decodes one complete session header record; an unsupported version is not a header. */
 export function decodeTranscriptSessionHeader(value: unknown): TranscriptSessionHeaderRecord | undefined {
   if (!Value.Check(TranscriptSessionHeaderSchema, value)) return undefined;
-  return { version: value.version, sessionId: agentId(value.id) };
+  return {
+    version: value.version,
+    sessionId: agentId(value.id),
+    ...(value.cwd === undefined ? {} : { cwd: value.cwd }),
+  };
 }
 
 /** Decodes one complete session entry record; a malformed record is rejected as a whole. */
@@ -581,11 +607,13 @@ function decodeTranscriptSessionMessage(value: unknown): TranscriptSessionMessag
     return { role: "assistant", content: value.content.map(decodeTranscriptSessionContent) };
   }
   if (Value.Check(TranscriptToolResultMessageSchema, value)) {
+    const details = value.details === undefined ? undefined : admitBoundedTranscriptJson(value.details);
     return {
       role: "tool-result",
       callId: value.toolCallId,
       tool: value.toolName,
       content: value.content.map(decodeTranscriptSessionContent),
+      ...(details === undefined ? {} : { details }),
       error: value.isError === true,
     };
   }
@@ -599,7 +627,11 @@ function decodeTranscriptSessionMessage(value: unknown): TranscriptSessionMessag
 function decodeTranscriptSessionContent(value: unknown): TranscriptSessionContentRecord {
   if (Value.Check(TextContentSchema, value)) return { kind: "text", text: value.text };
   if (Value.Check(ThinkingContentSchema, value)) return { kind: "thinking", text: value.thinking };
-  if (Value.Check(ToolCallContentSchema, value)) return { kind: "tool-call", callId: value.id, tool: value.name };
+  if (Value.Check(ToolCallContentSchema, value)) {
+    const admitted = value.arguments === undefined ? undefined : admitBoundedTranscriptJson(value.arguments);
+    return { kind: "tool-call", callId: value.id, tool: value.name, ...(admitted === undefined ? {} : { arguments: admitted }) };
+  }
+  if (Value.Check(ImageContentSchema, value)) return { kind: "image" };
   return { kind: "ignored" };
 }
 
