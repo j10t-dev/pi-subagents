@@ -40,6 +40,7 @@ import {
   type KnownChildSnapshots,
   type ObservationRow,
   type ObservationSnapshot,
+  type SnapshotSkipReason,
 } from "../src/observation-snapshot-path.ts";
 import { absolutePath } from "../src/paths.ts";
 import {
@@ -515,6 +516,186 @@ describe("RecursiveAgentIndex", () => {
     expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: false });
     expect(reads).toEqual([terminal, terminalChild]);
     expect(watcher.calls.at(-1)).toEqual([terminal]);
+  });
+
+  test.each([
+    ["missing-directory", false, []],
+    ["missing-file", false, [agentId("terminal-missing-file")]],
+    ["malformed", true, [agentId("terminal-malformed")]],
+    ["unreadable", true, [agentId("terminal-unreadable")]],
+    ["oversized", true, [agentId("terminal-oversized")]],
+    ["session-id-mismatch", true, [agentId("terminal-session-id-mismatch")]],
+    ["not-a-regular-file", true, [agentId("terminal-not-a-regular-file")]],
+    ["invalid-session-id", true, []],
+    ["escapes-managed-root", true, []],
+  ] as const)("classifies terminal %s slots without retained data", (reason, expectedDegraded, expectedTracked) => {
+    const owner = agentId(`terminal-${reason}`);
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => ({
+      snapshots: new Map(),
+      skipped: new Map(ids.map((id) => [id, reason] as const)),
+    });
+    const { index, watcher } = fixture(
+      direct([projection(owner, "A1", CompletionState.Completed)]),
+      { readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(1), omitted: agentCount(0), degraded: expectedDegraded });
+    expect(watcher.calls.at(-1)).toEqual([...expectedTracked]);
+  });
+
+  test.each([
+    "missing-file",
+    "not-a-regular-file",
+    "unreadable",
+    "oversized",
+    "malformed",
+    "session-id-mismatch",
+    "invalid-session-id",
+    "escapes-managed-root",
+  ] as const)("retains a terminal revision through a %s replacement failure", (reason) => {
+    const owner = agentId(`retained-${reason}`);
+    let result: KnownChildSnapshots = {
+      snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "retained-child", CompletionState.Completed)], {
+        revision: 5,
+      })]]),
+      skipped: new Map(),
+    };
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => ids.includes(owner)
+      ? result
+      : { snapshots: new Map(), skipped: new Map(ids.map((id) => [id, "missing-directory"] as const)) };
+    const { index, watcher } = fixture(
+      direct([projection(owner, "A1", CompletionState.Completed)]),
+      { readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+    result = { snapshots: new Map(), skipped: new Map([[owner, reason]]) };
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: true });
+    expect(watcher.calls.at(-1)).toEqual(
+      reason === "invalid-session-id" || reason === "escapes-managed-root" ? [] : [owner],
+    );
+  });
+
+  test("retains a terminal revision when a same-incarnation snapshot regresses", () => {
+    const owner = agentId("retained-stale-revision");
+    let result: KnownChildSnapshots = {
+      snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "revision-five", CompletionState.Completed, "revision-five")], {
+        incarnation: incarnationId("terminal-inc"), revision: 5,
+      })]]),
+      skipped: new Map(),
+    };
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => ids.includes(owner)
+      ? result
+      : { snapshots: new Map(), skipped: new Map(ids.map((id) => [id, "missing-directory"] as const)) };
+    const { index } = fixture(
+      direct([projection(owner, "A1", CompletionState.Completed)]),
+      { readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+    result = {
+      snapshots: new Map([[owner, snapshot(owner, [observationRow("A1", "revision-four", CompletionState.Completed, "revision-four")], {
+        incarnation: incarnationId("terminal-inc"), revision: 4,
+      })]]),
+      skipped: new Map(),
+    };
+    index.refresh();
+
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("revision-five" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(true);
+  });
+
+  test("preserves an active child published by a terminal ancestor and marks the projection degraded", () => {
+    const owner = agentId("terminal-active-ancestor");
+    const child = agentId("terminal-active-child");
+    const grandchild = agentId("terminal-active-grandchild");
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => ({
+      snapshots: new Map(ids.flatMap((id) => {
+        if (id === owner) return [[owner, snapshot(owner, [observationRow("A1", child, AgentState.Running)])]];
+        if (id === child) return [[child, snapshot(child, [observationRow("A1", grandchild, CompletionState.Completed)])]];
+        return [];
+      })),
+      skipped: new Map(ids.filter((id) => id !== owner && id !== child).map((id) => [id, "missing-directory"] as const)),
+    });
+    const { index, watcher } = fixture(
+      direct([projection(owner, "A1", CompletionState.Completed)]),
+      { readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1", "A1.1.1"]);
+    expect(index.snapshot().rows[1]?.state).toBe(AgentState.Running);
+    expect(index.snapshot().degraded).toBe(true);
+    expect(watcher.calls.at(-1)).toEqual([owner, child]);
+  });
+
+  test("contains malformed and unsafe terminal subtrees without admitting unvalidated rows", () => {
+    const malformed = agentId("terminal-malformed-row");
+    const unsafe = agentId("terminal-unsafe-slot");
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => ({
+      snapshots: new Map(),
+      skipped: new Map(ids.map((id): readonly [AgentId, SnapshotSkipReason] => [
+        id,
+        id === malformed ? "malformed" : "escapes-managed-root",
+      ])),
+    });
+    const { index, watcher } = fixture(
+      direct([
+        projection(malformed, "A1", CompletionState.Completed),
+        projection(unsafe, "A2", CompletionState.Completed),
+      ]),
+      { readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A2"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: true });
+    expect(watcher.calls.at(-1)).toEqual([malformed]);
+  });
+
+  test("preserves terminal cycle, depth and row bounds", () => {
+    const cycle = agentId("terminal-cycle");
+    writeSnapshot(snapshot(cycle, [observationRow("A1", cycle, CompletionState.Completed)]));
+    const cycleIndex = fixture(direct([projection(cycle, "A1", CompletionState.Completed)]));
+    cycleIndex.index.refresh();
+    expect(ordinals(cycleIndex.index.snapshot().rows)).toEqual(["A1"]);
+    expect(cycleIndex.index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(1), degraded: true });
+
+    const depthRoot = agentId("terminal-depth-0");
+    for (let depth = 0; depth < Number(MAX_WALK_DEPTH); depth += 1) {
+      const owner = agentId(`terminal-depth-${depth}`);
+      const child = agentId(`terminal-depth-${depth + 1}`);
+      writeSnapshot(snapshot(owner, [observationRow("A1", child, CompletionState.Completed)]));
+    }
+    const depthIndex = fixture(direct([projection(depthRoot, "A1", CompletionState.Completed)]));
+    depthIndex.index.refresh();
+    expect(depthIndex.index.snapshot().rows).toHaveLength(Number(MAX_WALK_DEPTH));
+    expect(depthIndex.index.snapshot().rows.at(-1)?.depth).toBe(agentDepth(Number(MAX_WALK_DEPTH) - 1));
+    expect(depthIndex.index.snapshot()).toMatchObject({ total: agentCount(9), omitted: agentCount(1), degraded: true });
+
+    const bounded = agentId("terminal-row-bound");
+    writeSnapshot(snapshot(bounded, Array.from({ length: Number(MAX_WIDGET_ROWS) }, (_, index) =>
+      observationRow(`A${index + 1}`, `terminal-row-${index + 1}`, CompletionState.Completed),
+    )));
+    const boundedIndex = fixture(
+      direct([projection(bounded, "A1", CompletionState.Completed)]),
+      { maxRows: Number(MAX_WIDGET_ROWS) },
+    );
+    boundedIndex.index.refresh();
+    expect(boundedIndex.index.snapshot().rows).toHaveLength(Number(MAX_WIDGET_ROWS));
+    expect(boundedIndex.index.snapshot()).toMatchObject({
+      total: agentCount(Number(MAX_WIDGET_ROWS) + 1),
+      omitted: agentCount(1),
+      degraded: true,
+    });
   });
 
   test("reconstructs a completed three-level tree after fresh index creation", () => {

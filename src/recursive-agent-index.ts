@@ -22,6 +22,7 @@ import {
   readKnownChildSnapshots,
   type KnownChildSnapshots,
   type ObservationSnapshot,
+  type SnapshotSkipReason,
 } from "./observation-snapshot-path.ts";
 import type { SnapshotWatcher } from "./snapshot-watcher.ts";
 
@@ -116,7 +117,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
 
     const roots: AdmittedNode[] = [];
     const ownerQueue: AdmittedNode[] = [];
-    const tracked: AgentId[] = [];
+    const tracked = new Set<AgentId>();
     const seen = new Set<AgentId>();
     const nextOwners = new Map<AgentOrdinal, AgentId>();
     const nextRetained = new Map<AgentId, RetainedSlot>();
@@ -140,7 +141,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
       admittedCount += 1;
       if (!nextOwners.has(entry.row.ordinal)) nextOwners.set(entry.row.ordinal, entry.agentId);
       ownerQueue.push(node);
-      if (!isTerminal(entry.row.state)) tracked.push(entry.agentId);
+      if (!isTerminal(entry.row.state)) tracked.add(entry.agentId);
     }
 
     let levelStart = 0;
@@ -160,27 +161,39 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
           continue;
         }
         const incoming = result.snapshots.get(parent.sessionId);
-        if (incoming === undefined) {
-          const skip = result.skipped.get(parent.sessionId);
-          if (!isTerminal(parent.row.state) || skip !== "missing-directory") degraded = true;
+        const terminal = isTerminal(parent.row.state);
+        const retained = this.retained.get(parent.sessionId);
+        let selected: ObservationSnapshot | undefined;
+        if (incoming !== undefined) {
+          selected = incoming;
+          if (retained !== undefined && retained.snapshot.incarnation === incoming.incarnation &&
+              Number(incoming.revision) < Number(retained.snapshot.revision)) {
+            selected = retained.snapshot;
+            degraded = true;
+          }
+          nextRetained.set(parent.sessionId, { snapshot: selected });
+          if (terminal) tracked.add(parent.sessionId);
+        } else if (terminal) {
+          const reason = result.skipped.get(parent.sessionId);
+          if (reason === "missing-directory") continue;
+          selected = retained?.snapshot;
+          if (reason === undefined || reason !== "missing-file" || selected !== undefined) degraded = true;
+          if (selected !== undefined) nextRetained.set(parent.sessionId, { snapshot: selected });
+          if (reason !== undefined && !isUnsafeSkip(reason) && isReplaceableTerminalSkip(reason)) {
+            tracked.add(parent.sessionId);
+          }
+        } else {
+          degraded = true;
           continue;
         }
-
-        if (isTerminal(parent.row.state)) tracked.push(parent.sessionId);
-        const retained = this.retained.get(parent.sessionId);
-        let selected = incoming;
-        if (retained !== undefined && retained.snapshot.incarnation === incoming.incarnation &&
-            Number(incoming.revision) < Number(retained.snapshot.revision)) {
-          selected = retained.snapshot;
-          degraded = true;
-        }
-        nextRetained.set(parent.sessionId, { snapshot: selected });
+        if (selected === undefined) continue;
         if (selected.degraded) degraded = true;
         const addition = saturatingAdd(total, Number(selected.total));
         total = addition.value;
         if (addition.saturated) degraded = true;
 
         for (const child of selected.agents) {
+          if (terminal && !isTerminal(child.state)) degraded = true;
           const depth = Number(parent.row.depth) + 1;
           if (depth >= Number(MAX_WALK_DEPTH) || admittedCount >= maximumRows || seen.has(child.sessionId)) {
             degraded = true;
@@ -207,7 +220,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
           seen.add(child.sessionId);
           admittedCount += 1;
           ownerQueue.push(node);
-          if (!isTerminal(child.state)) tracked.push(child.sessionId);
+          if (!isTerminal(child.state)) tracked.add(child.sessionId);
         }
       }
       if (admittedCount >= maximumRows && ownerQueue.length > levelEnd) {
@@ -227,7 +240,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     this.retained = nextRetained;
     this.owners = nextOwners;
     try {
-      this.watcher?.track(tracked);
+      this.watcher?.track([...tracked]);
     } catch {
       degraded = true;
     }
@@ -309,6 +322,38 @@ function isTerminal(state: AgentDisplayState): boolean {
       const exhaustive: never = state;
       return exhaustive;
     }
+  }
+}
+
+function isUnsafeSkip(reason: SnapshotSkipReason): boolean {
+  switch (reason) {
+    case "invalid-session-id":
+    case "escapes-managed-root":
+      return true;
+    case "missing-directory":
+    case "missing-file":
+    case "not-a-regular-file":
+    case "unreadable":
+    case "oversized":
+    case "malformed":
+    case "session-id-mismatch":
+      return false;
+  }
+}
+
+function isReplaceableTerminalSkip(reason: SnapshotSkipReason): boolean {
+  switch (reason) {
+    case "missing-file":
+    case "not-a-regular-file":
+    case "unreadable":
+    case "oversized":
+    case "malformed":
+    case "session-id-mismatch":
+      return true;
+    case "invalid-session-id":
+    case "missing-directory":
+    case "escapes-managed-root":
+      return false;
   }
 }
 

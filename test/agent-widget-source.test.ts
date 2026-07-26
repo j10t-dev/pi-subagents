@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
@@ -224,6 +224,57 @@ describe("createAgentWidgetSource", () => {
     expect(recreated.transcriptSource(agentOrdinal("A1"))).toBeDefined();
     expect(recreated.transcriptSource(agentOrdinal("A1.2"))).toBeUndefined();
     recreated.dispose();
+  });
+
+  test("watches a terminal slot directory until delayed final publication arrives", async () => {
+    const store = new AgentObservationStore();
+    register(store, "delayed-terminal-root", 1, "Finished root");
+    const direct = store.directSnapshot();
+    if (direct.kind !== "snapshot") throw new Error("expected snapshot fixture");
+    const port: SubagentObservationPort = {
+      observation: (id) => store.observation(id),
+      directSnapshot: () => ({
+        ...direct,
+        entries: direct.entries.map((entry) => ({
+          ...entry,
+          observation: { ...entry.observation, lifecycleState: AgentState.Stopped, displayState: CompletionState.Completed },
+          row: { ...entry.row, state: CompletionState.Completed },
+        })),
+      }),
+      transcriptSource: (id) => store.transcriptSource(id),
+      subscribe: (listener) => store.subscribe(listener),
+    };
+    const owner = agentId("delayed-terminal-root");
+    mkdirSync(observationSlotDirectory(AGENT_DIR, owner), { recursive: true });
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    await waitForIndexRefresh();
+    const before = source.snapshot().revision;
+    const encoded = encodeObservationSnapshot({
+      sessionId: owner,
+      incarnation: incarnationId("delayed-publication"),
+      revision: observationRevision(1),
+      total: agentCount(1),
+      omitted: agentCount(0),
+      degraded: false,
+      agents: [{
+        ordinal: agentOrdinal("A1"),
+        sessionId: agentId("delayed-terminal-child"),
+        model: "luna:h" as ObservationRow["model"],
+        context: "42%" as ObservationRow["context"],
+        taskLabel: "child" as ObservationRow["taskLabel"],
+        state: CompletionState.Completed,
+      }],
+    });
+    if (!encoded.ok) throw new Error("snapshot fixture exceeded codec bound");
+    const destination = observationSnapshotPath(AGENT_DIR, owner);
+    const temporary = `${destination}.tmp`;
+    writeFileSync(temporary, encoded.text);
+    renameSync(temporary, destination);
+    await waitForIndexRefresh();
+
+    expect(Number(source.snapshot().revision)).toBeGreaterThan(Number(before));
+    expect(source.snapshot().rows.map((row) => row.ordinal)).toEqual([agentOrdinal("A1"), agentOrdinal("A1.1")]);
+    source.dispose();
   });
 
   test("refreshes from snapshot-watcher changes and stops watching after disposal", async () => {
