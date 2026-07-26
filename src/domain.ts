@@ -51,6 +51,16 @@ export type AgentObservationRevision = Brand<number, "AgentObservationRevision">
 export type AgentWidgetRevision = Brand<number, "AgentWidgetRevision">;
 export type TranscriptSequence = Brand<number, "TranscriptSequence">;
 export type TranscriptRevision = Brand<number, "TranscriptRevision">;
+/** A presentation-only child-conversation revision, detached from transcript correlation. */
+export type ConversationRevision = Brand<number, "ConversationRevision">;
+/** An opaque key derived only from one presentation revision and local item order. */
+export type ConversationItemKey = Brand<string, "ConversationItemKey">;
+/** A bounded count of laid-out transcript text-cell rows. */
+export type VisualLineCount = Brand<number, "VisualLineCount">;
+/** A bounded tail-relative transcript text-cell row offset. */
+export type VisualLineOffset = Brand<number, "VisualLineOffset">;
+/** A bounded count of terminal rows available to transcript content. */
+export type ViewportLineCount = Brand<number, "ViewportLineCount">;
 /** One selected-conversation revision: row, route availability and transcript published together. */
 export type SelectedTranscriptRevision = Brand<number, "SelectedTranscriptRevision">;
 /** The device and inode pair proving two stats describe the same underlying file. */
@@ -356,6 +366,23 @@ export function transcriptSequence(value: number): TranscriptSequence {
 export function transcriptRevision(value: number): TranscriptRevision {
   requireNonnegativeSafeInteger(value, "transcript revision");
   return value as TranscriptRevision;
+}
+export function conversationRevision(value: number): ConversationRevision {
+  requireNonnegativeSafeInteger(value, "conversation revision");
+  return value as ConversationRevision;
+}
+export function conversationItemKey(revision: ConversationRevision, index: number): ConversationItemKey {
+  requireNonnegativeSafeInteger(index, "conversation item index");
+  return `conversation-${revision}-${index}` as ConversationItemKey;
+}
+export function visualLineCount(value: number): VisualLineCount {
+  return normalisedBoundedInteger(value, 4_096) as VisualLineCount;
+}
+export function visualLineOffset(value: number): VisualLineOffset {
+  return normalisedBoundedInteger(value, 4_096) as VisualLineOffset;
+}
+export function viewportLineCount(value: number): ViewportLineCount {
+  return normalisedBoundedInteger(value, 10_000) as ViewportLineCount;
 }
 export function selectedTranscriptRevision(value: number): SelectedTranscriptRevision {
   requireNonnegativeSafeInteger(value, "selected transcript revision");

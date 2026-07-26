@@ -2,12 +2,19 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import type { EditorComponent, TUI } from "@earendil-works/pi-tui";
+import {
+  KeybindingsManager, TUI_KEYBINDINGS, type Component, type EditorComponent,
+  type OverlayHandle, type TUI,
+} from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { createPiSubagentsExtension, type ExtensionController } from "../index.ts";
 import createAgentWidgetExtension, { type AgentWidgetDeps } from "../src/agent-widget/extension.ts";
-import type { AgentDisplayState, AgentObservation, AgentWidgetSnapshot, AgentWidgetSource, ObservationChange, SubagentObservationPort } from "../src/agent-observation.ts";
+import { createChildConversationController } from "../src/agent-widget/conversation-controller.ts";
+import type {
+  AgentDisplayState, AgentObservation, AgentWidgetSnapshot, AgentWidgetSource,
+  ObservationChange, SelectedTranscriptSource, SubagentObservationPort,
+} from "../src/agent-observation.ts";
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
 import { onObservationPort, publishObservationPort } from "../src/observation-registry.ts";
 import { observationSnapshotPath, readKnownChildSnapshots } from "../src/observation-snapshot-path.ts";
@@ -16,7 +23,8 @@ import { parseExtensionLaunchContext } from "../src/delegation-policy.ts";
 import { setAmbientStatus, onAmbientStatus } from "../src/ambient-status-lease.ts";
 import {
   AgentState, agentCount, agentDepth, agentId, agentObservationRevision, agentOrdinal, agentWidgetRevision,
-  contextPercent, directAgentOrdinal, modelSpec, observationRevision,
+  contextPercent, directAgentOrdinal, modelSpec, observationRevision, selectedTranscriptRevision,
+  transcriptRevision,
   type AgentId, type ContextLabel, type ModelLabel, type TaskLabel,
 } from "../src/domain.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
@@ -42,8 +50,21 @@ function snapshotOf(count: number, total = count): AgentWidgetSnapshot {
   };
 }
 
+function loadingConversationSource(): SelectedTranscriptSource {
+  const selected = Object.freeze({
+    revision: selectedTranscriptRevision(0),
+    transcript: Object.freeze({
+      revision: transcriptRevision(0), items: [], truncatedBefore: false, availability: "live" as const,
+    }),
+    row: snapshotOf(1).rows[0]!,
+    routeAvailable: true,
+  });
+  return { snapshot: () => selected, subscribe: () => () => {} };
+}
+
 function fakeSource(options: {
   onSnapshot?: () => AgentWidgetSnapshot;
+  transcriptSource?: AgentWidgetSource["transcriptSource"];
   subscribeThrows?: boolean;
   unsubscribeFailures?: number;
   disposeFailures?: number;
@@ -56,7 +77,7 @@ function fakeSource(options: {
   let disposalAttempts = 0;
   const source: AgentWidgetSource & { dispose(): void } = {
     snapshot: () => options.onSnapshot ? options.onSnapshot() : current,
-    transcriptSource: () => undefined,
+    transcriptSource: options.transcriptSource ?? (() => undefined),
     subscribe: (onChange) => {
       listeners.add(onChange);
       if (options.subscribeThrows) throw new Error("subscribe boom");
@@ -92,6 +113,7 @@ function harness(options: {
   createSourceThrows?: boolean;
   sourceDiagnostic?: string;
   createCoalescer?: NonNullable<AgentWidgetDeps["createCoalescer"]>;
+  createConversationController?: NonNullable<AgentWidgetDeps["createConversationController"]>;
   editorThrowsOn?: "getEditorComponent" | "getText" | "inherited" | "setFocus" | "requestRender";
   trace?: (event: string) => void;
 } = {}) {
@@ -110,8 +132,27 @@ function harness(options: {
   let editorText = "";
   const inherited: string[] = [];
   const shortcuts: string[] = [];
+  const callbackTheme = {};
+  const callbackKeybindings = new KeybindingsManager({
+    ...TUI_KEYBINDINGS,
+    "app.thinking.toggle": { defaultKeys: "ctrl+t" },
+    "app.tools.expand": { defaultKeys: "ctrl+o" },
+  });
+  const overlayEntries: Array<{ readonly component: Component; readonly handle: OverlayHandle; readonly hides: () => number }> = [];
+  const showOverlay = (overlayComponent: Component): OverlayHandle => {
+    let hidden = false;
+    let hides = 0;
+    const handle: OverlayHandle = {
+      hide: () => { if (!hidden) { hidden = true; hides += 1 } },
+      setHidden: (next) => { hidden = next }, isHidden: () => hidden,
+      focus: () => {}, unfocus: () => {}, isFocused: () => !hidden,
+    };
+    overlayEntries.push({ component: overlayComponent, handle, hides: () => hides });
+    return handle;
+  };
   const tui = {
     terminal: { rows: 40, columns: 120 },
+    showOverlay,
     setFocus: (target: object) => { if (options.editorThrowsOn === "setFocus") throw new Error("focus boom"); focusCalls.push(target); },
     requestRender: () => { if (options.editorThrowsOn === "requestRender") throw new Error("render boom"); },
   } as TUI;
@@ -129,7 +170,7 @@ function harness(options: {
         if (options.setWidgetThrowsOn === "unmount" && removing) throw new Error("unmount boom");
         if (removing && unmountFailures > 0) { unmountFailures -= 1; throw new Error("unmount boom"); }
         widgets.push({ key, content });
-        component = removing ? undefined : content!(tui, {});
+        component = removing ? undefined : content!(tui, callbackTheme);
         if (!removing && options.mountThrowsAfterRegistration === true) throw new Error("post-registration mount boom");
       },
       setEditorComponent: (factory: EditorFactory | undefined) => {
@@ -183,14 +224,18 @@ function harness(options: {
       };
     },
     ...(options.createCoalescer === undefined ? {} : { createCoalescer: options.createCoalescer }),
+    ...(options.createConversationController === undefined ? {} : { createConversationController: options.createConversationController }),
     ...(options.trace === undefined ? {} : { trace: options.trace }),
   });
   handlers.get("session_start")?.({}, ctx);
   cleanups.push(() => { handlers.get("session_shutdown")?.({}, ctx); });
-  const editor = installed?.(tui, {}, {});
+  const editor = installed?.(tui, callbackTheme, callbackKeybindings);
   return {
     widgets, notices, focusCalls, inherited, shortcuts, editor, rootSessionIds,
-    component: () => component, setEditorText: (value: string) => { editorText = value; },
+    callbackValues: { tui, theme: callbackTheme, keybindings: callbackKeybindings },
+    overlayEntries,
+    showSiblingOverlay: () => showOverlay({ render: () => ["sibling"], invalidate: () => {} }),
+    component: () => component, setEditorText: (value: string) => { editorText = value; }, editorText: () => editorText,
     replaceEditorFactory: () => { editorFactory = (() => ({ render: () => [], invalidate: () => {}, getText: () => "", setText: () => {}, handleInput: () => {} })) as EditorFactory; },
     lines: () => (component?.render as ((width: number) => string[]) | undefined)?.(120) ?? [],
     start: () => handlers.get("session_start")?.({}, ctx),
@@ -631,6 +676,70 @@ describe("editor composition and focus", () => {
   test("Down does not focus the widget once the identity check has failed", () => { const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(2)); h.replaceEditorFactory(); h.editor!.handleInput(DOWN); expect(h.focusCalls).toHaveLength(0); expect(h.inherited).toEqual([DOWN]); });
   test("the latched suffix survives an unmount and remount, and the diagnostic still fires once", () => { const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(2)); h.replaceEditorFactory(); h.lines(); feed.emit(snapshotOf(0, 0)); feed.emit(snapshotOf(2)); expect(h.lines()[0]).toContain("arrow navigation unavailable"); expect(h.notices.filter((n) => n.message.includes("arrow")).length).toBe(1); });
   test("Up from the widget's first row returns focus to the same editor instance", () => { const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(2)); h.editor!.handleInput(DOWN); (h.component()!.handleInput as (data: string) => void)(UP); expect(h.focusCalls.at(-1)).toBe(h.editor); });
+  test("Esc closes the real child overlay without changing parent selection, editor text or a newer sibling", () => {
+    const selected = loadingConversationSource();
+    const feed = fakeSource({ transcriptSource: () => selected });
+    const h = harness({ sources: [feed], createConversationController: createChildConversationController });
+    publish();
+    feed.emit(snapshotOf(2));
+    h.editor!.handleInput(DOWN);
+    h.setEditorText("unchanged draft");
+    const parentBefore = h.lines();
+
+    (h.component()!.handleInput as (data: string) => void)("\r");
+    expect(h.overlayEntries).toHaveLength(1);
+    const child = h.overlayEntries[0]!;
+    h.showSiblingOverlay();
+    const siblingEntry = h.overlayEntries[1]!;
+
+    child.component.handleInput?.("\u001b");
+
+    expect(child.hides()).toBe(1);
+    expect(siblingEntry.hides()).toBe(0);
+    expect(h.lines()).toEqual(parentBefore);
+    expect(h.editorText()).toBe("unchanged draft");
+  });
+
+  test("creates one overlay controller from callback values and preserves parent state through open and shutdown", () => {
+    const feed = fakeSource();
+    const lifecycle: string[] = [];
+    const originalDispose = feed.source.dispose.bind(feed.source);
+    feed.source.dispose = () => { lifecycle.push("source:dispose"); originalDispose() };
+    const opens: string[] = [];
+    let closeEvents = 0;
+    let captured: Parameters<NonNullable<AgentWidgetDeps["createConversationController"]>>[0] | undefined;
+    const h = harness({
+      sources: [feed],
+      createConversationController: (options) => {
+        captured = options;
+        return {
+          open: (ordinal) => { opens.push(String(ordinal)) },
+          close: () => { closeEvents += 1 },
+          dispose: () => { lifecycle.push("controller:dispose") },
+        };
+      },
+    });
+    publish();
+    feed.emit(snapshotOf(2));
+
+    expect(captured?.tui).toBe(h.callbackValues.tui);
+    expect(captured?.theme as object | undefined).toBe(h.callbackValues.theme);
+    expect(captured?.keybindings as object | undefined).toBe(h.callbackValues.keybindings);
+    h.editor!.handleInput(DOWN);
+    h.setEditorText("unchanged draft");
+    (h.component()!.handleInput as (data: string) => void)("\r");
+    expect(opens).toEqual(["A1"]);
+    expect(h.editorText()).toBe("unchanged draft");
+    expect(h.widgets.at(-1)?.content).toBeDefined();
+
+    captured?.source();
+    expect(h.lines().join("\n")).toContain("A1");
+    const closesBeforeShutdown = closeEvents;
+    h.shutdown();
+    expect(closeEvents).toBe(closesBeforeShutdown);
+    expect(lifecycle).toEqual(["controller:dispose", "source:dispose"]);
+  });
+
   test("gate tracing is supplied explicitly through dependencies", () => {
     const feed = fakeSource();
     const events: string[] = [];

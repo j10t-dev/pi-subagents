@@ -12,6 +12,8 @@ import {
   type AgentWidgetRevision,
   type ContextLabel,
   type ContextPercent,
+  type ConversationItemKey,
+  type ConversationRevision,
   type ModelLabel,
   type ModelSpec,
   type RunId,
@@ -157,6 +159,25 @@ export interface SelectedTranscriptSource {
   snapshot(): SelectedTranscriptSnapshot;
   subscribe(listener: (snapshot: SelectedTranscriptSnapshot) => void): () => void;
 }
+
+/** Correlation-free transcript content accepted by the presentation boundary. */
+export type ConversationItem =
+  | { readonly key: ConversationItemKey; readonly kind: "user"; readonly text: TranscriptText }
+  | { readonly key: ConversationItemKey; readonly kind: "assistant"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
+  | { readonly key: ConversationItemKey; readonly kind: "thinking"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
+  | { readonly key: ConversationItemKey; readonly kind: "tool"; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
+  | { readonly key: ConversationItemKey; readonly kind: "notice"; readonly code: "transport-unavailable" | "projection-unavailable" | "context-compacted" };
+
+/** Atomic, correlation-free input to the read-only child-conversation UI. */
+export interface ConversationSnapshot {
+  readonly revision: ConversationRevision;
+  readonly items: readonly ConversationItem[];
+  readonly truncatedBefore: boolean;
+  readonly availability: "live" | "stopped" | "unavailable";
+  readonly row: AgentRow;
+  readonly routeAvailable: boolean;
+}
+
 export interface ManagedSelectedTranscriptSource extends SelectedTranscriptSource {
   /** Applies the latest index refresh; an absent or unequal route retains the last-known row. */
   update(current: { readonly route: TranscriptRoute; readonly row: AgentRow } | undefined): void;

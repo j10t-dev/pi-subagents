@@ -4,6 +4,8 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   type ExtensionFactory,
+  type KeybindingsManager,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, type EditorComponent, type TUI } from "@earendil-works/pi-tui";
 
@@ -14,6 +16,10 @@ import { parseExtensionLaunchContext, type ExtensionLaunchContext } from "../del
 import { agentId, milliseconds, type AbsolutePath, type AgentId } from "../domain.ts";
 import { createObservationRelay, type ObservationRelay } from "../observation-relay.ts";
 import { AgentWidgetComponent } from "./component.ts";
+import {
+  createChildConversationController,
+  type ChildConversationController,
+} from "./conversation-controller.ts";
 import { clearSelection, emptyModel, replaceRows, type AgentWidgetModel } from "./model.ts";
 import type { AgentWidgetView } from "./render.ts";
 import { createAgentWidgetSource } from "./source.ts";
@@ -51,6 +57,7 @@ export interface AgentWidgetDeps {
   readonly subscribePort?: typeof onObservationPort;
   readonly createRelay?: typeof createObservationRelay;
   readonly createCoalescer?: typeof createCoalescer;
+  readonly createConversationController?: typeof createChildConversationController;
   readonly launchContext?: ExtensionLaunchContext;
   readonly agentDir?: AbsolutePath;
   /** Gate-only observation seam. Production supplies no trace dependency. */
@@ -234,6 +241,9 @@ function startAggregator(
   let widget: AgentWidgetComponent | undefined;
   let editorRef: EditorComponent | undefined;
   let tuiRef: TUI | undefined;
+  let themeRef: Theme | undefined;
+  let keybindingsRef: KeybindingsManager | undefined;
+  let conversationController: ChildConversationController | undefined;
   let installedFactory: EditorFactory | undefined;
   let navigationLost = false;
   let view = emptyView();
@@ -324,6 +334,31 @@ function startAggregator(
     view = { ...view, model: next };
     guard(() => widget?.invalidate());
   };
+  const ensureConversationController = (): void => {
+    if (conversationController !== undefined || tuiRef === undefined || themeRef === undefined || keybindingsRef === undefined) return;
+    conversationController = guard(() => (deps.createConversationController ?? createChildConversationController)({
+      source: () => currentSource,
+      tui: tuiRef!,
+      theme: themeRef!,
+      keybindings: keybindingsRef!,
+      onDiagnostic: report,
+    }));
+  };
+  const closeConversation = (): void => {
+    guard(() => conversationController?.close());
+  };
+  const disposeConversationController = (): boolean => {
+    const pending = conversationController;
+    if (pending === undefined) return true;
+    try {
+      pending.dispose();
+      if (conversationController === pending) conversationController = undefined;
+      return true;
+    } catch {
+      report(WidgetDiagnosticCode.ComponentFailed);
+      return false;
+    }
+  };
   const unmount = (): boolean => {
     view = emptyView();
     if (widgetRegistrationPending) {
@@ -353,12 +388,15 @@ function startAggregator(
     try {
       ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
         tuiRef = tui;
+        themeRef = theme;
+        ensureConversationController();
         widget = new AgentWidgetComponent(
           tui,
           theme,
           currentView,
           applyModel,
           returnFocusToEditor,
+          (ordinal) => conversationController?.open(ordinal),
           forwardShortcut,
           () => report(WidgetDiagnosticCode.ComponentFailed),
         );
@@ -432,6 +470,9 @@ function startAggregator(
   try { previous = ctx.ui.getEditorComponent(); }
   catch { report(WidgetDiagnosticCode.EditorFailed); return () => true; }
   const factory: EditorFactory = (tui, theme, keybindings) => {
+    tuiRef = tui;
+    keybindingsRef = keybindings;
+    ensureConversationController();
     const editor = previous?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
     try {
       const inherited = editor.handleInput.bind(editor);
@@ -473,6 +514,7 @@ function startAggregator(
       generation += 1;
       const mine = generation;
       cancelScheduledRender();
+      closeConversation();
       const rowsReleased = unsubscribeFromRows();
       const sourceReleased = disposeSource();
       const widgetReleased = unmount();
@@ -483,6 +525,7 @@ function startAggregator(
         WidgetDiagnosticCode.SourceFailed,
       );
       currentSource = source;
+      ensureConversationController();
       if (source === undefined) {
         view = { ...view, sourceError: true };
         mount();
@@ -510,11 +553,13 @@ function startAggregator(
       cancelScheduledRender();
     }
     const registryReleased = unsubscribeFromRegistry();
+    const conversationReleased = disposeConversationController();
     const rowsReleased = unsubscribeFromRows();
     const sourceReleased = disposeSource();
     const widgetReleased = unmount();
     const editorRestored = restoreEditor();
     return registryReleased
+      && conversationReleased
       && rowsReleased
       && sourceReleased
       && widgetReleased

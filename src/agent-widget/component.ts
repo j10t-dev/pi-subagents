@@ -13,6 +13,7 @@ import {
   renderWidth,
   terminalRows,
   widgetRowCount,
+  type AgentOrdinal,
   type WidgetRowBudget,
   type WidgetRowCount,
 } from "../domain.ts";
@@ -33,6 +34,7 @@ export class AgentWidgetComponent implements Component, Focusable {
     private readonly view: () => AgentWidgetView,
     private readonly applyModel: (next: AgentWidgetModel) => void,
     private readonly returnFocusToEditor: () => void,
+    private readonly openConversation: (ordinal: AgentOrdinal) => void,
     private readonly forwardShortcut: (data: string) => boolean,
     private readonly reportError: (error: unknown) => void,
   ) {}
@@ -55,8 +57,11 @@ export class AgentWidgetComponent implements Component, Focusable {
       if (matchesKey(data, Key.down)) return this.move(view.model, "down", budget);
       if (matchesKey(data, Key.up)) return this.move(view.model, "up", budget);
       if (matchesKey(data, Key.escape)) return this.exit(view.model);
-      // Everything else, `Enter` included, is offered to the app's shortcut dispatcher and then
-      // dropped. It never reaches the editor buffer, which is what leaving Enter unbound requires.
+      if (matchesKey(data, Key.enter)) {
+        if (view.model.selected !== undefined) this.openConversation(view.model.selected);
+        return;
+      }
+      // Everything else is offered to the app's shortcut dispatcher and then dropped.
       this.forwardShortcut(data);
     }, undefined);
   }

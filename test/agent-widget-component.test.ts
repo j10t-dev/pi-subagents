@@ -117,6 +117,7 @@ function harness(rows: readonly AgentRow[], terminalRows = 40) {
   const tui = createTui(terminal);
   let view: AgentWidgetView = { model: replaceRows(emptyModel(), snapshot(rows)), sourceError: false, navigationLost: false };
   const shortcuts: string[] = [];
+  const opened: string[] = [];
   let returnedFocus = 0;
   const component = new AgentWidgetComponent(
     tui,
@@ -124,12 +125,15 @@ function harness(rows: readonly AgentRow[], terminalRows = 40) {
     () => view,
     (next: AgentWidgetModel) => { view = { ...view, model: next }; },
     () => { returnedFocus += 1; },
+    (ordinal) => { opened.push(String(ordinal)) },
     (data: string) => { shortcuts.push(data); return true; },
     (_error: unknown) => {},
   );
   return {
     component,
     shortcuts,
+    opened,
+    replace: (rows: readonly AgentRow[]) => { view = { ...view, model: replaceRows(view.model, snapshot(rows)) } },
     selected: () => view.model.selected,
     returnedFocus: () => returnedFocus,
     setTerminalRows: (rows: number) => { terminal.setRows(rows); },
@@ -168,12 +172,36 @@ describe("AgentWidgetComponent", () => {
     }
   });
 
-  test("Enter is unbound in this phase and is offered to the shortcut dispatcher", () => {
-    const h = harness([row("A1")]);
+  test("Enter opens only the currently selected ordinal", () => {
+    const h = harness([row("A1"), row("A2")]);
+    h.component.handleInput("\r");
+    expect(h.opened).toEqual([]);
+
     h.component.enterFromEditor();
     h.component.handleInput("\r");
-    expect(h.shortcuts).toEqual(["\r"]);
+    expect(h.opened).toEqual(["A1"]);
+    expect(h.shortcuts).toEqual([]);
     expect(h.selected()).toBe(agentOrdinal("A1"));
+
+    h.replace([]);
+    h.component.handleInput("\r");
+    expect(h.opened).toEqual(["A1"]);
+  });
+
+  test("a throwing conversation opener is reported and contained", () => {
+    const boom = new Error("open boom");
+    const reported: unknown[] = [];
+    const view: AgentWidgetView = {
+      model: selectFirst(replaceRows(emptyModel(), snapshot([row("A1")]))),
+      sourceError: false, navigationLost: false,
+    };
+    const component = new AgentWidgetComponent(
+      createTui(new FakeTerminal(40, 120)), testTheme(), () => view, () => {}, () => {},
+      () => { throw boom }, () => false, (error: unknown) => { reported.push(error) },
+    );
+
+    expect(() => component.handleInput("\r")).not.toThrow();
+    expect(reported).toEqual([boom]);
   });
 
   test("an unhandled key reaches onExtensionShortcut and is then dropped", () => {
@@ -201,7 +229,7 @@ describe("AgentWidgetComponent", () => {
     const reported: unknown[] = [];
     const tui = createTui(new FakeTerminal(40, 120));
     const component = new AgentWidgetComponent(
-      tui, testTheme(), () => { throw boom; }, () => {}, () => {}, () => false,
+      tui, testTheme(), () => { throw boom; }, () => {}, () => {}, () => {}, () => false,
       (error: unknown) => { reported.push(error); },
     );
     expect(component.render(120)).toEqual([]);
@@ -220,7 +248,7 @@ describe("AgentWidgetComponent", () => {
     };
     const tui = createTui(new FakeTerminal(40, 120));
     const component = new AgentWidgetComponent(
-      tui, testTheme(), () => view, () => { throw boom; }, () => {}, () => false,
+      tui, testTheme(), () => view, () => { throw boom; }, () => {}, () => {}, () => false,
       (error: unknown) => { reported.push(error); },
     );
     expect(() => component.enterFromEditor()).not.toThrow();
@@ -236,7 +264,7 @@ describe("AgentWidgetComponent", () => {
     };
     const tui = createTui(new FakeTerminal(40, 120));
     const component = new AgentWidgetComponent(
-      tui, testTheme(), () => view, () => {}, () => { throw boom; }, () => false,
+      tui, testTheme(), () => view, () => {}, () => { throw boom; }, () => {}, () => false,
       (error: unknown) => { reported.push(error); },
     );
     expect(() => component.handleInput(UP)).not.toThrow();
@@ -252,7 +280,7 @@ describe("AgentWidgetComponent", () => {
     };
     const tui = createTui(new FakeTerminal(40, 120));
     const component = new AgentWidgetComponent(
-      tui, testTheme(), () => view, () => {}, () => {}, () => { throw boom; },
+      tui, testTheme(), () => view, () => {}, () => {}, () => {}, () => { throw boom; },
       (error: unknown) => { reported.push(error); },
     );
     expect(() => component.handleInput("x")).not.toThrow();
@@ -265,7 +293,7 @@ describe("AgentWidgetComponent", () => {
     const tui = createTui(new FakeTerminal(40, 120));
     tui.requestRender = () => { throw boom; };
     const component = new AgentWidgetComponent(
-      tui, testTheme(), () => { throw new Error("unused"); }, () => {}, () => {}, () => false,
+      tui, testTheme(), () => { throw new Error("unused"); }, () => {}, () => {}, () => {}, () => false,
       (error: unknown) => { reported.push(error); },
     );
     expect(() => component.invalidate()).not.toThrow();
@@ -277,7 +305,7 @@ describe("AgentWidgetComponent", () => {
     let reportedError: unknown;
     const tui = createTui(new FakeTerminal(40, 120));
     const component = new AgentWidgetComponent(
-      tui, testTheme(), () => { throw boom; }, () => {}, () => {}, () => false,
+      tui, testTheme(), () => { throw boom; }, () => {}, () => {}, () => {}, () => false,
       (error: unknown) => {
         reportedError = error;
         throw new Error("report boom");
