@@ -1654,6 +1654,46 @@ describe("parent lifecycle wiring", () => {
     expect(sent).toEqual([]);
   });
 
+  test("shutdown waits for an in-flight settlement send before completing", async () => {
+    let busy = true;
+    const releaseSend = deferred<void>();
+    const enteredSend = deferred<void>();
+    const sent: string[] = [];
+    let shutdownCompleted = false;
+    const controller = new SubagentController({
+      composition: {
+        prepareSpawn: async () => { throw new Error("unused"); },
+        prepareSend: async () => { throw new Error("unused"); },
+        shutdownComplete: async () => { shutdownCompleted = true; },
+      },
+      parent: {
+        isBusy: () => busy,
+        sendMessage: async (text) => {
+          sent.push(text);
+          enteredSend.resolve();
+          await releaseSend.promise;
+        },
+      },
+    });
+
+    await controller.publish(completion("deadbeef"));
+    busy = false;
+    const settling = controller.parentSettled();
+    await enteredSend.promise;
+    const shuttingDown = controller.shutdown();
+    const suppressedSettlement = controller.parentSettled();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(shutdownCompleted).toBeFalse();
+
+    releaseSend.resolve();
+    await Promise.all([settling, shuttingDown, suppressedSettlement]);
+    expect(shutdownCompleted).toBeTrue();
+    await controller.parentSettled();
+    expect(sent).toHaveLength(1);
+  });
+
   test("restoration sends no message and leaves the completion collectable", async () => {
     const sent: Array<{ text: string; options: object }> = [];
     const controller = new SubagentController({

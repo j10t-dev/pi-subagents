@@ -515,6 +515,7 @@ export class SubagentController {
     }
     const admitted = [...this.operations].map((operation) => operation.done);
     const operation = (async () => {
+      await this.notificationMutex.runExclusive(() => {});
       await Promise.allSettled(admitted);
       const active = this.runs.snapshots().filter((record) => record.state !== AgentState.Stopped);
       const outcomes = await Promise.all(active.map(async (record) => {
