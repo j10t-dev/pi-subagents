@@ -55,6 +55,28 @@ export type TranscriptRevision = Brand<number, "TranscriptRevision">;
 export type ConversationRevision = Brand<number, "ConversationRevision">;
 /** An opaque key derived only from one presentation revision and local item order. */
 export type ConversationItemKey = Brand<string, "ConversationItemKey">;
+/** A JSON value that has been structurally narrowed; no `any`, no cycles, no functions. */
+export type ReadonlyJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly ReadonlyJsonValue[]
+  | { readonly [key: string]: ReadonlyJsonValue };
+/** JSON admitted by one transcript source under depth, node, string and byte limits. */
+export type BoundedTranscriptJson = Brand<ReadonlyJsonValue, "BoundedTranscriptJson">;
+/** Bounded JSON additionally proved free of every merged sensitive value. */
+export type SafePresentationJson = Brand<ReadonlyJsonValue, "SafePresentationJson">;
+/** One source-local assistant message group; never a native entry ID. */
+export type TranscriptAssistantGroup = Brand<number, "TranscriptAssistantGroup">;
+/** A synthetic revision-local presentation turn key. */
+export type ConversationTurnKey = Brand<string, "ConversationTurnKey">;
+/** A synthetic revision-local presentation tool-call key. */
+export type ConversationCallKey = Brand<string, "ConversationCallKey">;
+/** A validated child working directory admitted only for local built-in tool rendering. */
+export type PresentationCwd = AbsolutePath & Brand<string, "PresentationCwd">;
+/** The public Pi stop reasons this projection reproduces. */
+export type ConversationStopReason = "stop" | "length" | "toolUse" | "aborted" | "error";
 /** A bounded count of laid-out transcript text-cell rows. */
 export type VisualLineCount = Brand<number, "VisualLineCount">;
 /** A bounded tail-relative transcript text-cell row offset. */
@@ -374,6 +396,33 @@ export function conversationRevision(value: number): ConversationRevision {
 export function conversationItemKey(revision: ConversationRevision, index: number): ConversationItemKey {
   requireNonnegativeSafeInteger(index, "conversation item index");
   return `conversation-${revision}-${index}` as ConversationItemKey;
+}
+export function transcriptAssistantGroup(value: number): TranscriptAssistantGroup {
+  requireNonnegativeSafeInteger(value, "transcript assistant group");
+  return value as TranscriptAssistantGroup;
+}
+
+export function conversationTurnKey(revision: ConversationRevision, index: number): ConversationTurnKey {
+  requireNonnegativeSafeInteger(index, "conversation turn index");
+  return `t:${Number(revision)}:${index}` as ConversationTurnKey;
+}
+
+export function conversationCallKey(
+  revision: ConversationRevision,
+  turnIndex: number,
+  blockIndex: number,
+): ConversationCallKey {
+  requireNonnegativeSafeInteger(turnIndex, "conversation turn index");
+  requireNonnegativeSafeInteger(blockIndex, "conversation block index");
+  return `c:${Number(revision)}:${turnIndex}:${blockIndex}` as ConversationCallKey;
+}
+
+/** Admits a child working directory for local rendering only; it is never route identity. */
+export function tryPresentationCwd(value: string): PresentationCwd | undefined {
+  if (!isAbsolute(value)) return undefined;
+  if (new TextEncoder().encode(value).byteLength > 4_096) return undefined;
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(value)) return undefined;
+  return value as PresentationCwd;
 }
 export function visualLineCount(value: number): VisualLineCount {
   return normalisedBoundedInteger(value, 4_096) as VisualLineCount;

@@ -13,12 +13,26 @@ import {
   sessionEntryId,
   uiRequestId,
 } from "./domain.ts";
-import type { AgentId, Milliseconds, SessionEntryId, ThinkingLevel, UIRequestId, Usage } from "./domain.ts";
+import type {
+  AgentId,
+  BoundedTranscriptJson,
+  Milliseconds,
+  ReadonlyJsonValue,
+  SafePresentationJson,
+  SessionEntryId,
+  ThinkingLevel,
+  UIRequestId,
+  Usage,
+} from "./domain.ts";
 import {
   MAX_COMPLETION_OUTPUT_BYTES,
   MAX_ERROR_MESSAGE_BYTES,
   MAX_MAX_DEPTH,
   MAX_TRANSCRIPT_SOURCE_ITEMS,
+  MAX_TOOL_JSON_BYTES,
+  MAX_TOOL_JSON_DEPTH,
+  MAX_TOOL_JSON_NODES,
+  MAX_TOOL_JSON_STRING_BYTES,
 } from "./constants.ts";
 
 type LiteralSchemas<T extends readonly string[]> = {
@@ -587,4 +601,131 @@ function decodeTranscriptSessionContent(value: unknown): TranscriptSessionConten
   if (Value.Check(ThinkingContentSchema, value)) return { kind: "thinking", text: value.thinking };
   if (Value.Check(ToolCallContentSchema, value)) return { kind: "tool-call", callId: value.id, tool: value.name };
   return { kind: "ignored" };
+}
+
+const JSON_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u202a-\u202e\u2066-\u2069]/u;
+
+/**
+ * Narrows an external tool argument or details value into bounded, frozen, cycle-free JSON.
+ *
+ * Admission is total: a value that breaches any limit is rejected whole, because a partially
+ * rewritten value could present an invalid shape to a Pi built-in renderer.
+ */
+export function admitBoundedTranscriptJson(value: unknown): BoundedTranscriptJson | undefined {
+  try {
+    const budget = { nodes: 0, bytes: 0 };
+    const seen = new Set<object>();
+    const admitted = admitJsonValue(value, 0, budget, seen);
+    if (admitted === undefined) return undefined;
+    const serialised = JSON.stringify(admitted.value);
+    if (serialised === undefined || new TextEncoder().encode(serialised).byteLength > MAX_TOOL_JSON_BYTES) {
+      return undefined;
+    }
+    return admitted.value as BoundedTranscriptJson;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Proves bounded JSON contains no merged sensitive value in any object key or string value.
+ * A single occurrence rejects the whole value; nothing is redacted in place.
+ */
+export function admitSafePresentationJson(
+  value: BoundedTranscriptJson,
+  sensitive: ReadonlySet<string>,
+): SafePresentationJson | undefined {
+  if (sensitive.size === 0) return value as ReadonlyJsonValue as SafePresentationJson;
+  return containsSensitive(value, sensitive) ? undefined : (value as ReadonlyJsonValue as SafePresentationJson);
+}
+
+interface AdmittedJson { readonly value: ReadonlyJsonValue }
+
+function admitJsonValue(
+  value: unknown,
+  depth: number,
+  budget: { nodes: number; bytes: number },
+  seen: Set<object>,
+): AdmittedJson | undefined {
+  if (depth > MAX_TOOL_JSON_DEPTH) return undefined;
+  budget.nodes += 1;
+  if (budget.nodes > MAX_TOOL_JSON_NODES) return undefined;
+  if (value === null || typeof value === "boolean") {
+    budget.bytes += 5;
+    return budget.bytes > MAX_TOOL_JSON_BYTES ? undefined : { value };
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return undefined;
+    budget.bytes += String(value).length;
+    return budget.bytes > MAX_TOOL_JSON_BYTES ? undefined : { value };
+  }
+  if (typeof value === "string") return admitJsonString(value, budget);
+  if (Array.isArray(value)) {
+    if (!hasOnlyJsonOwnProperties(value, true)) return undefined;
+    if (seen.has(value)) return undefined;
+    seen.add(value);
+    const items: ReadonlyJsonValue[] = [];
+    for (const item of value) {
+      const admitted = admitJsonValue(item, depth + 1, budget, seen);
+      if (admitted === undefined) return undefined;
+      items.push(admitted.value);
+    }
+    seen.delete(value);
+    return { value: Object.freeze(items) };
+  }
+  if (typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    if (!hasOnlyJsonOwnProperties(source, false)) return undefined;
+    if (seen.has(source)) return undefined;
+    seen.add(source);
+    const result: Record<string, ReadonlyJsonValue> = {};
+    for (const key of Object.keys(source)) {
+      const admittedKey = admitJsonString(key, budget);
+      if (admittedKey === undefined) return undefined;
+      const admitted = admitJsonValue(source[key], depth + 1, budget, seen);
+      if (admitted === undefined) return undefined;
+      result[key] = admitted.value;
+    }
+    seen.delete(source);
+    return { value: Object.freeze(result) };
+  }
+  // `undefined`, functions and symbols have no JSON presentation.
+  return undefined;
+}
+
+function hasOnlyJsonOwnProperties(value: object, array: boolean): boolean {
+  if (!array) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+  }
+  for (const key of Reflect.ownKeys(value)) {
+    if (array && key === "length") continue;
+    if (typeof key !== "string") return false;
+    if (array && !/^(?:0|[1-9][0-9]*)$/u.test(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) return false;
+  }
+  return true;
+}
+
+function admitJsonString(value: string, budget: { nodes: number; bytes: number }): AdmittedJson | undefined {
+  if (JSON_CONTROL_PATTERN.test(value)) return undefined;
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes > MAX_TOOL_JSON_STRING_BYTES) return undefined;
+  budget.bytes += bytes;
+  return budget.bytes > MAX_TOOL_JSON_BYTES ? undefined : { value };
+}
+
+function containsSensitive(value: ReadonlyJsonValue, sensitive: ReadonlySet<string>): boolean {
+  if (typeof value === "string") return [...sensitive].some((item) => item.length > 0 && value.includes(item));
+  if (Array.isArray(value)) return value.some((item) => containsSensitive(item, sensitive));
+  if (typeof value === "object" && value !== null) {
+    const record = value as { readonly [key: string]: ReadonlyJsonValue };
+    return Object.keys(record).some(
+      (key) =>
+        [...sensitive].some((item) => item.length > 0 && key.includes(item))
+        || containsSensitive(record[key]!, sensitive),
+    );
+  }
+  return false;
 }

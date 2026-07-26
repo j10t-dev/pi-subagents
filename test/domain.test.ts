@@ -24,6 +24,11 @@ import {
   rpcToolCallId,
   transcriptRevision,
   transcriptSequence,
+  conversationRevision,
+  conversationTurnKey,
+  conversationCallKey,
+  transcriptAssistantGroup,
+  tryPresentationCwd,
   agentId,
   assertTransition,
   createRpcRequestId,
@@ -85,6 +90,7 @@ import {
   type AgentCount,
   type IncarnationId,
   type TranscriptFileName,
+  type PresentationCwd,
 } from "../src/domain.ts";
 import { absolutePath, diagnosticsPath, outputPath, sessionPath } from "../src/paths.ts";
 import {
@@ -193,6 +199,37 @@ void _processCountAsCapacity;
 void _offsetAsBytes;
 void MAXIMUM_WIDGET_ROWS;
 void _widgetRowsAsAgents;
+
+describe("presentation brands", () => {
+  test("assistant group rejects a negative or fractional value", () => {
+    expect(() => transcriptAssistantGroup(-1)).toThrow("invalid_input");
+    expect(() => transcriptAssistantGroup(1.5)).toThrow("invalid_input");
+    expect(Number(transcriptAssistantGroup(3))).toBe(3);
+  });
+
+  test("turn and call keys are revision-local, decimal and free of native identity", () => {
+    const revision = conversationRevision(7);
+    expect(String(conversationTurnKey(revision, 2))).toBe("t:7:2");
+    expect(String(conversationCallKey(revision, 2, 5))).toBe("c:7:2:5");
+  });
+
+  test("call keys are unique per block within one revision", () => {
+    const revision = conversationRevision(1);
+    const keys = new Set([
+      String(conversationCallKey(revision, 0, 0)),
+      String(conversationCallKey(revision, 0, 1)),
+      String(conversationCallKey(revision, 1, 0)),
+    ]);
+    expect(keys.size).toBe(3);
+  });
+
+  test("presentation cwd admits only absolute, control-free, bounded paths", () => {
+    expect(tryPresentationCwd("/home/child/project")).toBe("/home/child/project" as PresentationCwd);
+    expect(tryPresentationCwd("relative/path")).toBeUndefined();
+    expect(tryPresentationCwd("/home/child\u0007/project")).toBeUndefined();
+    expect(tryPresentationCwd(`/${"a".repeat(4_096)}`)).toBeUndefined();
+  });
+});
 
 describe("correlation identities", () => {
   test("constructs non-empty RPC and UI identities", () => {

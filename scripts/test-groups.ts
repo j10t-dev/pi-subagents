@@ -39,6 +39,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "settings.test.ts",
     "support-barriers.test.ts",
     "test-runner.test.ts",
+    "transcript-presentation.test.ts",
   ]),
   transport: new Set([
     "agent-widget-gate.test.ts",

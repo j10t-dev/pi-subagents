@@ -72,6 +72,13 @@ export const MAX_TRANSCRIPT_SOURCE_ITEMS = 256;
 export const MAX_TRANSCRIPT_SOURCE_BYTES = 256 * 1024;
 /** Wrapped lines one conversation view may lay out before older items are dropped. */
 export const MAX_CONVERSATION_LAYOUT_LINES = 4_096;
+/** Bounds on one tool's rich JSON arguments or structured result details. */
+export const MAX_TOOL_JSON_DEPTH = 8;
+export const MAX_TOOL_JSON_NODES = 512;
+export const MAX_TOOL_JSON_STRING_BYTES = 4 * 1024;
+export const MAX_TOOL_JSON_BYTES = 16 * 1024;
+/** Bounds on the bounded text blocks retained for one tool result. */
+export const MAX_TOOL_RESULT_BLOCKS = 8;
 export const MAX_TRANSCRIPT_STORE_ITEMS = 1_024;
 export const MAX_TRANSCRIPT_STORE_BYTES = 1_024 * 1024;
 
