@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 
-import { AgentState, truncateUtf8, utf8Bytes } from "../src/domain.ts";
+import { agentCount, AgentState, truncateUtf8, utf8Bytes } from "../src/domain.ts";
 import { CompletionService, completionKey, type AgentSummary } from "../src/completion-service.ts";
 import type { AgentCompletion, AgentRunKey } from "../src/domain.ts";
 import {
@@ -324,6 +324,109 @@ describe("CompletionService back-ping notification", () => {
 
     const result = await service.publish(completion({ agentId: OTHER_AGENT }));
     expect(result.shouldNotify).toBe(true);
+  });
+});
+
+describe("CompletionService notification epochs", () => {
+  test("creates one notification candidate for an eligible non-empty queue epoch", async () => {
+    const service = new CompletionService();
+    const first = completion();
+    await service.publish(first);
+    expect(await service.readyNotification()).toEqual({
+      epoch: completionKey(first),
+      readyCount: agentCount(1),
+    });
+
+    await service.publish(completion({ agentId: OTHER_AGENT }));
+    expect(await service.readyNotification()).toEqual({
+      epoch: completionKey(first),
+      readyCount: agentCount(2),
+    });
+  });
+
+  test("does not create a candidate when a blocked receiver receives publication", async () => {
+    const service = new CompletionService();
+    service.upsertAgent(running());
+    const waiting = service.awaitReady();
+
+    await service.publish(completion());
+    await waiting;
+
+    expect(await service.readyNotification()).toBeUndefined();
+  });
+
+  test("cancels the notification epoch after a partial drain", async () => {
+    const service = new CompletionService();
+    await service.publish(completion());
+    await service.publish(completion({ agentId: OTHER_AGENT }));
+
+    const first = await service.awaitReady();
+    expect(Number(first.remainingCompletions)).toBe(1);
+    expect(await service.readyNotification()).toBeUndefined();
+  });
+
+  test("matching acknowledgement clears the current candidate", async () => {
+    const service = new CompletionService();
+    await service.publish(completion());
+    const candidate = await service.readyNotification();
+    if (candidate === undefined) throw new Error("expected notification candidate");
+
+    await service.acknowledgeReadyNotification(candidate.epoch);
+
+    expect(await service.readyNotification()).toBeUndefined();
+  });
+
+  test("a stale acknowledgement cannot clear a newer notification epoch", async () => {
+    const service = new CompletionService();
+    await service.publish(completion());
+    const epochA = (await service.readyNotification())!.epoch;
+    await service.awaitReady();
+    const newer = completion({ agentId: OTHER_AGENT, runId: testRunId("cafebabe") });
+    await service.publish(newer);
+
+    await service.acknowledgeReadyNotification(epochA);
+
+    expect(await service.readyNotification()).toEqual({
+      epoch: completionKey(newer),
+      readyCount: agentCount(1),
+    });
+  });
+
+  test("a drain starts a distinct notification epoch for the next publication", async () => {
+    const service = new CompletionService();
+    const first = completion();
+    await service.publish(first);
+    const epochA = (await service.readyNotification())!.epoch;
+    await service.awaitReady();
+    const second = completion({ agentId: OTHER_AGENT });
+    await service.publish(second);
+
+    expect((await service.readyNotification())!.epoch).not.toBe(epochA);
+    expect((await service.readyNotification())!.epoch).toBe(completionKey(second));
+  });
+
+  test("duplicate publication does not change the current notification candidate", async () => {
+    const service = new CompletionService();
+    const first = completion();
+    await service.publish(first);
+    const candidate = await service.readyNotification();
+    await service.publish(first);
+
+    expect(await service.readyNotification()).toEqual(candidate);
+  });
+
+  test("restore preserves queued completion without creating a notification candidate", async () => {
+    const service = new CompletionService();
+    const restored = completion();
+    service.restore([{
+      agentId: restored.agentId,
+      state: AgentState.Stopped,
+      sessionPath: restored.transcriptPath,
+      latestCompletion: restored,
+    }]);
+
+    expect(await service.readyNotification()).toBeUndefined();
+    expect((await service.awaitReady()).completion).toMatchObject({ agentId: restored.agentId, runId: restored.runId });
   });
 });
 

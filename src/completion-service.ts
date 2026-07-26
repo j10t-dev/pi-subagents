@@ -53,6 +53,11 @@ export interface PublishResult {
   queueSize: number;
 }
 
+export interface ReadyNotificationCandidate {
+  readonly epoch: AgentRunKey;
+  readonly readyCount: AgentCount;
+}
+
 /** Stable DTO consumed by `restore()` and populated by the planner adapter. */
 export interface RestorableAgent {
   agentId: AgentId;
@@ -78,6 +83,7 @@ export class CompletionService {
   private readonly publishedRuns = new Set<AgentRunKey>();
   private readonly agents = new Map<AgentId, AgentSummary>();
   private waitingReceiver: CompletionWaiter | undefined;
+  private notificationEpoch: AgentRunKey | undefined;
   private notifiedSinceEmpty = false;
   private liveOperationsStarted = false;
 
@@ -117,10 +123,23 @@ export class CompletionService {
       }
 
       if (wasEmpty && !this.notifiedSinceEmpty) {
+        this.notificationEpoch = key;
         this.notifiedSinceEmpty = true;
         return { shouldNotify: true, queueSize: this.queue.length };
       }
       return { shouldNotify: false, queueSize: this.queue.length };
+    });
+  }
+
+  async readyNotification(): Promise<ReadyNotificationCandidate | undefined> {
+    return this.mutex.runExclusive(() => this.notificationEpoch === undefined
+      ? undefined
+      : { epoch: this.notificationEpoch, readyCount: agentCount(this.queue.length) });
+  }
+
+  async acknowledgeReadyNotification(epoch: AgentRunKey): Promise<void> {
+    await this.mutex.runExclusive(() => {
+      if (this.notificationEpoch === epoch) this.notificationEpoch = undefined;
     });
   }
 
@@ -278,6 +297,7 @@ export class CompletionService {
   private tryDrainLocked(): AgentCompletion | undefined {
     const completion = this.queue.shift();
     if (completion === undefined) return undefined;
+    this.notificationEpoch = undefined;
     this.notifiedSinceEmpty = false;
     return {
       ...completion,
