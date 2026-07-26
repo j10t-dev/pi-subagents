@@ -22,6 +22,7 @@ import {
   agentOrdinal,
   incarnationId,
   observationRevision,
+  transcriptFileName,
   type AbsolutePath,
   type AgentId,
   type ContextLabel,
@@ -47,6 +48,7 @@ const CHILD_1 = agentId("child-1");
 const ROW = {
   ordinal: agentOrdinal("A1"), sessionId: agentId("grandchild-1"), model: "model:high" as ModelLabel,
   context: "42%" as ContextLabel, taskLabel: "Research terminal UX" as TaskLabel, state: AgentState.Running,
+  transcriptFile: transcriptFileName("child.jsonl"),
 };
 
 let agentDir: AbsolutePath;
@@ -120,6 +122,34 @@ describe("current observation snapshot codec", () => {
     mutate(value);
     writeSnapshot(CHILD_1, value);
     expect(readKnownChildSnapshots(agentDir, [CHILD_1]).skipped.get(CHILD_1)).toBe("malformed");
+  });
+
+  test.each([
+    ["forward separator", "dir/child.jsonl"],
+    ["backward separator", "dir\\child.jsonl"],
+    ["control character", "bad\u0000.jsonl"],
+    ["parent traversal", "../child.jsonl"],
+    ["256-byte name", `${"x".repeat(250)}.jsonl`],
+    ["wrong suffix", "child.txt"],
+    ["non-string locator", 42],
+  ] as const)("omits an unsafe %s locator and degrades the decoded snapshot", (_name, locator) => {
+    const value = raw(snapshot());
+    (value.agents as Array<Record<string, unknown>>)[0]!.transcriptFile = locator;
+    writeSnapshot(CHILD_1, value);
+
+    const decoded = readKnownChildSnapshots(agentDir, [CHILD_1]).snapshots.get(CHILD_1);
+    expect(decoded?.agents).toHaveLength(1);
+    expect(decoded?.agents[0]).toMatchObject({ ordinal: ROW.ordinal, sessionId: ROW.sessionId, state: ROW.state });
+    expect(decoded?.agents[0]?.transcriptFile).toBeUndefined();
+    expect(decoded?.degraded).toBe(true);
+    expect(JSON.stringify(decoded)).not.toContain("/state/owner/sessions");
+  });
+
+  test("round-trips a valid locator without degrading the snapshot", () => {
+    writeSnapshot(CHILD_1, snapshot());
+    const decoded = readKnownChildSnapshots(agentDir, [CHILD_1]).snapshots.get(CHILD_1);
+    expect(decoded?.agents[0]).toMatchObject({ transcriptFile: transcriptFileName("child.jsonl") });
+    expect(decoded?.degraded).toBe(false);
   });
 
   test("reports a snapshot whose declared session ID does not match its slot", () => {

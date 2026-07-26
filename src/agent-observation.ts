@@ -26,6 +26,7 @@ import {
   type RpcStopReason,
   type RpcToolCallId,
   type Usage,
+  type TranscriptFileName,
   type TranscriptRevision,
   type TranscriptSequence,
   type TranscriptText,
@@ -56,7 +57,7 @@ export interface AgentObservation {
 }
 export type ObservationHealthCode = "projection-failed" | "reconciliation-failed";
 export type ObservationHealth = { readonly kind: "healthy" } | { readonly kind: "degraded"; readonly codes: readonly ObservationHealthCode[] };
-export interface DirectAgentProjection { readonly agentId: AgentId; readonly observation: AgentObservation; readonly row: AgentRow }
+export interface DirectAgentProjection { readonly agentId: AgentId; readonly observation: AgentObservation; readonly row: AgentRow; readonly transcriptFile?: TranscriptFileName }
 export type DirectAgentSnapshotResult =
   | { readonly kind: "snapshot"; readonly revision: AgentObservationRevision; readonly health: ObservationHealth; readonly total: AgentCount; readonly omitted: AgentCount; readonly omittedActive: AgentCount; readonly entries: readonly DirectAgentProjection[] }
   | { readonly kind: "unavailable"; readonly finalRevision: AgentObservationRevision };

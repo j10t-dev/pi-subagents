@@ -17,7 +17,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawn as spawnProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -46,10 +46,11 @@ import {
   delegationDepth,
   milliseconds,
   runCapacity,
+  transcriptFileName,
   type AgentId,
   type RunId,
 } from "../src/domain.ts";
-import { readKnownChildSnapshots, type ObservationSnapshot } from "../src/observation-snapshot-path.ts";
+import { observationSnapshotPath, readKnownChildSnapshots, type ObservationSnapshot } from "../src/observation-snapshot-path.ts";
 import { absolutePath } from "../src/paths.ts";
 import { createRecursiveAgentIndex, type RecursiveAgentIndex } from "../src/recursive-agent-index.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";
@@ -735,6 +736,7 @@ describe("deterministic network-free real-Pi matrix", () => {
         expect(livePids).toHaveLength(2);
         expect(livePids.every((pid) => !processAbsent(pid))).toBeTrue();
 
+        const childTranscriptFile = transcriptFileName(basename(findChildTranscript(agentDir, childId)));
         const rootObservation: AgentObservation = {
           agentId: childId,
           ordinal: agentOrdinal("A1"),
@@ -764,17 +766,40 @@ describe("deterministic network-free real-Pi matrix", () => {
               agentId: childId,
               observation: rootObservation,
               row: directAgentRow(rootObservation),
+              transcriptFile: childTranscriptFile,
             }],
           }),
           transcriptSource: () => undefined,
           subscribe: () => () => {},
         };
+        const rootSessionFile = (await client.getState()).sessionFile;
+        expect(rootSessionFile).toBeString();
+        const rootSessionId = agentId(SessionManager.open(rootSessionFile!).getSessionId());
         index = createRecursiveAgentIndex(rootPort, {
           agentDir: absolutePath(agentDir),
+          rootSessionId,
           maxRows: MAX_WIDGET_ROWS,
           onChange: () => {},
         });
         index.refresh();
+
+        expect(index.transcriptRoute(agentOrdinal("A1"))).toEqual({
+          ownerSessionId: rootSessionId,
+          childSessionId: childId,
+          fileName: childTranscriptFile,
+          direct: true,
+        });
+        expect(index.transcriptRoute(agentOrdinal("A1.1"))).toEqual({
+          ownerSessionId: childId,
+          childSessionId: grandchildId,
+          fileName: transcriptFileName(basename(findChildTranscript(agentDir, grandchildId))),
+          direct: false,
+        });
+
+        const publishedText = readFileSync(observationSnapshotPath(absolutePath(agentDir), childId), "utf8");
+        expect(publishedText).toContain("transcriptFile");
+        expect(publishedText).not.toContain(dirname(findChildTranscript(agentDir, grandchildId)));
+        expect(publishedText).not.toContain("NESTED_RELAY_HOLD");
 
         expect(index.snapshot().rows.map((row) => String(row.ordinal))).toEqual(["A1", "A1.1"]);
         expect(index.snapshot().degraded).toBe(false);

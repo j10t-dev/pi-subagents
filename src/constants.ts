@@ -8,7 +8,7 @@ import {
   utf8Bytes,
 } from "./domain.ts";
 
-export { MAX_ERROR_MESSAGE_BYTES } from "./domain.ts";
+export { MAX_ERROR_MESSAGE_BYTES, MAX_TRANSCRIPT_FILE_NAME_BYTES } from "./domain.ts";
 
 /** Schema version stamped on newly persisted lifecycle event envelopes. */
 export const CURRENT_EVENT_SCHEMA_VERSION = 2;

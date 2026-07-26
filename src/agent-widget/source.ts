@@ -10,12 +10,14 @@ import {
   MAX_WATCH_RETRY_INTERVAL_MS,
   WATCH_FALLBACK_INTERVAL_MS,
 } from "../constants.ts";
-import type { AgentCount, AgentOrdinal, AbsolutePath } from "../domain.ts";
+import type { AgentCount, AgentId, AgentOrdinal, AbsolutePath } from "../domain.ts";
 import { createRecursiveAgentIndex } from "../recursive-agent-index.ts";
 import { createSnapshotWatcher } from "../snapshot-watcher.ts";
 
 export interface AgentWidgetSourceDeps {
   readonly agentDir: AbsolutePath;
+  /** Identity of the session owning the direct rows, injected by the aggregator. */
+  readonly rootSessionId: AgentId;
   readonly maxRows: AgentCount;
   /** Receives bounded index and watcher diagnostic codes; the adapters are contained. */
   readonly onDiagnostic?: (code: string) => void;
@@ -34,6 +36,7 @@ export function createAgentWidgetSource(
 
   const index = createRecursiveAgentIndex(port, {
     agentDir: deps.agentDir,
+    rootSessionId: deps.rootSessionId,
     maxRows: deps.maxRows,
     onChange: () => {
       current = index.snapshot();
@@ -65,8 +68,10 @@ export function createAgentWidgetSource(
   return {
     snapshot: (): AgentWidgetSnapshot => current,
     transcriptSource: (ordinal: AgentOrdinal): TranscriptSource | undefined => {
-      const owner = index.ownerOf(ordinal);
-      return owner === undefined ? undefined : port.transcriptSource(owner);
+      // Only a direct child's transcript is served by the local observation port; a nested route
+      // names a descendant this session does not observe.
+      const route = index.transcriptRoute(ordinal);
+      return route === undefined || !route.direct ? undefined : port.transcriptSource(route.childSessionId);
     },
     subscribe: (onChange: () => void): (() => void) => {
       listeners.add(onChange);

@@ -17,7 +17,7 @@ import { setAmbientStatus, onAmbientStatus } from "../src/ambient-status-lease.t
 import {
   AgentState, agentCount, agentDepth, agentId, agentObservationRevision, agentOrdinal, agentWidgetRevision,
   contextPercent, directAgentOrdinal, modelSpec, observationRevision,
-  type ContextLabel, type ModelLabel, type TaskLabel,
+  type AgentId, type ContextLabel, type ModelLabel, type TaskLabel,
 } from "../src/domain.ts";
 import { extensionApiForTest, lifecycleOn, type ExtensionApiPort, type LifecycleHandler } from "./support/extension-api.ts";
 import { awaitAgentSchema, sendInputSchema, spawnAgentSchema, stopAgentSchema } from "../src/tools.ts";
@@ -121,6 +121,7 @@ function harness(options: {
       if (options.modeThrows) throw new Error("mode boom");
       return options.mode ?? "tui";
     },
+    sessionManager: { getSessionId: () => "aggregator-session" },
     ui: {
       setWidget: (key: string, content: WidgetFactory | undefined) => {
         const removing = content === undefined;
@@ -160,7 +161,9 @@ function harness(options: {
   const handlers = new Map<string, Handler>();
   const pi = { on: (name: string, handler: Handler) => { handlers.set(name, handler); } };
   const queue = [...(options.sources ?? [fakeSource()])];
-  const createSource: NonNullable<AgentWidgetDeps["createSource"]> = (_port, onDiagnostic) => {
+  const rootSessionIds: AgentId[] = [];
+  const createSource: NonNullable<AgentWidgetDeps["createSource"]> = (_port, rootSessionId, onDiagnostic) => {
+    rootSessionIds.push(rootSessionId);
     if (options.createSourceThrows) throw new Error("source constructor boom");
     if (options.sourceDiagnostic !== undefined) onDiagnostic(options.sourceDiagnostic);
     return (queue.shift() ?? fakeSource()).source;
@@ -186,7 +189,7 @@ function harness(options: {
   cleanups.push(() => { handlers.get("session_shutdown")?.({}, ctx); });
   const editor = installed?.(tui, {}, {});
   return {
-    widgets, notices, focusCalls, inherited, shortcuts, editor,
+    widgets, notices, focusCalls, inherited, shortcuts, editor, rootSessionIds,
     component: () => component, setEditorText: (value: string) => { editorText = value; },
     replaceEditorFactory: () => { editorFactory = (() => ({ render: () => [], invalidate: () => {}, getText: () => "", setText: () => {}, handleInput: () => {} })) as EditorFactory; },
     lines: () => (component?.render as ((width: number) => string[]) | undefined)?.(120) ?? [],
@@ -451,6 +454,10 @@ describe("mount and unmount", () => {
   });
   test("remounts when agents return, through the same source subscription", () => {
     const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(1)); const subscribers = feed.listenerCount(); feed.emit(snapshotOf(0, 0)); feed.emit(snapshotOf(1)); expect(h.widgets.at(-1)?.content).toBeDefined(); expect(feed.listenerCount()).toBe(subscribers);
+  });
+  test("creates the aggregator source with the branded root session identity", () => {
+    const h = harness(); publish();
+    expect(h.rootSessionIds).toEqual([agentId("aggregator-session")]);
   });
   test("unmounting while a fake selector holds focus performs no setFocus at all", () => {
     const feed = fakeSource(); const h = harness({ sources: [feed] }); publish(); feed.emit(snapshotOf(2)); h.component()!.focused = false; feed.emit(snapshotOf(0, 0)); expect(h.focusCalls).toHaveLength(0);
@@ -873,6 +880,7 @@ interface CompositionContext {
   readonly label: string;
   readonly mode: "tui";
   readonly widgets: string[][];
+  readonly sessionManager: { getSessionId(): string };
   isWidgetMounted(): boolean;
   readonly ui: {
     setWidget(key: string, content: WidgetFactory | undefined, options?: object): void;
@@ -916,6 +924,7 @@ function compositionContext(
     label,
     mode: "tui",
     widgets,
+    sessionManager: { getSessionId: () => `${label}-session` },
     isWidgetMounted: () => widgetMounted,
     ui: {
       setWidget: (_key, content) => {

@@ -94,8 +94,9 @@ class ManagedObservationRelay implements ObservationRelay {
 
   private fit(direct: AvailableDirectSnapshot | "empty", revision: ObservationRevision): ObservationSnapshot | undefined {
     const total = direct === "empty" ? agentCount(0) : direct.total;
-    const all = direct === "empty" ? [] : direct.entries.map(({ agentId, row }) => ({
+    const all = direct === "empty" ? [] : direct.entries.map(({ agentId, row, transcriptFile }) => ({
       ordinal: row.ordinal, sessionId: agentId, model: row.model, context: row.context, taskLabel: row.taskLabel, state: row.state,
+      ...(transcriptFile === undefined ? {} : { transcriptFile }),
     }));
     let retained = all;
     let degraded = direct !== "empty" && (direct.health.kind === "degraded" || Number(direct.omittedActive) > 0);

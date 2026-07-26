@@ -17,6 +17,8 @@ import {
   type AgentDepth,
   type AgentId,
   type AgentOrdinal,
+  type TranscriptFileName,
+  type TranscriptRoute,
 } from "./domain.ts";
 import {
   readKnownChildSnapshots,
@@ -33,12 +35,14 @@ export interface RecursiveAgentIndex {
   setWatcher(watcher: SnapshotWatcher): void;
   refresh(): void;
   snapshot(): AgentWidgetSnapshot;
-  ownerOf(ordinal: AgentOrdinal): AgentId | undefined;
+  transcriptRoute(ordinal: AgentOrdinal): TranscriptRoute | undefined;
   dispose(): void;
 }
 
 export interface RecursiveAgentIndexDependencies {
   readonly agentDir: AbsolutePath;
+  /** Identity of the session owning the direct rows; never inferred from a composed ordinal. */
+  readonly rootSessionId: AgentId;
   readonly maxRows: AgentCount;
   readonly readKnownChildSnapshots?: (
     agentDir: AbsolutePath,
@@ -67,16 +71,19 @@ interface RetainedSlot {
 
 interface TraversalCandidate {
   readonly owner: AgentId;
+  /** Session whose partition holds this candidate's transcript: the root, or the publishing parent. */
+  readonly ownerSessionId: AgentId;
   readonly parent: AdmittedNode | undefined;
   readonly node: AdmittedNode;
   readonly localOrdinal: AgentOrdinal;
   readonly ownerState: AgentDisplayState;
+  readonly transcriptFile: TranscriptFileName | undefined;
 }
 
 class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
   private readonly readSlots: NonNullable<RecursiveAgentIndexDependencies["readKnownChildSnapshots"]>;
   private retained = new Map<AgentId, RetainedSlot>();
-  private owners = new Map<AgentOrdinal, AgentId>();
+  private routes = new Map<AgentOrdinal, TranscriptRoute>();
   private watcher: SnapshotWatcher | undefined;
   private revision = 0;
   private projectionFailureReported = false;
@@ -128,7 +135,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     const ownerQueue: AdmittedNode[] = [];
     const tracked = new Set<AgentId>();
     const seen = new Set<AgentId>();
-    const nextOwners = new Map<AgentOrdinal, AgentId>();
+    const nextRoutes = new Map<AgentOrdinal, TranscriptRoute>();
     const nextRetained = new Map<AgentId, RetainedSlot>();
     const maximumRows = Math.min(Number(this.dependencies.maxRows), Number(MAX_WIDGET_ROWS));
     let admittedCount = 0;
@@ -139,10 +146,12 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     for (const entry of direct.entries) {
       directCandidates.push({
         owner: entry.agentId,
+        ownerSessionId: this.dependencies.rootSessionId,
         parent: undefined,
         node: { sessionId: entry.agentId, row: entry.row, children: [] },
         localOrdinal: entry.row.ordinal,
         ownerState: entry.row.state,
+        transcriptFile: entry.transcriptFile,
       });
     }
     const directAdmission = selectLevelCandidates(directCandidates, maximumRows - admittedCount);
@@ -153,7 +162,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
       ownerQueue,
       seen,
       tracked,
-      nextOwners,
+      nextRoutes,
     );
 
     let levelStart = 0;
@@ -208,7 +217,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
 
         for (const child of selected.agents) {
           if (terminal && !isTerminal(child.state)) degraded = true;
-          const candidate = childCandidate(parent, child, seen);
+          const candidate = childCandidate(parent, selected.sessionId, child, seen);
           if (candidate === undefined) {
             degraded = true;
             continue;
@@ -224,7 +233,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
         ownerQueue,
         seen,
         tracked,
-        nextOwners,
+        nextRoutes,
       );
       if (admittedCount >= maximumRows && ownerQueue.length > levelEnd) {
         preserveRetainedUnprocessedOwners(this.retained, nextRetained, ownerQueue, levelEnd);
@@ -242,7 +251,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     }
     const omitted = agentCount(total - rows.length);
     this.retained = nextRetained;
-    this.owners = nextOwners;
+    this.routes = nextRoutes;
     try {
       this.watcher?.track([...tracked]);
     } catch {
@@ -262,15 +271,15 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     return this.current;
   }
 
-  ownerOf(ordinal: AgentOrdinal): AgentId | undefined {
-    return this.owners.get(ordinal);
+  transcriptRoute(ordinal: AgentOrdinal): TranscriptRoute | undefined {
+    return this.routes.get(ordinal);
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.retained.clear();
-    this.owners.clear();
+    this.routes.clear();
     const watcher = this.watcher;
     this.watcher = undefined;
     if (watcher !== undefined) this.disposeWatcher(watcher);
@@ -330,7 +339,7 @@ function admitCandidates(
   ownerQueue: AdmittedNode[],
   seen: Set<AgentId>,
   tracked: Set<AgentId>,
-  nextOwners: Map<AgentOrdinal, AgentId>,
+  nextRoutes: Map<AgentOrdinal, TranscriptRoute>,
 ): number {
   for (const candidate of candidates) {
     seen.add(candidate.owner);
@@ -338,13 +347,16 @@ function admitCandidates(
     if (!isTerminal(candidate.ownerState)) tracked.add(candidate.owner);
   }
   for (const candidate of [...candidates].sort(compareCandidatesByLocalOrdinal)) {
-    if (candidate.parent === undefined) {
-      roots.push(candidate.node);
-      if (!nextOwners.has(candidate.node.row.ordinal)) {
-        nextOwners.set(candidate.node.row.ordinal, candidate.owner);
-      }
-    } else {
-      candidate.parent.children.push(candidate.node);
+    if (candidate.parent === undefined) roots.push(candidate.node);
+    else candidate.parent.children.push(candidate.node);
+    const route = candidate.transcriptFile === undefined ? undefined : Object.freeze({
+      ownerSessionId: candidate.ownerSessionId,
+      childSessionId: candidate.node.sessionId,
+      fileName: candidate.transcriptFile,
+      direct: candidate.parent === undefined,
+    });
+    if (route !== undefined && !nextRoutes.has(candidate.node.row.ordinal)) {
+      nextRoutes.set(candidate.node.row.ordinal, route);
     }
   }
   return candidates.length;
@@ -352,6 +364,7 @@ function admitCandidates(
 
 function childCandidate(
   parent: AdmittedNode,
+  ownerSessionId: AgentId,
   child: ObservationRow,
   seen: ReadonlySet<AgentId>,
 ): TraversalCandidate | undefined {
@@ -361,6 +374,7 @@ function childCandidate(
   if (ordinal === undefined) return undefined;
   return {
     owner: child.sessionId,
+    ownerSessionId,
     parent,
     node: {
       sessionId: child.sessionId,
@@ -376,6 +390,7 @@ function childCandidate(
     },
     localOrdinal: child.ordinal,
     ownerState: child.state,
+    transcriptFile: child.transcriptFile,
   };
 }
 

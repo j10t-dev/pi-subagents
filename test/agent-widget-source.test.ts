@@ -29,6 +29,7 @@ import {
 import { testAbsolutePath, testSessionPath } from "./support/brands.ts";
 
 const AGENT_DIR = testAbsolutePath(mkdtempSync(join(tmpdir(), "agent-widget-source-")));
+const ROOT_SESSION = agentId("root-session");
 const waitForIndexRefresh = () => Bun.sleep(Number(INDEX_REFRESH_WINDOW_MS) + 40);
 
 afterEach(() => {
@@ -81,7 +82,7 @@ function register(store: AgentObservationStore, name: string, position: number, 
 }
 
 function sourceOver(store: AgentObservationStore, maxRows = MAX_WIDGET_ROWS) {
-  return createAgentWidgetSource(store as SubagentObservationPort, { agentDir: AGENT_DIR, maxRows });
+  return createAgentWidgetSource(store as SubagentObservationPort, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows });
 }
 
 describe("createAgentWidgetSource", () => {
@@ -141,6 +142,26 @@ describe("createAgentWidgetSource", () => {
     source.dispose();
   });
 
+  test("resolves no transcript source for a direct row without a safe transcript locator", () => {
+    const store = new AgentObservationStore();
+    const id = agentId("unsafe-locator");
+    const sessionPath = testSessionPath("/tmp/pi-subagents-test/state/owner/sessions/unsafe-locator");
+    store.registerSpawned({
+      agentId: id,
+      ordinal: directAgentOrdinal(1),
+      assignment: "Review races",
+      sessionPath,
+      cwd: AGENT_DIR,
+      model: modelSpec("mock-provider/luna"),
+      thinkingLevel: "high",
+    });
+    const source = sourceOver(store);
+
+    expect(source.snapshot().rows.map((row) => row.ordinal)).toEqual([agentOrdinal("A1")]);
+    expect(source.transcriptSource(agentOrdinal("A1"))).toBeUndefined();
+    source.dispose();
+  });
+
   test("populates the recursive projection synchronously without a later source event", () => {
     const store = new AgentObservationStore();
     register(store, "agent-a", 1, "Root task");
@@ -182,7 +203,7 @@ describe("createAgentWidgetSource", () => {
       transcriptSource: (id) => terminalStore.transcriptSource(id),
       subscribe: (listener) => terminalStore.subscribe(listener),
     };
-    const terminal = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    const terminal = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
     expect(terminal.snapshot().degraded).toBe(false);
     terminal.dispose();
   });
@@ -208,7 +229,7 @@ describe("createAgentWidgetSource", () => {
       subscribe: (listener) => store.subscribe(listener),
     };
 
-    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
     expect(source.snapshot().rows.map((row) => row.ordinal)).toEqual([
       agentOrdinal("A1"), agentOrdinal("A1.2"), agentOrdinal("A1.2.3"),
     ]);
@@ -216,7 +237,7 @@ describe("createAgentWidgetSource", () => {
     expect(source.transcriptSource(agentOrdinal("A1.2"))).toBeUndefined();
     source.dispose();
 
-    const recreated = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    const recreated = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
     expect(recreated.snapshot().rows.map((row) => row.ordinal)).toEqual([
       agentOrdinal("A1"), agentOrdinal("A1.2"), agentOrdinal("A1.2.3"),
     ]);
@@ -245,7 +266,7 @@ describe("createAgentWidgetSource", () => {
     };
     const owner = agentId("delayed-terminal-root");
     mkdirSync(observationSlotDirectory(AGENT_DIR, owner), { recursive: true });
-    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
     await waitForIndexRefresh();
     const before = source.snapshot().revision;
     const encoded = encodeObservationSnapshot({
@@ -341,6 +362,7 @@ describe("createAgentWidgetSource", () => {
 
     const source = createAgentWidgetSource(port, {
       agentDir: AGENT_DIR,
+      rootSessionId: ROOT_SESSION,
       maxRows: MAX_WIDGET_ROWS,
       onDiagnostic: (code) => { diagnostics.push(code); },
     });
@@ -368,6 +390,7 @@ describe("createAgentWidgetSource", () => {
     };
     const source = createAgentWidgetSource(port, {
       agentDir: AGENT_DIR,
+      rootSessionId: ROOT_SESSION,
       maxRows: MAX_WIDGET_ROWS,
       onDiagnostic: (code) => { diagnostics.push(code); throw new Error("diagnostic adapter boom"); },
     });
@@ -405,7 +428,7 @@ describe("createAgentWidgetSource", () => {
       transcriptSource: (id) => store.transcriptSource(id),
       subscribe: (listener) => { notify.add(listener); return () => { notify.delete(listener); }; },
     };
-    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
     const before = source.snapshot().rows;
     const atRevision = source.snapshot().revision;
     expect(before).toHaveLength(1);
@@ -457,7 +480,7 @@ describe("createAgentWidgetSource", () => {
       transcriptSource: (id) => store.transcriptSource(id),
       subscribe: () => () => {},
     };
-    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
 
     expect(source.transcriptSource(agentOrdinal("A1"))).toBe(store.transcriptSource(agentId("agent-a")));
     source.dispose();
@@ -479,7 +502,7 @@ describe("createAgentWidgetSource", () => {
         };
       },
     };
-    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
 
     expect(() => source.dispose()).toThrow("port unsubscribe boom");
     expect(() => source.dispose()).not.toThrow();

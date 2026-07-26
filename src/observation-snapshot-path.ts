@@ -10,6 +10,7 @@ import {
   agentOrdinal,
   incarnationId,
   observationRevision,
+  tryTranscriptFileName,
   utf8Bytes,
   type AbsolutePath,
   type AgentCount,
@@ -21,6 +22,7 @@ import {
   type ObservationRevision,
   type ObservationSnapshotPath,
   type TaskLabel,
+  type TranscriptFileName,
   type Utf8Bytes,
 } from "./domain.ts";
 import type { AgentDisplayState } from "./agent-observation.ts";
@@ -36,6 +38,8 @@ export interface ObservationRow {
   readonly context: ContextLabel;
   readonly taskLabel: TaskLabel;
   readonly state: AgentDisplayState;
+  /** Owner-relative transcript basename; absent when the publisher had no safe locator. */
+  readonly transcriptFile?: TranscriptFileName;
 }
 
 export interface ObservationSnapshot {
@@ -227,30 +231,44 @@ function decodeSnapshot(value: unknown, requestedSessionId: AgentId): Observatio
   const agents: ObservationRow[] = [];
   const ordinals = new Set<AgentOrdinal>();
   const sessionIds = new Set<AgentId>();
+  let degraded = value.degraded;
   for (const candidate of value.agents) {
-    const row = decodeRow(candidate);
-    if (row === undefined || ordinals.has(row.ordinal) || sessionIds.has(row.sessionId)) return undefined;
-    ordinals.add(row.ordinal);
-    sessionIds.add(row.sessionId);
-    agents.push(row);
+    const decoded = decodeRow(candidate);
+    if (decoded === undefined || ordinals.has(decoded.row.ordinal) || sessionIds.has(decoded.row.sessionId)) return undefined;
+    if (decoded.locatorRejected) degraded = true;
+    ordinals.add(decoded.row.ordinal);
+    sessionIds.add(decoded.row.sessionId);
+    agents.push(decoded.row);
   }
   if (total < agents.length || omitted !== total - agents.length) return undefined;
   if (sessionId !== requestedSessionId) return "session-id-mismatch";
-  return { sessionId, incarnation, revision, total, omitted, degraded: value.degraded, agents: Object.freeze(agents) };
+  return { sessionId, incarnation, revision, total, omitted, degraded, agents: Object.freeze(agents) };
 }
 
-function decodeRow(value: unknown): ObservationRow | undefined {
+interface DecodedRow {
+  readonly row: ObservationRow;
+  /** An unsafe optional locator is dropped and degrades the snapshot rather than the row. */
+  readonly locatorRejected: boolean;
+}
+
+function decodeRow(value: unknown): DecodedRow | undefined {
   if (!isRecord(value) || typeof value.ordinal !== "string" || typeof value.sessionId !== "string" ||
       typeof value.model !== "string" || typeof value.context !== "string" ||
       typeof value.taskLabel !== "string" || typeof value.state !== "string") return undefined;
   if (!isDisplayText(value.model, 1_024) || !isDisplayText(value.taskLabel, 512) ||
       !isDisplayText(value.context, Number.POSITIVE_INFINITY) || [...value.context].length > 8 || !isDisplayState(value.state)) return undefined;
+  const locator = typeof value.transcriptFile === "string" ? tryTranscriptFileName(value.transcriptFile) : undefined;
+  const locatorRejected = value.transcriptFile !== undefined && locator === undefined;
   try {
     const ordinal = agentOrdinal(value.ordinal);
     if (value.ordinal.includes(".")) return undefined;
     return {
-      ordinal, sessionId: agentId(value.sessionId), model: value.model as ModelLabel,
-      context: value.context as ContextLabel, taskLabel: value.taskLabel as TaskLabel, state: value.state,
+      row: {
+        ordinal, sessionId: agentId(value.sessionId), model: value.model as ModelLabel,
+        context: value.context as ContextLabel, taskLabel: value.taskLabel as TaskLabel, state: value.state,
+        ...(locator === undefined ? {} : { transcriptFile: locator }),
+      },
+      locatorRejected,
     };
   } catch {
     return undefined;

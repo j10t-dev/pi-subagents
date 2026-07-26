@@ -9,14 +9,19 @@ import {
   agentId,
   agentObservationRevision,
   agentOrdinal,
+  directAgentOrdinal,
   incarnationId,
+  modelSpec,
   observationRevision,
+  transcriptFileName,
   type AbsolutePath,
   type ContextLabel,
   type ModelLabel,
   type TaskLabel,
 } from "../src/domain.ts";
 import type { DirectAgentSnapshotResult, SubagentObservationPort } from "../src/agent-observation.ts";
+import { AgentObservationStore } from "../src/agent-observation-store.ts";
+import { testAbsolutePath, testSessionPath } from "./support/brands.ts";
 import { systemDurableFileSystem } from "../src/durable-fs.ts";
 import { absolutePath } from "../src/paths.ts";
 import { observationSnapshotPath, readKnownChildSnapshots } from "../src/observation-snapshot-path.ts";
@@ -91,6 +96,28 @@ describe("ObservationRelay", () => {
     subject.setPort(port(direct()));
     subject.flush();
     expect(published()).toMatchObject({ sessionId: SESSION_ID, incarnation: incarnationId("relay-test"), agents: [{ sessionId: agentId("child-1"), ordinal: agentOrdinal("A1") }] });
+  });
+
+  test("publishes only the bounded transcript basename projected by a real observation store", () => {
+    const store = new AgentObservationStore();
+    store.registerSpawned({
+      agentId: agentId("child-1"),
+      ordinal: directAgentOrdinal(1),
+      assignment: "Review races",
+      sessionPath: testSessionPath("/tmp/pi-subagents-test/state/owner/sessions/child.jsonl"),
+      cwd: testAbsolutePath("/tmp/pi-subagents-test"),
+      model: modelSpec("mock-provider/luna"),
+      thinkingLevel: "high",
+    });
+
+    const subject = relay();
+    subject.setPort(store);
+    subject.flush();
+
+    const decoded = published();
+    expect(decoded?.agents[0]).toMatchObject({ transcriptFile: transcriptFileName("child.jsonl") });
+    expect(JSON.stringify(decoded)).not.toContain("/state/owner/sessions");
+    expect(readFileSync(observationSnapshotPath(agentDir, SESSION_ID), "utf8")).not.toContain("/tmp/pi-subagents-test");
   });
 
   test.each([

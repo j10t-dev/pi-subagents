@@ -22,12 +22,14 @@ import {
   agentOrdinal,
   incarnationId,
   observationRevision,
+  transcriptFileName,
   type AbsolutePath,
   type AgentId,
   type ContextLabel,
   type IncarnationId,
   type ModelLabel,
   type TaskLabel,
+  type TranscriptFileName,
 } from "../src/domain.ts";
 import { createObservationRelay } from "../src/observation-relay.ts";
 import {
@@ -105,6 +107,7 @@ function projection(
   ordinal: string,
   state: AgentDisplayState = AgentState.Running,
   label = ordinal,
+  transcriptFile?: TranscriptFileName,
 ): DirectAgentProjection {
   const agent = agentId(id);
   const safeLabel = label as TaskLabel;
@@ -125,6 +128,7 @@ function projection(
       revision: agentObservationRevision(1),
     },
     row: displayRow(ordinal, state, label),
+    ...(transcriptFile === undefined ? {} : { transcriptFile }),
   };
 }
 
@@ -153,6 +157,7 @@ function observationRow(
   id: string,
   state: AgentDisplayState = AgentState.Running,
   label = ordinal,
+  transcriptFile?: TranscriptFileName,
 ): ObservationRow {
   return {
     ordinal: agentOrdinal(ordinal),
@@ -161,6 +166,7 @@ function observationRow(
     context: "42%" as ContextLabel,
     taskLabel: label as TaskLabel,
     state,
+    ...(transcriptFile === undefined ? {} : { transcriptFile }),
   };
 }
 
@@ -197,6 +203,7 @@ function fixture(
   result: DirectAgentSnapshotResult,
   options: {
     readonly maxRows?: number;
+    readonly rootSessionId?: AgentId;
     readonly readKnownChildSnapshots?: RecursiveAgentIndexDependencies["readKnownChildSnapshots"];
   } = {},
 ) {
@@ -206,6 +213,7 @@ function fixture(
   const diagnostics: string[] = [];
   const dependencies: RecursiveAgentIndexDependencies = {
     agentDir,
+    rootSessionId: options.rootSessionId ?? agentId("root-session"),
     maxRows: agentCount(options.maxRows ?? 200),
     onChange: () => { changes.push("change"); },
     onDiagnostic: (code) => { diagnostics.push(code); },
@@ -792,8 +800,8 @@ describe("RecursiveAgentIndex", () => {
     const sharedOwner = agentId("duplicate-priority-direct-owner");
     const { index, watcher } = fixture(
       direct([
-        projection(sharedOwner, "A1", CompletionState.Completed),
-        projection(sharedOwner, "A2", AgentState.Running),
+        projection(sharedOwner, "A1", CompletionState.Completed, "A1", transcriptFileName("child.jsonl")),
+        projection(sharedOwner, "A2", AgentState.Running, "A2", transcriptFileName("child.jsonl")),
       ]),
       { maxRows: 1 },
     );
@@ -801,7 +809,13 @@ describe("RecursiveAgentIndex", () => {
     index.refresh();
 
     expect(ordinals(index.snapshot().rows)).toEqual(["A2"]);
-    expect(index.ownerOf(agentOrdinal("A2"))).toBe(sharedOwner);
+    expect(index.transcriptRoute(agentOrdinal("A2"))).toEqual({
+      ownerSessionId: agentId("root-session"),
+      childSessionId: sharedOwner,
+      fileName: transcriptFileName("child.jsonl"),
+      direct: true,
+    });
+    expect(index.transcriptRoute(agentOrdinal("A1"))).toBeUndefined();
     expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(1), degraded: true });
     expect(watcher.calls.at(-1)).toEqual([sharedOwner]);
   });
@@ -1197,15 +1211,64 @@ describe("RecursiveAgentIndex", () => {
     expect(index.snapshot().degraded).toBe(false);
   });
 
-  test("resolves ownership for direct rows only", () => {
-    const owner = agentId("owner");
-    writeSnapshot(snapshot(owner, [observationRow("A1", "descendant", CompletionState.Completed)]));
-    const { index } = fixture(direct([projection(owner, "A1")]));
+  test("resolves direct and nested transcript routes under their owning partitions", () => {
+    const child = agentId("child");
+    writeSnapshot(snapshot(child, [
+      observationRow("A2", "grandchild", AgentState.Running, "A2", transcriptFileName("grandchild.jsonl")),
+      observationRow("A3", "no-locator", AgentState.Running),
+    ]));
+    const { index } = fixture(direct([projection(child, "A1", AgentState.Running, "A1", transcriptFileName("child.jsonl"))]));
     index.refresh();
 
-    expect(index.ownerOf(agentOrdinal("A1"))).toBe(owner);
-    expect(index.ownerOf(agentOrdinal("A1.1"))).toBeUndefined();
-    expect(index.ownerOf(agentOrdinal("A9"))).toBeUndefined();
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.2", "A1.3"]);
+    expect(index.transcriptRoute(agentOrdinal("A1"))).toEqual({
+      ownerSessionId: agentId("root-session"),
+      childSessionId: agentId("child"),
+      fileName: transcriptFileName("child.jsonl"),
+      direct: true,
+    });
+    expect(index.transcriptRoute(agentOrdinal("A1.2"))).toEqual({
+      ownerSessionId: agentId("child"),
+      childSessionId: agentId("grandchild"),
+      fileName: transcriptFileName("grandchild.jsonl"),
+      direct: false,
+    });
+    expect(index.transcriptRoute(agentOrdinal("A1.3"))).toBeUndefined();
+    expect(index.transcriptRoute(agentOrdinal("A9"))).toBeUndefined();
+  });
+
+  test("drops transcript routes for rows that a later refresh no longer admits", () => {
+    const child = agentId("child");
+    writeSnapshot(snapshot(child, [observationRow("A2", "grandchild", AgentState.Running, "A2", transcriptFileName("grandchild.jsonl"))]));
+    const { index, port } = fixture(direct([projection(child, "A1", AgentState.Running, "A1", transcriptFileName("child.jsonl"))]));
+    index.refresh();
+    expect(index.transcriptRoute(agentOrdinal("A1.2"))).toBeDefined();
+
+    port.result = direct([]);
+    index.refresh();
+
+    expect(index.transcriptRoute(agentOrdinal("A1"))).toBeUndefined();
+    expect(index.transcriptRoute(agentOrdinal("A1.2"))).toBeUndefined();
+
+    index.dispose();
+    expect(index.transcriptRoute(agentOrdinal("A1"))).toBeUndefined();
+  });
+
+  test("keeps the first admitted route when two direct rows claim one ordinal", () => {
+    const first = agentId("first-claimant");
+    const second = agentId("second-claimant");
+    const { index } = fixture(direct([
+      projection(first, "A1", AgentState.Running, "A1", transcriptFileName("first.jsonl")),
+      projection(second, "A1", AgentState.Running, "A1", transcriptFileName("second.jsonl")),
+    ]));
+    index.refresh();
+
+    expect(index.transcriptRoute(agentOrdinal("A1"))).toEqual({
+      ownerSessionId: agentId("root-session"),
+      childSessionId: first,
+      fileName: transcriptFileName("first.jsonl"),
+      direct: true,
+    });
   });
 
   test("retains prior roots through unavailable and thrown projection failures", () => {
@@ -1235,6 +1298,7 @@ describe("RecursiveAgentIndex", () => {
     const watcher = new FakeWatcher();
     const index = createRecursiveAgentIndex(port, {
       agentDir,
+      rootSessionId: agentId("root-session"),
       maxRows: agentCount(2),
       onChange: () => { throw new Error("callback failed"); },
       onDiagnostic: (code) => { diagnostics.push(code); throw new Error("diagnostic failed"); },

@@ -11,7 +11,7 @@ import type { SubagentObservationPort } from "../agent-observation.ts";
 import { acquireStatusLease, type StatusLease } from "../ambient-status-lease.ts";
 import { createCoalescer, type Coalescer } from "../coalescer.ts";
 import { parseExtensionLaunchContext, type ExtensionLaunchContext } from "../delegation-policy.ts";
-import { agentId, milliseconds, type AbsolutePath } from "../domain.ts";
+import { agentId, milliseconds, type AbsolutePath, type AgentId } from "../domain.ts";
 import { createObservationRelay, type ObservationRelay } from "../observation-relay.ts";
 import { AgentWidgetComponent } from "./component.ts";
 import { clearSelection, emptyModel, replaceRows, type AgentWidgetModel } from "./model.ts";
@@ -43,7 +43,11 @@ function shortcutTarget(editor: EditorComponent): ShortcutEditor | undefined {
 }
 
 export interface AgentWidgetDeps {
-  readonly createSource?: (port: SubagentObservationPort, onDiagnostic: (code: string) => void) => WidgetSource;
+  readonly createSource?: (
+    port: SubagentObservationPort,
+    rootSessionId: AgentId,
+    onDiagnostic: (code: string) => void,
+  ) => WidgetSource;
   readonly subscribePort?: typeof onObservationPort;
   readonly createRelay?: typeof createObservationRelay;
   readonly createCoalescer?: typeof createCoalescer;
@@ -53,9 +57,14 @@ export interface AgentWidgetDeps {
   readonly trace?: (event: WidgetTraceEvent) => void;
 }
 
-const productionCreateSource = (port: SubagentObservationPort, onDiagnostic: (code: string) => void): WidgetSource =>
+const productionCreateSource = (
+  port: SubagentObservationPort,
+  rootSessionId: AgentId,
+  onDiagnostic: (code: string) => void,
+): WidgetSource =>
   createAgentWidgetSource(port, {
     agentDir: absolutePath(getAgentDir()),
+    rootSessionId,
     maxRows: MAX_WIDGET_ROWS,
     onDiagnostic,
   });
@@ -220,6 +229,7 @@ function startAggregator(
   deps: AgentWidgetDeps,
   reported: Set<WidgetDiagnosticCodeValue>,
 ): WidgetCleanup {
+  const rootSessionId = agentId(ctx.sessionManager.getSessionId());
 
   let widget: AgentWidgetComponent | undefined;
   let editorRef: EditorComponent | undefined;
@@ -469,7 +479,7 @@ function startAggregator(
       if (!rowsReleased || !sourceReleased || !widgetReleased || port === undefined) return;
       const createSource = deps.createSource ?? productionCreateSource;
       const source = guard(
-        () => createSource(port, (code) => report(sourceDiagnosticCode(code))),
+        () => createSource(port, rootSessionId, (code) => report(sourceDiagnosticCode(code))),
         WidgetDiagnosticCode.SourceFailed,
       );
       currentSource = source;

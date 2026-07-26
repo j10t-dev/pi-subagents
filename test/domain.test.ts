@@ -55,9 +55,12 @@ import {
   truncateUtf8,
   retainUtf8Tail,
   toolName,
+  transcriptFileName,
   tryAgentOrdinal,
+  tryTranscriptFileName,
   uiRequestId,
   utf8Bytes,
+  MAX_TRANSCRIPT_FILE_NAME_BYTES,
   type AgentCompletion,
   type CgroupScopePath,
   type CommittedOutputPath,
@@ -81,6 +84,7 @@ import {
   type WidgetRowCount,
   type AgentCount,
   type IncarnationId,
+  type TranscriptFileName,
 } from "../src/domain.ts";
 import { absolutePath, diagnosticsPath, outputPath, sessionPath } from "../src/paths.ts";
 import {
@@ -244,6 +248,27 @@ describe("agentOrdinal", () => {
       expect(tryAgentOrdinal(invalid)).toBeUndefined();
       expect(() => agentOrdinal(invalid)).toThrow(/invalid agent ordinal/);
     }
+  });
+});
+
+describe("transcriptFileName", () => {
+  test.each([
+    "child.jsonl",
+    "2026-07-26T03-06-36-283Z_019f9c63-877b-72df-9192-75506e278a7a.jsonl",
+  ])("brands a safe transcript basename: %s", (value) => {
+    expect(transcriptFileName(value)).toBe(value as TranscriptFileName);
+    expect(tryTranscriptFileName(value)).toBe(value as TranscriptFileName);
+  });
+
+  test.each(["", ".", "..", "child", "child.txt", "../child.jsonl", "dir/child.jsonl", "dir\\child.jsonl", "bad\u0000.jsonl", `${"x".repeat(251)}.jsonl`])(
+    "rejects an unsafe transcript basename: %s",
+    (value) => expect(tryTranscriptFileName(value)).toBeUndefined(),
+  );
+
+  test("admits the exact byte bound and throws on every rejected basename", () => {
+    const longest = `${"x".repeat(Number(MAX_TRANSCRIPT_FILE_NAME_BYTES) - 6)}.jsonl`;
+    expect(transcriptFileName(longest)).toBe(longest as TranscriptFileName);
+    expect(() => transcriptFileName("dir/child.jsonl")).toThrow(/transcript file name/);
   });
 });
 

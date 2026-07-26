@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { basename, isAbsolute } from "node:path";
 
 import type { ResolveCliModelResult, SessionEntry } from "@earendil-works/pi-coding-agent";
 
@@ -45,6 +45,8 @@ export type ProcessGroupId = Brand<number, "ProcessGroupId">;
 export type ObservationRevision = Brand<number, "ObservationRevision">;
 export type AgentOrdinal = Brand<string, "HierarchicalAgentOrdinal">;
 export type IncarnationId = Brand<string, "ObservationRelayIncarnationId">;
+/** An owner-relative transcript basename: never a path, never transcript content. */
+export type TranscriptFileName = Brand<string, "TranscriptFileName">;
 export type AgentObservationRevision = Brand<number, "AgentObservationRevision">;
 export type AgentWidgetRevision = Brand<number, "AgentWidgetRevision">;
 export type TranscriptSequence = Brand<number, "TranscriptSequence">;
@@ -69,6 +71,14 @@ export type RpcToolCallId = Brand<string, "RpcToolCallId">;
 export type RpcStopReason = Brand<string, "RpcStopReason">;
 export type WidgetTraceEvent = "widget-focused" | "editor-refocused" | "native-arrow";
 
+/** Private capability locating one descendant transcript beneath its owning session's partition. */
+export interface TranscriptRoute {
+  readonly ownerSessionId: AgentId;
+  readonly childSessionId: AgentId;
+  readonly fileName: TranscriptFileName;
+  readonly direct: boolean;
+}
+
 /** Canonical identity for state belonging to one agent run. Native entry IDs are session-local. */
 export type AgentRunKey = Brand<string, "AgentRunKey">;
 
@@ -82,6 +92,9 @@ const MAX_SESSION_ID_BYTES = 256;
 const SESSION_ENTRY_ID_PATTERN = /^[0-9a-f]{8}$/;
 const AGENT_ORDINAL_PATTERN = /^A[1-9][0-9]*(?:\.[1-9][0-9]*)*$/;
 export const MAX_AGENT_ORDINAL_BYTES = utf8Bytes(128);
+export const MAX_TRANSCRIPT_FILE_NAME_BYTES = utf8Bytes(255);
+const TRANSCRIPT_FILE_SUFFIX = ".jsonl";
+const TRANSCRIPT_FILE_NAME_UNSAFE_PATTERN = /[\\\/\u0000-\u001f\u007f]/u;
 const DISPLAY_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 /** Brands a native `SessionManager.getSessionId()` value, matching Pi's own lexical rule. */
@@ -282,6 +295,23 @@ export function agentOrdinal(value: string): AgentOrdinal {
   const ordinal = tryAgentOrdinal(value);
   if (ordinal === undefined) throw new Error(`invalid_input: invalid agent ordinal: ${JSON.stringify(value)}`);
   return ordinal;
+}
+
+/** Brands an owner-relative transcript basename, rejecting paths, traversal and control characters. */
+export function tryTranscriptFileName(value: string): TranscriptFileName | undefined {
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes === 0 || bytes > Number(MAX_TRANSCRIPT_FILE_NAME_BYTES)) return undefined;
+  if (!value.endsWith(TRANSCRIPT_FILE_SUFFIX) || value === "." || value === "..") return undefined;
+  if (TRANSCRIPT_FILE_NAME_UNSAFE_PATTERN.test(value) || basename(value) !== value) return undefined;
+  return value as TranscriptFileName;
+}
+
+export function transcriptFileName(value: string): TranscriptFileName {
+  const fileName = tryTranscriptFileName(value);
+  if (fileName === undefined) {
+    throw new Error(`invalid_input: invalid transcript file name: ${JSON.stringify(value)}`);
+  }
+  return fileName;
 }
 
 export function incarnationId(value: string): IncarnationId {

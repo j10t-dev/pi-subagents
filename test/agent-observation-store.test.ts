@@ -14,8 +14,10 @@ import {
   modelSpec,
   runAttemptId,
   runId,
+  transcriptFileName,
   truncateUtf8,
   utf8Bytes,
+  type AgentId,
 } from "../src/domain.ts";
 import { testAbsolutePath, testCommittedOutputPath, testSessionPath } from "./support/brands.ts";
 
@@ -29,6 +31,18 @@ function register(store: AgentObservationStore, id = A, position = 1, assignment
     ordinal: directAgentOrdinal(position),
     assignment,
     sessionPath: testSessionPath(`/tmp/pi-subagents-test/${id}.jsonl`),
+    cwd: testAbsolutePath("/tmp/pi-subagents-test"),
+    model: modelSpec("mock-provider/luna"),
+    thinkingLevel: "high",
+  });
+}
+
+function registerAt(store: AgentObservationStore, id: AgentId, path: string): void {
+  store.registerSpawned({
+    agentId: id,
+    ordinal: directAgentOrdinal(1),
+    assignment: "Review races",
+    sessionPath: testSessionPath(path),
     cwd: testAbsolutePath("/tmp/pi-subagents-test"),
     model: modelSpec("mock-provider/luna"),
     thinkingLevel: "high",
@@ -218,6 +232,29 @@ describe("AgentObservationStore", () => {
     expect(Number(snapshot.total)).toBe(208);
     expect(Number(snapshot.omitted)).toBe(8);
     expect(Number(snapshot.omittedActive)).toBe(0);
+  });
+
+  test("projects an owner-relative transcript basename derived from the authoritative session path", () => {
+    const store = new AgentObservationStore();
+    registerAt(store, A, "/tmp/pi-subagents-test/state/owner/sessions/child.jsonl");
+    const direct = store.directSnapshot();
+    if (direct.kind !== "snapshot") throw new Error("expected snapshot");
+
+    expect(direct.entries[0]).toMatchObject({ transcriptFile: transcriptFileName("child.jsonl") });
+    expect(direct.health).toEqual({ kind: "healthy" });
+    expect(JSON.stringify(direct.entries[0]!.transcriptFile)).not.toContain("/state/owner/sessions");
+  });
+
+  test("degrades projection health but retains the row when the session basename is unsafe", () => {
+    const store = new AgentObservationStore();
+    registerAt(store, A, "/tmp/pi-subagents-test/state/owner/sessions/child");
+    const direct = store.directSnapshot();
+    if (direct.kind !== "snapshot") throw new Error("expected snapshot");
+
+    expect(direct.entries).toHaveLength(1);
+    expect(direct.entries[0]!.transcriptFile).toBeUndefined();
+    expect(direct.entries[0]!.observation.lifecycleState).toBe(AgentState.Stopped);
+    expect(direct.health).toEqual({ kind: "degraded", codes: ["projection-failed"] });
   });
 
   test("reports active omission when more than the cap are active", () => {

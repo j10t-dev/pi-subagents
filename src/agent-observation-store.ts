@@ -1,3 +1,5 @@
+import { basename } from "node:path";
+
 import {
   AgentState,
   agentCount,
@@ -5,6 +7,7 @@ import {
   agentRunKey,
   directAgentOrdinal,
   transcriptRevision,
+  tryTranscriptFileName,
   transcriptSequence,
   type AbsolutePath,
   type AgentCompletion,
@@ -16,6 +19,7 @@ import {
   type ModelSpec,
   type RunId,
   type RunAttemptId,
+  type SessionPath,
   type ThinkingLevel,
   type TranscriptRevision,
 } from "./domain.ts";
@@ -93,6 +97,7 @@ interface RetainedAgent {
   readonly agentId: AgentId;
   readonly ordinal: AgentOrdinal;
   readonly position: number;
+  readonly sessionPath: SessionPath;
   readonly model: ModelSpec;
   readonly thinkingLevel: ThinkingLevel;
   candidate: string;
@@ -212,15 +217,23 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       selected.push(...terminal);
     }
     selected.sort((left, right) => left.position - right.position);
-    const entries = Object.freeze(selected.map((agent): DirectAgentProjection => Object.freeze({
-      agentId: agent.agentId,
-      observation: agent.observation,
-      row: directAgentRow(agent.observation),
-    })));
+    let locatorUnsafe = false;
+    const entries = Object.freeze(selected.map((agent): DirectAgentProjection => {
+      // The wire carries only an owner-relative basename; an unsafe one degrades the projection
+      // without withdrawing the lifecycle row it belongs to.
+      const transcriptFile = tryTranscriptFileName(basename(agent.sessionPath));
+      if (transcriptFile === undefined) locatorUnsafe = true;
+      return Object.freeze({
+        agentId: agent.agentId,
+        observation: agent.observation,
+        row: directAgentRow(agent.observation),
+        ...(transcriptFile === undefined ? {} : { transcriptFile }),
+      });
+    }));
     this.snapshotCache = Object.freeze({
       kind: "snapshot",
       revision: this.revision,
-      health: this.health,
+      health: locatorUnsafe ? withProjectionFailure(this.health) : this.health,
       total: agentCount(all.length),
       omitted: agentCount(all.length - entries.length),
       omittedActive: agentCount(Math.max(0, active.length - MAX_DIRECT_AGENT_OBSERVATIONS)),
@@ -258,6 +271,7 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       agentId: input.agentId,
       ordinal: input.ordinal,
       position: directPosition(input.ordinal),
+      sessionPath: input.sessionPath,
       model: input.model,
       thinkingLevel: input.thinkingLevel,
       candidate: boundedCandidate(input.assignment),
@@ -925,7 +939,8 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     if (this.agents.has(input.agentId)) return;
     this.addSensitiveValues({ agentIds: new Set([input.agentId]), runIds: new Set(), internalPaths: new Set([input.sessionPath, input.cwd]) });
     const retained: RetainedAgent = {
-      agentId: input.agentId, ordinal: input.ordinal, position: directPosition(input.ordinal), model: input.model,
+      agentId: input.agentId, ordinal: input.ordinal, position: directPosition(input.ordinal),
+      sessionPath: input.sessionPath, model: input.model,
       thinkingLevel: input.thinkingLevel, candidate: boundedCandidate(input.assignment), lifecycleState: AgentState.Stopped,
       pendingDelivery: false, observation: undefined as never,
     };
@@ -1140,6 +1155,11 @@ function freezeObservation(
   });
 }
 function safeModel(model: ModelSpec, thinking: ThinkingLevel): AgentObservation["modelLabel"] { try { return deriveModelLabel(model, thinking); } catch { return unknownModelLabel(); } }
+function withProjectionFailure(health: ObservationHealth): ObservationHealth {
+  const codes = health.kind === "degraded" ? health.codes : [];
+  if (codes.includes("projection-failed")) return health;
+  return Object.freeze({ kind: "degraded" as const, codes: Object.freeze([...codes, "projection-failed" as const]) });
+}
 function boundedCandidate(value: string): string {
   const bytes = new TextEncoder().encode(value);
   if (bytes.byteLength <= 512) return value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ");
