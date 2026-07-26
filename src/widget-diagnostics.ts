@@ -14,6 +14,11 @@ export const WidgetDiagnosticCode = {
   RelayWriteFailed: "relay_write_failed",
   RelayRenameFailed: "relay_rename_failed",
   WatchUnavailable: "watch_unavailable",
+  TranscriptRouteUnavailable: "transcript_route_unavailable",
+  TranscriptReadRefused: "transcript_read_refused",
+  TranscriptMalformed: "transcript_malformed",
+  TranscriptOversized: "transcript_oversized",
+  TranscriptWatchFallback: "transcript_watch_fallback",
 } as const;
 
 export type WidgetDiagnosticCode = (typeof WidgetDiagnosticCode)[keyof typeof WidgetDiagnosticCode];
@@ -34,7 +39,26 @@ const MESSAGES: Readonly<Record<WidgetDiagnosticCode, string>> = {
   [WidgetDiagnosticCode.RelayWriteFailed]: "Agent observation snapshot could not be written.",
   [WidgetDiagnosticCode.RelayRenameFailed]: "Agent observation snapshot could not be published.",
   [WidgetDiagnosticCode.WatchUnavailable]: "Agent observation file watching is unavailable.",
+  [WidgetDiagnosticCode.TranscriptRouteUnavailable]: "This agent's conversation is no longer available.",
+  [WidgetDiagnosticCode.TranscriptReadRefused]: "This agent's conversation could not be opened safely.",
+  [WidgetDiagnosticCode.TranscriptMalformed]: "This agent's conversation could not be read.",
+  [WidgetDiagnosticCode.TranscriptOversized]: "This agent's conversation exceeds the readable limit.",
+  [WidgetDiagnosticCode.TranscriptWatchFallback]: "This agent's conversation is refreshing periodically.",
 };
+
+/**
+ * The bounded subset a transcript source may report. Narrowing the port to these codes keeps
+ * transcript acquisition from reaching any diagnostic that could carry unrelated detail.
+ */
+export const TranscriptDiagnosticCode = {
+  RouteUnavailable: WidgetDiagnosticCode.TranscriptRouteUnavailable,
+  ReadRefused: WidgetDiagnosticCode.TranscriptReadRefused,
+  Malformed: WidgetDiagnosticCode.TranscriptMalformed,
+  Oversized: WidgetDiagnosticCode.TranscriptOversized,
+  WatchFallback: WidgetDiagnosticCode.TranscriptWatchFallback,
+} as const;
+
+export type TranscriptDiagnosticCode = (typeof TranscriptDiagnosticCode)[keyof typeof TranscriptDiagnosticCode];
 
 /** Returns only bounded, static user-facing text. Exception details never enter this module. */
 export function widgetDiagnostic(code: WidgetDiagnosticCode): string {

@@ -1,6 +1,6 @@
 const FOUNDATION = "^src/(?:domain|constants|paths|schemas|containment|async-primitives|durable-fs|jsonl|assignment-identity|delegation-policy)\\.ts$";
 const ORCHESTRATION_PI_HOST = "^(?:index\\.ts|src/(?:controller|run-controller|completion-service|tools|pi-composition)\\.ts)$";
-const PRESENTATION_PROJECTION = "^src/(?:agent-observation|agent-observation-store|context-observation|observation-registry|observation-relay|observation-snapshot-path|snapshot-watcher|recursive-agent-index|tool-presentation|ui-forwarder|widget-diagnostics|ambient-status-lease|coalescer)\\.ts$|^src/agent-widget/";
+const PRESENTATION_PROJECTION = "^src/(?:agent-observation|agent-observation-store|context-observation|observation-registry|observation-relay|observation-snapshot-path|snapshot-watcher|recursive-agent-index|tool-presentation|ui-forwarder|widget-diagnostics|ambient-status-lease|coalescer|session-transcript-source|merged-transcript-source)\\.ts$|^src/agent-widget/";
 const PERSISTENCE_LAUNCH_AUTHORITY = "^src/(?:persistence|restoration|output-store|pi-composition|pi-launcher|rpc-client|cgroup-v2|watchdog-client)\\.ts$";
 
 module.exports = {

@@ -26,8 +26,10 @@ import {
   type RpcStopReason,
   type RpcToolCallId,
   type Usage,
+  type SelectedTranscriptRevision,
   type TranscriptFileName,
   type TranscriptRevision,
+  type TranscriptRoute,
   type TranscriptSequence,
   type TranscriptText,
 } from "./domain.ts";
@@ -116,16 +118,50 @@ export interface AgentRow {
   readonly state: AgentDisplayState;
 }
 export interface AgentWidgetSnapshot { readonly revision: AgentWidgetRevision; readonly rows: readonly AgentRow[]; readonly total: AgentCount; readonly omitted: AgentCount; readonly degraded: boolean }
-export interface AgentWidgetSource { snapshot(): AgentWidgetSnapshot; transcriptSource(ordinal: AgentOrdinal): TranscriptSource | undefined; subscribe(onChange: () => void): () => void }
+export interface AgentWidgetSource { snapshot(): AgentWidgetSnapshot; transcriptSource(ordinal: AgentOrdinal): SelectedTranscriptSource | undefined; subscribe(onChange: () => void): () => void }
 
 export type TranscriptItem =
   | { readonly sequence: TranscriptSequence; readonly runId: RunId; readonly kind: "user"; readonly text: TranscriptText }
-  | { readonly sequence: TranscriptSequence; readonly runId: RunId; readonly kind: "assistant" | "thinking"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
-  | { readonly sequence: TranscriptSequence; readonly runId: RunId; readonly kind: "tool"; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
-  | { readonly sequence: TranscriptSequence; readonly kind: "notice"; readonly code: "transport-unavailable" | "projection-unavailable" };
+  | { readonly sequence: TranscriptSequence; readonly runId?: RunId; readonly kind: "assistant" | "thinking"; readonly phase: "partial" | "final"; readonly text: TranscriptText }
+  | { readonly sequence: TranscriptSequence; readonly runId?: RunId; readonly kind: "tool"; readonly tool: ToolDisplayName; readonly phase: "running" | "completed" | "failed"; readonly preview?: TranscriptText }
+  | { readonly sequence: TranscriptSequence; readonly kind: "notice"; readonly code: "transport-unavailable" | "projection-unavailable" | "context-compacted" };
 export interface TranscriptSnapshot { readonly revision: TranscriptRevision; readonly items: readonly TranscriptItem[]; readonly truncatedBefore: boolean; readonly availability: "live" | "stopped" | "unavailable" }
 export type TranscriptListener = (snapshot: TranscriptSnapshot) => void;
 export interface TranscriptSource { snapshot(): TranscriptSnapshot; subscribe(listener: TranscriptListener): () => void }
+
+/** A transcript source whose lifetime, display state and route validity one owner controls. */
+export interface ManagedTranscriptSource extends TranscriptSource {
+  /** Reports the selected row's display state; availability and run finality follow from it. */
+  setDisplayState(state: AgentDisplayState): void;
+  /** Reports that the capability locating this transcript no longer resolves. */
+  markRouteUnavailable(): void;
+  dispose(): void;
+}
+
+/**
+ * A managed transcript that can also prove it read past the last byte written before the run
+ * terminated. A later merge uses that proof to decide when live observation may be dropped.
+ */
+export interface AuthoritativeTranscriptSource extends ManagedTranscriptSource {
+  postTerminalEndReached(): boolean;
+}
+
+/** One atomic view of the selected row and its conversation, published under one revision. */
+export interface SelectedTranscriptSnapshot {
+  readonly revision: SelectedTranscriptRevision;
+  readonly transcript: TranscriptSnapshot;
+  readonly row: AgentRow;
+  readonly routeAvailable: boolean;
+}
+export interface SelectedTranscriptSource {
+  snapshot(): SelectedTranscriptSnapshot;
+  subscribe(listener: (snapshot: SelectedTranscriptSnapshot) => void): () => void;
+}
+export interface ManagedSelectedTranscriptSource extends SelectedTranscriptSource {
+  /** Applies the latest index refresh; an absent or unequal route retains the last-known row. */
+  update(current: { readonly route: TranscriptRoute; readonly row: AgentRow } | undefined): void;
+  dispose(): void;
+}
 
 export interface FinalAssistantBlock {
   readonly contentIndex: RpcContentIndex;
@@ -207,6 +243,29 @@ export function transcriptText(value: string): TranscriptText {
 export function toolDisplayName(value: string): ToolDisplayName {
   return displayText(value, 256, "tool display name") as ToolDisplayName;
 }
+/** Sanitises untrusted external text into bounded control-free transcript text. */
+export function safeTranscriptText(value: string): TranscriptText {
+  return transcriptText(boundedPrefix(stripControl(value), 8_192, 8_192));
+}
+/** Sanitises an untrusted external tool name; an empty result names no displayable tool. */
+export function trySafeToolDisplayName(value: string): ToolDisplayName | undefined {
+  const bounded = boundedPrefix(stripControl(value), 256, 256).trim();
+  return bounded.length === 0 ? undefined : (bounded as ToolDisplayName);
+}
+/** True once a display state can no longer produce further conversation of its own accord. */
+export function isTerminalDisplayState(state: AgentDisplayState): boolean {
+  switch (state) {
+    case AgentState.Running:
+    case AgentState.Settling:
+    case AgentState.Stopping:
+      return false;
+    case AgentState.Stopped:
+    case CompletionState.Completed:
+    case CompletionState.Failed:
+    case CompletionState.Cancelled:
+      return true;
+  }
+}
 export function contextLabel(context: ContextObservation): ContextLabel {
   if (context.kind === "unavailable") return "?%" as ContextLabel;
   const rounded = Math.round(context.percent);
@@ -232,6 +291,12 @@ function controlSafeText(value: string, maxBytes: number, label: string, allowEm
 function boundedDisplayText(value: string, maxCodePoints: number, maxBytes: number, label: string, allowEmpty = false): string {
   if ([...value].length > maxCodePoints) throw new Error(`invalid_input: invalid ${label}`);
   return controlSafeText(value, maxBytes, label, allowEmpty);
+}
+function stripControl(value: string): string {
+  ANSI_PATTERN.lastIndex = 0; CONTROL_PATTERN.lastIndex = 0;
+  const stripped = value.replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, " ");
+  ANSI_PATTERN.lastIndex = 0; CONTROL_PATTERN.lastIndex = 0;
+  return stripped;
 }
 function boundedPrefix(value: string, maxCodePoints: number, maxBytes: number): string {
   let output = ""; let points = 0; let bytes = 0;

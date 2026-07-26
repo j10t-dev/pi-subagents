@@ -8,10 +8,12 @@ import {
   CancellationReason,
   CompletionState,
   THINKING_LEVELS,
+  agentId,
   milliseconds,
+  sessionEntryId,
   uiRequestId,
 } from "./domain.ts";
-import type { Milliseconds, ThinkingLevel, UIRequestId, Usage } from "./domain.ts";
+import type { AgentId, Milliseconds, SessionEntryId, ThinkingLevel, UIRequestId, Usage } from "./domain.ts";
 import { MAX_COMPLETION_OUTPUT_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_MAX_DEPTH } from "./constants.ts";
 
 type LiteralSchemas<T extends readonly string[]> = {
@@ -402,3 +404,179 @@ export const SettingsDocumentSchema = Type.Object({
 });
 
 export type SettingsDocumentDto = Static<typeof SettingsDocumentSchema>;
+
+// --- Pi session transcript schemas ---------------------------------------
+
+/**
+ * Structural decoding of Pi's own session JSONL. These schemas deliberately narrow external
+ * records instead of importing the installed session-manager declarations: a transcript on disk
+ * may have been written by another Pi build, so compatibility must be proved from the bytes.
+ * Extra properties are tolerated; only the fields this projection reads are validated.
+ */
+export interface TranscriptSessionHeaderRecord {
+  readonly version: 1 | 2 | 3;
+  readonly sessionId: AgentId;
+}
+
+export type TranscriptSessionContentRecord =
+  | { readonly kind: "text" | "thinking"; readonly text: string }
+  | { readonly kind: "tool-call"; readonly callId: string; readonly tool: string }
+  | { readonly kind: "ignored" };
+
+export type TranscriptSessionMessageRecord =
+  | { readonly role: "user"; readonly content: readonly TranscriptSessionContentRecord[] }
+  | { readonly role: "assistant"; readonly content: readonly TranscriptSessionContentRecord[] }
+  | {
+      readonly role: "tool-result";
+      readonly callId: string;
+      readonly tool: string;
+      readonly content: readonly TranscriptSessionContentRecord[];
+      readonly error: boolean;
+    }
+  | { readonly role: "non-conversation" };
+
+export type TranscriptSessionEntryRecord =
+  | {
+      readonly id: SessionEntryId;
+      readonly parentId: SessionEntryId | null;
+      readonly kind: "message";
+      readonly message: TranscriptSessionMessageRecord;
+    }
+  | {
+      readonly id: SessionEntryId;
+      readonly parentId: SessionEntryId | null;
+      readonly kind: "compaction";
+      readonly firstKeptEntryId?: SessionEntryId;
+      readonly retainedTailPresent: boolean;
+    }
+  | { readonly id: SessionEntryId; readonly parentId: SessionEntryId | null; readonly kind: "non-conversation" };
+
+const SessionEntryIdSchema = Type.String({ pattern: "^[0-9a-f]{8}$" });
+const NativeCorrelationSchema = Type.String({ minLength: 1, maxLength: 4_096 });
+const EntryLineageSchema = {
+  id: SessionEntryIdSchema,
+  parentId: Type.Union([SessionEntryIdSchema, Type.Null()]),
+} as const;
+
+/** Version 1 omits the field entirely; the migration that introduced it started at 2. */
+export const TranscriptSessionHeaderSchema = Type.Object({
+  type: Type.Literal("session"),
+  id: AgentIdSchema,
+  version: Type.Optional(Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)])),
+});
+
+const TextContentSchema = Type.Object({ type: Type.Literal("text"), text: Type.String() });
+const ThinkingContentSchema = Type.Object({ type: Type.Literal("thinking"), thinking: Type.String() });
+const ToolCallContentSchema = Type.Object({
+  type: Type.Literal("toolCall"),
+  id: NativeCorrelationSchema,
+  name: NativeCorrelationSchema,
+});
+
+const TranscriptUserMessageSchema = Type.Object({
+  role: Type.Literal("user"),
+  content: Type.Union([Type.String(), Type.Array(Type.Unknown())]),
+});
+const TranscriptAssistantMessageSchema = Type.Object({
+  role: Type.Literal("assistant"),
+  content: Type.Array(Type.Unknown()),
+});
+const TranscriptToolResultMessageSchema = Type.Object({
+  role: Type.Literal("toolResult"),
+  toolCallId: NativeCorrelationSchema,
+  toolName: NativeCorrelationSchema,
+  content: Type.Array(Type.Unknown()),
+  isError: Type.Optional(Type.Boolean()),
+});
+const TranscriptOtherMessageSchema = Type.Object({ role: Type.String() });
+const CONVERSATION_ROLES = new Set(["user", "assistant", "toolResult"]);
+
+const TranscriptMessageEntrySchema = Type.Object({
+  type: Type.Literal("message"),
+  ...EntryLineageSchema,
+  message: Type.Unknown(),
+});
+/** Both compaction forms: one names the first kept entry, the other carries a retained tail. */
+const TranscriptCompactionEntrySchema = Type.Object({
+  type: Type.Literal("compaction"),
+  ...EntryLineageSchema,
+  summary: Type.Optional(Type.String()),
+  firstKeptEntryId: Type.Optional(SessionEntryIdSchema),
+  retainedTail: Type.Optional(Type.Array(Type.Unknown())),
+});
+const TranscriptOtherEntrySchema = Type.Object({ type: Type.String(), ...EntryLineageSchema });
+const KNOWN_ENTRY_TYPES = new Set(["message", "compaction"]);
+
+/** Decodes one complete session header record; an unsupported version is not a header. */
+export function decodeTranscriptSessionHeader(value: unknown): TranscriptSessionHeaderRecord | undefined {
+  if (!Value.Check(TranscriptSessionHeaderSchema, value)) return undefined;
+  return { version: value.version ?? 1, sessionId: agentId(value.id) };
+}
+
+/** Decodes one complete session entry record; a malformed record is rejected as a whole. */
+export function decodeTranscriptSessionEntry(value: unknown): TranscriptSessionEntryRecord | undefined {
+  if (Value.Check(TranscriptMessageEntrySchema, value)) {
+    const message = decodeTranscriptSessionMessage(value.message);
+    if (message === undefined) return undefined;
+    return { ...lineageOf(value), kind: "message", message };
+  }
+  if (Value.Check(TranscriptCompactionEntrySchema, value)) {
+    const firstKept = value.firstKeptEntryId;
+    return {
+      ...lineageOf(value),
+      kind: "compaction",
+      ...(firstKept === undefined ? {} : { firstKeptEntryId: sessionEntryId(firstKept) }),
+      retainedTailPresent: value.retainedTail !== undefined,
+    };
+  }
+  if (Value.Check(TranscriptOtherEntrySchema, value)) {
+    // A record that names a known kind but failed that kind's schema is malformed, not foreign.
+    return KNOWN_ENTRY_TYPES.has(value.type)
+      ? undefined
+      : { ...lineageOf(value), kind: "non-conversation" };
+  }
+  return undefined;
+}
+
+function lineageOf(entry: { readonly id: string; readonly parentId: string | null }): {
+  readonly id: SessionEntryId;
+  readonly parentId: SessionEntryId | null;
+} {
+  return {
+    id: sessionEntryId(entry.id),
+    parentId: entry.parentId === null ? null : sessionEntryId(entry.parentId),
+  };
+}
+
+function decodeTranscriptSessionMessage(value: unknown): TranscriptSessionMessageRecord | undefined {
+  if (Value.Check(TranscriptUserMessageSchema, value)) {
+    const content = typeof value.content === "string"
+      ? [{ kind: "text", text: value.content } as const]
+      : value.content.map(decodeTranscriptSessionContent);
+    return { role: "user", content };
+  }
+  if (Value.Check(TranscriptAssistantMessageSchema, value)) {
+    return { role: "assistant", content: value.content.map(decodeTranscriptSessionContent) };
+  }
+  if (Value.Check(TranscriptToolResultMessageSchema, value)) {
+    return {
+      role: "tool-result",
+      callId: value.toolCallId,
+      tool: value.toolName,
+      content: value.content.map(decodeTranscriptSessionContent),
+      error: value.isError === true,
+    };
+  }
+  // A conversation role that failed its own schema is malformed, not a foreign record kind.
+  if (Value.Check(TranscriptOtherMessageSchema, value) && !CONVERSATION_ROLES.has(value.role)) {
+    return { role: "non-conversation" };
+  }
+  return undefined;
+}
+
+function decodeTranscriptSessionContent(value: unknown): TranscriptSessionContentRecord {
+  if (Value.Check(TextContentSchema, value)) return { kind: "text", text: value.text };
+  if (Value.Check(ThinkingContentSchema, value)) return { kind: "thinking", text: value.thinking };
+  if (Value.Check(ToolCallContentSchema, value)) return { kind: "tool-call", callId: value.id, tool: value.name };
+  return { kind: "ignored" };
+}

@@ -51,6 +51,17 @@ export type AgentObservationRevision = Brand<number, "AgentObservationRevision">
 export type AgentWidgetRevision = Brand<number, "AgentWidgetRevision">;
 export type TranscriptSequence = Brand<number, "TranscriptSequence">;
 export type TranscriptRevision = Brand<number, "TranscriptRevision">;
+/** One selected-conversation revision: row, route availability and transcript published together. */
+export type SelectedTranscriptRevision = Brand<number, "SelectedTranscriptRevision">;
+/** The device and inode pair proving two stats describe the same underlying file. */
+export type FileDevice = Brand<number, "FileDevice">;
+export type FileInode = Brand<number, "FileInode">;
+/** A byte length reported by a stat. */
+export type FileByteLength = Brand<number, "FileByteLength">;
+/** A byte position within one file. */
+export type FileOffset = Brand<number, "FileOffset">;
+/** One validated separator-free directory component, only ever opened relative to a parent handle. */
+export type TranscriptPathSegment = Brand<string, "TranscriptPathSegment">;
 export type ContextPercent = Brand<number, "ContextPercent">;
 export type TaskLabel = Brand<string, "SafeTaskLabel">;
 export type ModelLabel = Brand<string, "ModelDisplayLabel">;
@@ -346,6 +357,47 @@ export function transcriptRevision(value: number): TranscriptRevision {
   requireNonnegativeSafeInteger(value, "transcript revision");
   return value as TranscriptRevision;
 }
+export function selectedTranscriptRevision(value: number): SelectedTranscriptRevision {
+  requireNonnegativeSafeInteger(value, "selected transcript revision");
+  return value as SelectedTranscriptRevision;
+}
+export function fileDevice(value: number): FileDevice {
+  requireNonnegativeSafeInteger(value, "file device");
+  return value as FileDevice;
+}
+export function fileInode(value: number): FileInode {
+  requireNonnegativeSafeInteger(value, "file inode");
+  return value as FileInode;
+}
+export function fileByteLength(value: number): FileByteLength {
+  requireNonnegativeSafeInteger(value, "file byte length");
+  return value as FileByteLength;
+}
+export function fileOffset(value: number): FileOffset {
+  requireNonnegativeSafeInteger(value, "file offset");
+  return value as FileOffset;
+}
+
+/**
+ * Brands one path component that may be opened relative to an already-open parent directory.
+ * Separators, traversal and control characters are rejected so no component can leave its parent.
+ */
+export function tryTranscriptPathSegment(value: string): TranscriptPathSegment | undefined {
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes === 0 || bytes > Number(MAX_TRANSCRIPT_FILE_NAME_BYTES)) return undefined;
+  if (value === "." || value === "..") return undefined;
+  if (TRANSCRIPT_FILE_NAME_UNSAFE_PATTERN.test(value) || basename(value) !== value) return undefined;
+  return value as TranscriptPathSegment;
+}
+
+export function transcriptPathSegment(value: string): TranscriptPathSegment {
+  const segment = tryTranscriptPathSegment(value);
+  if (segment === undefined) {
+    throw new Error(`invalid_input: invalid transcript path segment: ${JSON.stringify(value)}`);
+  }
+  return segment;
+}
+
 export function contextPercent(value: number): ContextPercent {
   if (!Number.isFinite(value) || value < 0) throw new Error(`invalid_input: invalid context percent: ${value}`);
   return value as ContextPercent;

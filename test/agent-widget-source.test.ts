@@ -6,6 +6,15 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
 import type { AgentDisplayState, ObservationChange, SubagentObservationPort } from "../src/agent-observation.ts";
 import { createAgentWidgetSource } from "../src/agent-widget/source.ts";
+import {
+  type TranscriptDirectoryHandle,
+  type TranscriptFileSystem,
+  type TranscriptFileWatcherFactory,
+  type TranscriptReadHandle,
+  type TranscriptRefreshClock,
+  type TranscriptScheduledTask,
+  type TranscriptWatch,
+} from "../src/session-transcript-source.ts";
 import { INDEX_REFRESH_WINDOW_MS, MAX_WIDGET_ROWS } from "../src/constants.ts";
 import {
   AgentState,
@@ -15,10 +24,18 @@ import {
   agentObservationRevision,
   agentOrdinal,
   directAgentOrdinal,
+  fileByteLength,
+  fileDevice,
+  fileInode,
   incarnationId,
   modelSpec,
   observationRevision,
   runId,
+  type FileOffset,
+  type Milliseconds,
+  type TranscriptFileName,
+  type TranscriptPathSegment,
+  type Utf8Bytes,
 } from "../src/domain.ts";
 import {
   encodeObservationSnapshot,
@@ -42,6 +59,7 @@ function writePublished(owner: string, agents: readonly {
   readonly ordinal: string;
   readonly sessionId: string;
   readonly state?: AgentDisplayState;
+  readonly transcriptFile?: string;
 }[]): void {
   const sessionId = agentId(owner);
   const rows: ObservationRow[] = agents.map((agent) => ({
@@ -51,6 +69,9 @@ function writePublished(owner: string, agents: readonly {
     context: "42%" as ObservationRow["context"],
     taskLabel: agent.ordinal as ObservationRow["taskLabel"],
     state: agent.state ?? CompletionState.Completed,
+    ...(agent.transcriptFile === undefined
+      ? {}
+      : { transcriptFile: agent.transcriptFile as NonNullable<ObservationRow["transcriptFile"]> }),
   }));
   const encoded = encodeObservationSnapshot({
     sessionId,
@@ -83,6 +104,48 @@ function register(store: AgentObservationStore, name: string, position: number, 
 
 function sourceOver(store: AgentObservationStore, maxRows = MAX_WIDGET_ROWS) {
   return createAgentWidgetSource(store as SubagentObservationPort, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows });
+}
+
+class RecordingTranscriptAdapters implements TranscriptFileSystem, TranscriptFileWatcherFactory, TranscriptRefreshClock {
+  readonly directorySegments: string[] = [];
+  readonly fileNames: string[] = [];
+  readonly watchedDirectories: string[] = [];
+  private readonly bytes = new TextEncoder().encode(`${JSON.stringify({ type: "session", id: "agent-b" })}\n`);
+  private readonly directory: TranscriptDirectoryHandle = {
+    stat: async () => ({ directory: true }),
+    close: async () => {},
+  };
+
+  async openRootDirectoryNoFollow(): Promise<TranscriptDirectoryHandle> { return this.directory }
+
+  async openDirectoryNoFollow(
+    _parent: TranscriptDirectoryHandle,
+    segment: TranscriptPathSegment,
+  ): Promise<TranscriptDirectoryHandle> {
+    this.directorySegments.push(String(segment));
+    return this.directory;
+  }
+
+  async openReadOnlyNoFollow(
+    _parent: TranscriptDirectoryHandle,
+    fileName: TranscriptFileName,
+  ): Promise<TranscriptReadHandle> {
+    this.fileNames.push(String(fileName));
+    return {
+      stat: async () => ({ device: fileDevice(1), inode: fileInode(1), size: fileByteLength(this.bytes.byteLength), regular: true }),
+      read: async (position: FileOffset, maximum: Utf8Bytes) => this.bytes.slice(Number(position), Number(position) + Number(maximum)),
+      close: async () => {},
+    };
+  }
+
+  watch(directory: Parameters<TranscriptFileWatcherFactory["watch"]>[0]): TranscriptWatch {
+    this.watchedDirectories.push(String(directory));
+    return { dispose: () => {} };
+  }
+
+  schedule(_delay: Milliseconds, _callback: () => void): TranscriptScheduledTask {
+    return { cancel: () => {} };
+  }
 }
 
 describe("createAgentWidgetSource", () => {
@@ -131,14 +194,43 @@ describe("createAgentWidgetSource", () => {
     source.dispose();
   });
 
-  test("resolves only direct rendered ordinals to their owning transcript source", () => {
+  test("resolves only routed rendered ordinals to a selected conversation source", () => {
     const store = new AgentObservationStore();
     register(store, "agent-a", 1, "Research terminal UX");
     writePublished("agent-a", [{ ordinal: "A1", sessionId: "published-child" }]);
     const source = sourceOver(store);
-    expect(source.transcriptSource(agentOrdinal("A1"))).toBe(store.transcriptSource(agentId("agent-a")));
+    const selected = source.transcriptSource(agentOrdinal("A1"));
+    expect(selected?.snapshot()).toMatchObject({ row: { ordinal: agentOrdinal("A1") }, routeAvailable: true });
+    // The same ordinal keeps its lazily created selection rather than reopening the transcript.
+    expect(source.transcriptSource(agentOrdinal("A1"))).toBe(selected);
     expect(source.transcriptSource(agentOrdinal("A1.1"))).toBeUndefined();
     expect(source.transcriptSource(agentOrdinal("A9"))).toBeUndefined();
+    source.dispose();
+  });
+
+  test("opens a nested selected transcript beneath its publishing child owner partition", async () => {
+    const store = new AgentObservationStore();
+    register(store, "agent-a", 1, "Parent task");
+    writePublished("agent-a", [{ ordinal: "A2", sessionId: "agent-b", transcriptFile: "agent-b.jsonl" }]);
+    const adapters = new RecordingTranscriptAdapters();
+    const source = createAgentWidgetSource(store as SubagentObservationPort, {
+      agentDir: AGENT_DIR,
+      rootSessionId: ROOT_SESSION,
+      maxRows: MAX_WIDGET_ROWS,
+      transcriptFileSystem: adapters,
+      transcriptWatcher: adapters,
+      transcriptClock: adapters,
+    });
+
+    const selected = source.transcriptSource(agentOrdinal("A1.2"));
+    const unsubscribe = selected?.subscribe(() => {});
+    await Bun.sleep(0);
+
+    expect(selected?.snapshot()).toMatchObject({ row: { ordinal: agentOrdinal("A1.2") }, routeAvailable: true });
+    expect(adapters.directorySegments).toEqual(["pi-subagents", "agent-a", "sessions"]);
+    expect(adapters.fileNames).toEqual(["agent-b.jsonl"]);
+    expect(adapters.watchedDirectories).toEqual([join(AGENT_DIR, "pi-subagents", "agent-a", "sessions")]);
+    unsubscribe?.();
     source.dispose();
   });
 
@@ -482,7 +574,10 @@ describe("createAgentWidgetSource", () => {
     };
     const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, rootSessionId: ROOT_SESSION, maxRows: MAX_WIDGET_ROWS });
 
-    expect(source.transcriptSource(agentOrdinal("A1"))).toBe(store.transcriptSource(agentId("agent-a")));
+    expect(source.transcriptSource(agentOrdinal("A1"))?.snapshot()).toMatchObject({
+      row: { ordinal: agentOrdinal("A1") },
+      routeAvailable: true,
+    });
     source.dispose();
   });
 
