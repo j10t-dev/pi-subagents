@@ -356,10 +356,11 @@ export class SubagentController {
   private async flushReadyNotification(): Promise<void> {
     await this.notificationMutex.runExclusive(async () => {
       const parent = this.parent;
-      if (this.suppressPings || parent === undefined || parent.isBusy()) return;
-      const candidate = await this.completions.readyNotification();
-      if (candidate === undefined || this.suppressPings || parent.isBusy()) return;
+      if (this.suppressPings || parent === undefined) return;
       try {
+        if (parent.isBusy()) return;
+        const candidate = await this.completions.readyNotification();
+        if (candidate === undefined || this.suppressPings || parent.isBusy()) return;
         await parent.sendMessage(readyMessage(candidate.readyCount), {
           deliverAs: "followUp",
           triggerTurn: true,

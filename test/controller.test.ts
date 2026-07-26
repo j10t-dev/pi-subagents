@@ -1613,6 +1613,47 @@ describe("parent lifecycle wiring", () => {
     }]);
   });
 
+  test("an initial busy inspection failure leaves notification eligibility retryable", async () => {
+    let inspectFails = true;
+    const sent: string[] = [];
+    const controller = new SubagentController({ parent: {
+      isBusy: () => {
+        if (inspectFails) throw new Error("host state unavailable");
+        return false;
+      },
+      sendMessage: async (text) => { sent.push(text); },
+    } });
+
+    await expect(controller.publish(completion("deadbeef"))).resolves.toBeUndefined();
+    expect(sent).toEqual([]);
+    expect(controller.completions.queuedCount()).toBe(1);
+
+    inspectFails = false;
+    await expect(controller.parentSettled()).resolves.toBeUndefined();
+    expect(sent).toEqual(["1 agent completion is ready. Call await_agent to collect it."]);
+  });
+
+  test("a post-candidate busy inspection failure leaves notification eligibility retryable", async () => {
+    let inspections = 0;
+    const sent: string[] = [];
+    const controller = new SubagentController({ parent: {
+      isBusy: () => {
+        inspections++;
+        if (inspections === 2) throw new Error("host state unavailable");
+        return false;
+      },
+      sendMessage: async (text) => { sent.push(text); },
+    } });
+
+    await expect(controller.publish(completion("deadbeef"))).resolves.toBeUndefined();
+    expect(inspections).toBe(2);
+    expect(sent).toEqual([]);
+    expect(controller.completions.queuedCount()).toBe(1);
+
+    await expect(controller.parentSettled()).resolves.toBeUndefined();
+    expect(sent).toEqual(["1 agent completion is ready. Call await_agent to collect it."]);
+  });
+
   test("a failed notification retries the same candidate on settlement", async () => {
     let sends = 0;
     const controller = new SubagentController({ parent: { isBusy: () => false, sendMessage: async () => { if (++sends === 1) throw new Error("send failed"); } } });
