@@ -102,6 +102,10 @@ RPC events
 
 Observation is deliberately total and bounded: malformed or unsupported observation data may degrade presentation but must not break lifecycle operations.
 
+## Child-conversation presentation boundary
+
+Transcript presentation normalisation admits only bounded JSON and per-source sensitive values. The post-merge projector removes identities, rejects rich JSON, assigns synthetic keys and decides tool rendering. The native adapter composes Pi's public message and tool components, owns spacing and removes OSC 133 shell-integration sequences; the renderer owns viewport arithmetic only. Tools render as native built-in, native generic or renderer override. An ineligible built-in uses the override, rather than the generic shell, because Pi resolves built-in names unconditionally and the override prevents its native renderer receiving inadmissible data.
+
 ## Dependency direction
 
 Domain and boundary modules must not depend on controller, Pi host or presentation modules. Persistence and transport expose validated data to orchestration. Presentation consumes projections and cannot append lifecycle events or launch processes. Production Pi creation remains behind the watchdog/launcher boundary.

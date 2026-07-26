@@ -86,6 +86,20 @@ reportIntegrationCli(PI_EXECUTABLE);
 const LIFECYCLE_TOOLS = ["spawn_agent", "send_input", "await_agent", "stop_agent"] as const;
 
 describe("installed Pi integration prerequisites", () => {
+  test("the installed runtime exports every component this projection composes", async () => {
+    const pi = await import("@earendil-works/pi-coding-agent");
+    for (const name of [
+      "UserMessageComponent",
+      "AssistantMessageComponent",
+      "ToolExecutionComponent",
+      "SkillInvocationMessageComponent",
+      "parseSkillBlock",
+      "getMarkdownTheme",
+    ]) {
+      expect(typeof (pi as Record<string, unknown>)[name]).not.toBe("undefined");
+    }
+  });
+
   test("the literal command-v Pi launcher registers the extension in a real parent session", async () => {
     const state = temporaryStateRoot("pi-literal-launcher-");
     const root: string = state.path;

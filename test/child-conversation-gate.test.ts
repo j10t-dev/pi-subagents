@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 
@@ -17,6 +19,75 @@ describe("child conversation PTY gate control logic", () => {
     expect(classifyChildConversationGate([...REQUIRED_CHILD_VIEW_EVENTS].reverse()))
       .toBe("unsupported");
     expect(classifyChildConversationGate([])).toBe("not-run");
+  });
+
+  test("the required event order includes native presentation proofs", () => {
+    expect(REQUIRED_CHILD_VIEW_EVENTS).toEqual([
+      "editor-prefilled",
+      "widget-focused",
+      "nested-row-selected",
+      "conversation-opened",
+      "fullscreen-covered",
+      "native-user-rendered",
+      "native-assistant-rendered",
+      "native-builtin-tool-rendered",
+      "native-generic-tool-rendered",
+      "native-override-tool-rendered",
+      "native-builtin-names-asserted",
+      "scrolled-up",
+      "thinking-toggled",
+      "tools-toggled",
+      "conversation-closed",
+      "editor-restored",
+      "selection-restored",
+      "widget-navigation-restored",
+    ]);
+  });
+
+  test("a run missing a native presentation event is unsupported", () => {
+    const events = REQUIRED_CHILD_VIEW_EVENTS.filter((event) => event !== "native-builtin-tool-rendered");
+    expect(classifyChildConversationGate([...events])).toBe("unsupported");
+  });
+
+  test("a runtime built-in-name proof before its rendered built-in frame is unsupported", () => {
+    const events = [...REQUIRED_CHILD_VIEW_EVENTS];
+    const builtIn = events.indexOf("native-builtin-tool-rendered");
+    const names = events.indexOf("native-builtin-names-asserted");
+    [events[builtIn], events[names]] = [events[names]!, events[builtIn]!];
+    expect(classifyChildConversationGate(events)).toBe("unsupported");
+  });
+
+  test("waits for terminal stream closure after process exit", async () => {
+    const awaitTerminalClose = (childConversationGate as {
+      readonly awaitTerminalClose?: (child: { once(event: "close", listener: () => void): unknown; stdout: PassThrough; stderr: PassThrough }) => Promise<void>;
+    }).awaitTerminalClose;
+    expect(awaitTerminalClose).toBeFunction();
+    const process = new EventEmitter();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    stdout.resume();
+    stderr.resume();
+    let settled = false;
+    const closing = awaitTerminalClose!({
+      once: (event, listener) => process.once(event, listener), stdout, stderr,
+    }).then(() => { settled = true; });
+
+    process.emit("exit");
+    await Bun.sleep(0);
+    expect(settled).toBe(false);
+    stdout.end("late stdout");
+    stderr.end("late stderr");
+    process.emit("close");
+    await closing;
+    expect(settled).toBe(true);
+  });
+
+  test("detects 7-bit and C1 OSC 133 sequences in raw terminal chunks", () => {
+    const containsOsc133 = (childConversationGate as { readonly containsOsc133?: (value: string) => boolean }).containsOsc133;
+    expect(containsOsc133).toBeFunction();
+    expect(containsOsc133!("safe\u001b]133;A\u0007")).toBe(true);
+    expect(containsOsc133!("safe\u009d133;A\u009c")).toBe(true);
+    expect(containsOsc133!("safe\u001b]8;;https://example.test\u0007")).toBe(false);
   });
 
   test("reconstructs the current frame across split ANSI control sequences", () => {

@@ -1,14 +1,23 @@
 #!/usr/bin/env bun
 /** Real-Pi child-conversation open, navigation, toggle, close and restoration PTY gate. */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { finished } from "node:stream/promises";
+import type { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { assertOrdered, encodeKey } from "./focus-spike-protocol.ts";
 import { detectPiRuntime, piExecutable } from "./pi-runtime-target.ts";
-import { CHILD_GATE_EDITOR_TEXT } from "./child-conversation-gate-fixture.ts";
+import {
+  CHILD_GATE_BUILTIN_SUMMARY,
+  CHILD_GATE_EDITOR_TEXT,
+  CHILD_GATE_NATIVE_ASSISTANT_TEXT,
+  CHILD_GATE_NATIVE_USER_TEXT,
+  CHILD_GATE_OVERRIDE_SECRET,
+  CHILD_GATE_TOOL_PREVIEW,
+} from "./child-conversation-gate-fixture.ts";
 import {
   CHILD_CAPACITY_ENV,
   CHILD_DEPTH_ENV,
@@ -22,6 +31,12 @@ export const REQUIRED_CHILD_VIEW_EVENTS = [
   "nested-row-selected",
   "conversation-opened",
   "fullscreen-covered",
+  "native-user-rendered",
+  "native-assistant-rendered",
+  "native-builtin-tool-rendered",
+  "native-generic-tool-rendered",
+  "native-override-tool-rendered",
+  "native-builtin-names-asserted",
   "scrolled-up",
   "thinking-toggled",
   "tools-toggled",
@@ -50,6 +65,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "child-conversation-gate-fixture.ts");
 const ANSI_ESCAPE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/gu;
 const DIAGNOSTIC_EVENTS: ReadonlySet<string> = new Set(REQUIRED_CHILD_VIEW_EVENTS);
+
+/** Detects raw 7-bit and C1 OSC 133 shell-integration prefixes without stripping them. */
+export function containsOsc133(value: string): boolean {
+  return value.includes("\u001b]133;") || value.includes("\u009d133;");
+}
 
 /** Bounded failure evidence containing no terminal, editor or transcript content. */
 export function safeChildGateDiagnostic(
@@ -236,13 +256,19 @@ function writeInput(child: ChildProcess, data: string): void {
   child.stdin.write(data);
 }
 
-async function stop(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 2_000);
-    child.once("exit", () => { clearTimeout(timer); resolve(); });
-  });
+export async function awaitTerminalClose(child: {
+  once(event: "close", listener: () => void): unknown;
+  readonly stdout: Readable | null;
+  readonly stderr: Readable | null;
+}): Promise<void> {
+  const processClose = new Promise<void>((resolve) => { child.once("close", resolve); });
+  const streams = [child.stdout, child.stderr].filter((stream): stream is Readable => stream !== null);
+  await Promise.all([processClose, ...streams.map((stream) => stream.closed ? Promise.resolve() : finished(stream))]);
+}
+
+async function stop(child: ChildProcess, terminalClose: Promise<void>): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  await terminalClose;
 }
 
 function requireScript(): void {
@@ -278,27 +304,41 @@ export function createChildConversationGateEnvironment(
   return environment;
 }
 
-async function drive(command: readonly string[], workDir: string, eventFile: string, logFile: string): Promise<string[]> {
+async function drive(command: readonly string[], workDir: string, eventFile: string, proofFile: string, logFile: string): Promise<string[]> {
   const shellCommand = `stty rows ${ROWS} cols ${COLUMNS}; exec ${command.map(shellQuote).join(" ")}`;
   mkdirSync(join(workDir, "home"), { recursive: true });
   mkdirSync(join(workDir, "agent"), { recursive: true });
   const environment = createChildConversationGateEnvironment(workDir, eventFile);
+  environment.PI_CHILD_CONVERSATION_GATE_PROOF_FILE = proofFile;
   const child = spawn("script", ["-q", "-f", "-c", shellCommand, logFile], {
     cwd: workDir,
     env: environment,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const terminalClose = awaitTerminalClose(child);
   const terminal = new FixedTerminalScreen(ROWS, COLUMNS);
-  let output = "";
+  let cumulativeRawOutput = "";
+  let conversationOpen = false;
+  let rawOsc133Observed = false;
   const accept = (chunk: Buffer): void => {
     const text = chunk.toString("utf8");
-    output += text;
+    cumulativeRawOutput += text;
+    if (conversationOpen && containsOsc133(cumulativeRawOutput)) rawOsc133Observed = true;
     terminal.feed(text);
   };
   child.stdout.on("data", accept);
   child.stderr.on("data", accept);
   const events: string[] = [];
-  const detail = (phase: string): string => safeChildGateDiagnostic(phase, output, events);
+  const detail = (phase: string): string => safeChildGateDiagnostic(phase, cumulativeRawOutput, events);
+  const assertNoRawOsc133 = (): void => {
+    if (rawOsc133Observed || (conversationOpen && containsOsc133(cumulativeRawOutput))) {
+      throw new Error("raw output contains OSC 133 shell integration");
+    }
+  };
+  const observe = async (predicate: () => boolean, phase: string): Promise<void> => {
+    await waitFor(predicate, () => detail(phase));
+    assertNoRawOsc133();
+  };
 
   try {
     await waitFor(
@@ -307,9 +347,9 @@ async function drive(command: readonly string[], workDir: string, eventFile: str
     );
     events.push("editor-prefilled");
 
-    const beforeClear = output.length;
+    const beforeClear = cumulativeRawOutput.length;
     writeInput(child, "\u0003");
-    await waitFor(() => output.length > beforeClear, () => detail("clear draft"));
+    await waitFor(() => cumulativeRawOutput.length > beforeClear, () => detail("clear draft"));
     writeInput(child, encodeKey("down"));
     await waitFor(() => readTrace(eventFile).includes("widget-focused"), () => detail("widget focus"));
     events.push("widget-focused");
@@ -320,48 +360,87 @@ async function drive(command: readonly string[], workDir: string, eventFile: str
 
     writeInput(child, encodeKey("enter"));
     await waitFor(() => terminal.lines()[0]?.includes("A1.2") === true, () => detail("conversation open"));
+    conversationOpen = true;
+    assertNoRawOsc133();
     events.push("conversation-opened");
-    await waitFor(() => hasFullscreenConversationFrame(terminal.lines()), () => detail("fullscreen frame"));
+    await observe(() => hasFullscreenConversationFrame(terminal.lines()), "fullscreen frame");
     events.push("fullscreen-covered");
 
+    writeInput(child, "g");
+    await observe(() => terminal.text().includes(CHILD_GATE_NATIVE_USER_TEXT), "native user");
+    events.push("native-user-rendered");
+    await observe(() => terminal.text().includes(CHILD_GATE_NATIVE_ASSISTANT_TEXT), "native assistant");
+    events.push("native-assistant-rendered");
+    writeInput(child, "\u000f");
+    await observe(() => terminal.text().includes(CHILD_GATE_BUILTIN_SUMMARY)
+      && terminal.text().includes(CHILD_GATE_TOOL_PREVIEW) && terminal.text().includes("read"), "native built-in tool");
+    events.push("native-builtin-tool-rendered");
+    await observe(() => terminal.text().includes("subagent_probe")
+      && terminal.text().includes("fixture"), "native generic tool");
+    events.push("native-generic-tool-rendered");
+    writeInput(child, "\u000f");
+    await observe(() => !terminal.text().includes(CHILD_GATE_TOOL_PREVIEW), "tools collapse before renderer override proof");
+    for (let index = 0; index < 24 && !(terminal.text().includes("Result shown in bounded form")
+      && !terminal.text().includes(CHILD_GATE_BUILTIN_SUMMARY)
+      && !terminal.text().includes("subagent_probe")); index += 1) {
+      const beforeMove = cumulativeRawOutput.length;
+      writeInput(child, encodeKey("down"));
+      await waitFor(() => cumulativeRawOutput.length > beforeMove, () => detail("renderer override scroll"));
+      assertNoRawOsc133();
+    }
+    await observe(() => terminal.text().includes("read")
+      && terminal.text().includes("Result shown in bounded form")
+      && !terminal.text().includes(CHILD_GATE_BUILTIN_SUMMARY)
+      && !terminal.text().includes("subagent_probe")
+      && !terminal.text().includes(CHILD_GATE_OVERRIDE_SECRET), "renderer override tool");
+    events.push("native-override-tool-rendered");
+    writeFileSync(proofFile, "native-built-in-rendered\n", { flag: "wx", mode: 0o600 });
+    await observe(() => readTrace(eventFile).includes("native-builtin-names-asserted"), "runtime built-in names");
+    events.push("native-builtin-names-asserted");
+
+    writeInput(child, "G");
+    await observe(() => terminal.lines()[ROWS - 1]?.includes("following") === true, "conversation tail");
     writeInput(child, "\u001b[5~");
-    await waitFor(() => terminal.lines()[ROWS - 1]?.includes("paused") === true, () => detail("page up"));
+    await observe(() => terminal.lines()[ROWS - 1]?.includes("paused") === true, "page up");
     events.push("scrolled-up");
 
-    await waitFor(() => terminal.text().includes("CHILD_GATE_THINKING"), () => detail("thinking before toggle"));
+    writeInput(child, "g");
+    await observe(() => terminal.text().includes("CHILD_GATE_THINKING"), "thinking before toggle");
     writeInput(child, "\u0014");
-    await waitFor(() => !terminal.text().includes("CHILD_GATE_THINKING"), () => detail("thinking toggle"));
+    await observe(() => !terminal.text().includes("CHILD_GATE_THINKING"), "thinking toggle");
     events.push("thinking-toggled");
 
     writeInput(child, "\u000f");
-    await waitFor(() => terminal.text().includes("CHILD_GATE_TOOL_PREVIEW"), () => detail("tools toggle"));
+    await observe(() => terminal.text().includes("CHILD_GATE_TOOL_PREVIEW"), "tools toggle");
     events.push("tools-toggled");
 
     writeInput(child, encodeKey("escape"));
-    await waitFor(() => !terminal.lines()[0]?.includes("A1.2"), () => detail("conversation close"));
+    await observe(() => !terminal.lines()[0]?.includes("A1.2"), "conversation close");
     events.push("conversation-closed");
-    await waitFor(() => terminal.text().includes(CHILD_GATE_EDITOR_TEXT), () => detail("editor restore"));
+    await observe(() => terminal.text().includes(CHILD_GATE_EDITOR_TEXT), "editor restore");
     events.push("editor-restored");
 
     writeInput(child, encodeKey("enter"));
-    await waitFor(() => terminal.lines()[0]?.includes("A1.2") === true, () => detail("selection restore"));
+    await observe(() => terminal.lines()[0]?.includes("A1.2") === true, "selection restore");
     events.push("selection-restored");
     writeInput(child, encodeKey("escape"));
-    await waitFor(() => !terminal.lines()[0]?.includes("A1.2"), () => detail("second close"));
+    await observe(() => !terminal.lines()[0]?.includes("A1.2"), "second close");
     writeInput(child, encodeKey("up"));
-    await waitFor(() => /›[^\n]*A1(?!\.)/u.test(terminal.text()), () => detail("widget navigation"));
+    await observe(() => /›[^\n]*A1(?!\.)/u.test(terminal.text()), "widget navigation");
     writeInput(child, encodeKey("up"));
-    await waitFor(() => readTrace(eventFile).includes("editor-refocused"), () => detail("widget navigation restore"));
+    await observe(() => readTrace(eventFile).includes("editor-refocused"), "widget navigation restore");
     events.push("widget-navigation-restored");
     return events;
   } finally {
-    await stop(child);
+    await stop(child, terminalClose);
+    assertNoRawOsc133();
   }
 }
 
 async function main(): Promise<void> {
   const workDir = mkdtempSync(join(tmpdir(), "pi-child-conversation-gate-"));
   const eventFile = join(workDir, "events.txt");
+  const proofFile = join(workDir, "built-in-proof.txt");
   const logFile = join(workDir, "script.log");
   let outcome: ChildConversationGateOutcome = "not-run";
   let reason = "gate did not run";
@@ -380,14 +459,17 @@ async function main(): Promise<void> {
       "--no-prompt-templates",
       "--no-themes",
       "--approve",
-    ], workDir, eventFile, logFile);
+    ], workDir, eventFile, proofFile, logFile);
     process.stderr.write(`child conversation gate events: ${JSON.stringify(events)}\n`);
     outcome = classifyChildConversationGate(events);
     if (outcome !== "supported") reason = "required event ordering was not observed";
   } catch (error) {
     outcome = "unsupported";
     const errorType = error instanceof Error ? error.name : typeof error;
-    reason = `${safeChildGateDiagnostic("runtime failure", "", readTrace(eventFile))}; errorType=${errorType}`;
+    const rawOsc133 = error instanceof Error && error.message === "raw output contains OSC 133 shell integration";
+    const failedPhase = error instanceof Error ? /^timeout: ([^;]+)/u.exec(error.message)?.[1] : undefined;
+    const phase = failedPhase === undefined ? "runtime failure" : failedPhase;
+    reason = `${safeChildGateDiagnostic(phase, "", readTrace(eventFile))}; errorType=${errorType}; rawOsc133=${rawOsc133}`;
   } finally {
     rmSync(workDir, { recursive: true, force: true });
   }
