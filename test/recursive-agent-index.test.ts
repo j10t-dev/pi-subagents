@@ -639,6 +639,53 @@ describe("RecursiveAgentIndex", () => {
     expect(watcher.calls.at(-1)).toEqual([root, laterActive, earlierTerminal, activeOne, activeTwo]);
   });
 
+  test("admits a later active duplicate identity over an earlier terminal child across publishers", () => {
+    const earlierParent = agentId("duplicate-priority-earlier-parent");
+    const laterParent = agentId("duplicate-priority-later-parent");
+    const sharedChild = agentId("duplicate-priority-shared-child");
+    const reads: AgentId[] = [];
+    const reader: typeof readKnownChildSnapshots = (root, ids) => {
+      reads.push(...ids);
+      return readKnownChildSnapshots(root, ids);
+    };
+    writeSnapshot(snapshot(earlierParent, [
+      observationRow("A1", sharedChild, CompletionState.Completed),
+    ]));
+    writeSnapshot(snapshot(laterParent, [
+      observationRow("A1", sharedChild, AgentState.Running),
+    ]));
+    const { index, watcher } = fixture(
+      direct([projection(earlierParent, "A1"), projection(laterParent, "A2")]),
+      { maxRows: 3, readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A2", "A2.1"]);
+    expect(index.snapshot().rows.at(-1)?.state).toBe(AgentState.Running);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(4), omitted: agentCount(1), degraded: true });
+    expect(reads).toEqual([earlierParent, laterParent]);
+    expect(watcher.calls.at(-1)).toEqual([earlierParent, laterParent, sharedChild]);
+  });
+
+  test("admits a later active duplicate direct identity over an earlier terminal entry", () => {
+    const sharedOwner = agentId("duplicate-priority-direct-owner");
+    const { index, watcher } = fixture(
+      direct([
+        projection(sharedOwner, "A1", CompletionState.Completed),
+        projection(sharedOwner, "A2", AgentState.Running),
+      ]),
+      { maxRows: 1 },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A2"]);
+    expect(index.ownerOf(agentOrdinal("A2"))).toBe(sharedOwner);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(1), degraded: true });
+    expect(watcher.calls.at(-1)).toEqual([sharedOwner]);
+  });
+
   test("propagates publisher totals and degradation", () => {
     const root = agentId("root");
     writeSnapshot(snapshot(root, [observationRow("A1", "leaf", CompletionState.Completed)], {

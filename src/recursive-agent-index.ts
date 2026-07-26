@@ -136,13 +136,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     let degraded = direct.health.kind === "degraded" || Number(direct.omittedActive) > 0;
 
     const directCandidates: TraversalCandidate[] = [];
-    const directOwners = new Set<AgentId>();
     for (const entry of direct.entries) {
-      if (directOwners.has(entry.agentId)) {
-        degraded = true;
-        continue;
-      }
-      directOwners.add(entry.agentId);
       directCandidates.push({
         owner: entry.agentId,
         parent: undefined,
@@ -170,7 +164,6 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
       }
       const levelEnd = ownerQueue.length;
       const candidates: TraversalCandidate[] = [];
-      const levelOwners = new Set<AgentId>();
       for (let cursor = levelStart; cursor < levelEnd; cursor += 1) {
         const parent = ownerQueue[cursor]!;
         let result: KnownChildSnapshots;
@@ -214,7 +207,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
 
         for (const child of selected.agents) {
           if (terminal && !isTerminal(child.state)) degraded = true;
-          const candidate = childCandidate(parent, child, seen, levelOwners);
+          const candidate = childCandidate(parent, child, seen);
           if (candidate === undefined) {
             degraded = true;
             continue;
@@ -346,15 +339,11 @@ function childCandidate(
   parent: AdmittedNode,
   child: ObservationRow,
   seen: ReadonlySet<AgentId>,
-  levelOwners: Set<AgentId>,
 ): TraversalCandidate | undefined {
   const depth = Number(parent.row.depth) + 1;
-  if (depth >= Number(MAX_WALK_DEPTH) || seen.has(child.sessionId) || levelOwners.has(child.sessionId)) {
-    return undefined;
-  }
+  if (depth >= Number(MAX_WALK_DEPTH) || seen.has(child.sessionId)) return undefined;
   const ordinal = composeOrdinal(parent.row.ordinal, child.ordinal);
   if (ordinal === undefined) return undefined;
-  levelOwners.add(child.sessionId);
   return {
     owner: child.sessionId,
     parent,
@@ -383,8 +372,18 @@ function selectLevelCandidates(
   const terminal = candidates
     .filter((candidate) => isTerminal(candidate.ownerState))
     .sort((left, right) => compareLocalOrdinals(right.localOrdinal, left.localOrdinal));
-  const admitted = [...active, ...terminal].slice(0, remainingRows);
-  return { candidates: admitted, rejected: admitted.length !== candidates.length };
+  const admitted: TraversalCandidate[] = [];
+  const admittedOwners = new Set<AgentId>();
+  let rejected = false;
+  for (const candidate of [...active, ...terminal]) {
+    if (admitted.length >= remainingRows || admittedOwners.has(candidate.owner)) {
+      rejected = true;
+      continue;
+    }
+    admittedOwners.add(candidate.owner);
+    admitted.push(candidate);
+  }
+  return { candidates: admitted, rejected };
 }
 
 function compareCandidatesByLocalOrdinal(left: TraversalCandidate, right: TraversalCandidate): number {
