@@ -6,15 +6,32 @@ Use the smallest check that proves the claim, then run the complete required gat
 
 ```sh
 bun install --frozen-lockfile
-bun run typecheck
+bun run check
 bun run test
 ```
 
-- `bun run typecheck` runs strict TypeScript checking without emission.
-- `bun run test` discovers every non-live `*.test.ts`, requires exactly one group owner and runs groups concurrently where safe.
+`bun run check` aggregates the static gates. Run any of them on its own when it gives the shortest feedback loop:
+
+```sh
+bun run typecheck
+bun run lint
+bun run check:architecture
+```
+
+- `bun run typecheck` owns strict TypeScript checking without emission.
+- `bun run lint` owns the typed ESLint rules over `index.ts`, `src`, `test` and `scripts`.
+- `bun run check:architecture` owns the production dependency policy: no runtime cycles, no upward foundation dependency and no authority dependency from projection modules.
+- `bun run check` runs those three in the displayed order and is fail-fast, so a failure stops the aggregate before the later tools start and the failing tool is unambiguous.
+- Failures retain each tool's native diagnostics; the aggregate adds no wrapper formatting.
+- dependency-cruiser runs entirely local from a development dependency. It contacts no network service and publishes no report.
+- `bun run test` remains the independently grouped suite and is not part of `check`. It discovers every non-live `*.test.ts`, requires exactly one group owner and runs groups concurrently where safe.
 - The live-model smoke is deliberately excluded from normal discovery.
 
 Documentation-only changes require link/path inspection and the standard gates when they alter executable command guidance. If unrelated concurrent code prevents a standard gate, report that evidence rather than treating the documentation as verified by assumption.
+
+### Advisory dead-code audit
+
+Knip was evaluated once during the change that introduced these gates. It is not installed, not scripted and not required: the repository carries no Knip dependency, script or configuration, and no gate depends on it. Recurring adoption needs a separate approved design covering its entry-point model and the handling of its false positives.
 
 ## Test groups
 

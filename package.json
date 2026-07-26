@@ -16,6 +16,7 @@
   "devDependencies": {
     "@types/node": "24.12.4",
     "bun-types": "1.3.5",
+    "dependency-cruiser": "18.1.0",
     "eslint": "10.8.0",
     "typescript": "5.9.3",
     "typescript-eslint": "8.65.0"
@@ -25,11 +26,13 @@
     "test:unit": "bun scripts/run-tests.ts --group unit",
     "test:transport": "bun scripts/run-tests.ts --group transport",
     "check:cgroup": "bun scripts/check-cgroup-v2.ts",
+    "check:architecture": "depcruise index.ts src --config dependency-cruiser.config.cjs",
     "lint": "eslint .",
     "test:process": "bun scripts/run-tests.ts --group process",
     "test:controller": "bun scripts/run-tests.ts --group controller",
     "test:integration": "bun scripts/run-tests.ts --group integration",
     "test:live-model": "PI_SUBAGENTS_LIVE_SMOKE=1 bun test test/live-model-smoke.test.ts --timeout 120000",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun run lint && bun run check:architecture"
   }
 }
