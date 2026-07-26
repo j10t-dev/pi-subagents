@@ -245,6 +245,24 @@ describe("RecursiveAgentIndex", () => {
     relay.dispose();
   });
 
+  test("rejects a composed publisher ordinal before it collides with a nested direct path", () => {
+    const root = agentId("collision-root");
+    const directChild = agentId("collision-child");
+    writeSnapshot(snapshot(root, [
+      observationRow("A2", directChild),
+      observationRow("A2.1", "composed-collision", CompletionState.Completed),
+    ]));
+    writeSnapshot(snapshot(directChild, [
+      observationRow("A1", "nested-collision", CompletionState.Completed),
+    ]));
+
+    const { index } = fixture(direct([projection(root, "A1")]));
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(1), omitted: agentCount(0), degraded: true });
+  });
+
   test("admits depth MAX_WALK_DEPTH - 1, cuts MAX_WALK_DEPTH and guards cycles and overlong ordinals", () => {
     expect(Number(MAX_WALK_DEPTH)).toBe(8);
     const root = agentId("depth-0");
@@ -273,7 +291,45 @@ describe("RecursiveAgentIndex", () => {
     expect(second.watcher.calls.at(-1)).toEqual([cycleRoot, longRoot]);
   });
 
-  test("selects breadth-first under budget but emits depth-first pre-order", () => {
+  test("cuts active direct subtrees before first-level reads when direct rows exactly fill the budget", () => {
+    const left = agentId("direct-budget-left");
+    const right = agentId("direct-budget-right");
+    let phase: "full" | "room" = "full";
+    const reads: AgentId[] = [];
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => {
+      reads.push(...ids);
+      const revision = phase === "full" ? 5 : 4;
+      const label = phase === "full" ? "must-not-retain" : "fresh-lower-revision";
+      return {
+        snapshots: new Map(ids.map((owner) => [owner, snapshot(owner, [
+          observationRow("A1", `${owner}-child`, CompletionState.Completed, label),
+        ], { incarnation: incarnationId("direct-budget-inc"), revision })])),
+        skipped: new Map(),
+      };
+    };
+    const { index, port, watcher } = fixture(
+      direct([projection(left, "A1"), projection(right, "A2")]),
+      { maxRows: 2, readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A2"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: true });
+    expect(reads).toEqual([]);
+    expect(watcher.calls.at(-1)).toEqual([left, right]);
+
+    phase = "room";
+    port.result = direct([projection(left, "A1")]);
+    index.refresh();
+
+    expect(reads).toEqual([left]);
+    expect(index.snapshot().rows[1]?.taskLabel).toBe("fresh-lower-revision" as TaskLabel);
+    expect(index.snapshot().degraded).toBe(false);
+    expect(watcher.calls.at(-1)).toEqual([left]);
+  });
+
+  test("finishes current-level accounting but does not read the next BFS level after exhausting the row budget", () => {
     const left = agentId("left");
     const right = agentId("right");
     const leftDeep = agentId("left-deep");
@@ -297,12 +353,26 @@ describe("RecursiveAgentIndex", () => {
     index.refresh();
 
     expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1", "A1.2", "A2", "A2.1"]);
-    expect(index.snapshot()).toMatchObject({ total: agentCount(6), omitted: agentCount(1), degraded: true });
-    expect(readBatches.flat()).toEqual([left, right, leftDeep]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(5), omitted: agentCount(0), degraded: true });
+    expect(readBatches.flat()).toEqual([left, right]);
+    expect(readBatches.flat()).not.toContain(leftDeep);
     expect(readBatches.flat()).not.toContain(rejected);
     expect(watcher.calls.at(-1)).toEqual([left, right, leftDeep]);
     expect(watcher.calls.at(-1)!.length).toBeLessThanOrEqual(5);
     expect(new Set(readBatches.flat()).size).toBeLessThanOrEqual(5);
+  });
+
+  test("keeps an exact full budget healthy when no next-level publisher remains", () => {
+    const root = agentId("exact-budget-root");
+    writeSnapshot(snapshot(root, [
+      observationRow("A1", "exact-budget-leaf", CompletionState.Completed),
+    ]));
+    const { index } = fixture(direct([projection(root, "A1")]), { maxRows: 2 });
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: false });
   });
 
   test("clamps an oversized dependency budget to MAX_WIDGET_ROWS across admission and retention", () => {
@@ -325,7 +395,7 @@ describe("RecursiveAgentIndex", () => {
 
     index.refresh();
     expect(index.snapshot().rows).toHaveLength(Number(MAX_WIDGET_ROWS));
-    expect(reads).toHaveLength(Number(MAX_WIDGET_ROWS));
+    expect(reads).toHaveLength(0);
     expect(watcher.calls.at(-1)).toHaveLength(Number(MAX_WIDGET_ROWS));
     expect(reads).not.toContain(owners.at(-1));
     expect(watcher.calls.at(-1)).not.toContain(owners.at(-1));

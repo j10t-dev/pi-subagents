@@ -1,5 +1,16 @@
 import { execSync } from "node:child_process";
-import { lstatSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -83,10 +94,10 @@ describe("current observation snapshot codec", () => {
     expect(readKnownChildSnapshots(agentDir, [value.sessionId]).snapshots.get(value.sessionId)).toEqual(value);
   });
 
-  test("accepts a composed local ordinal", () => {
+  test("rejects a composed local ordinal", () => {
     const value = snapshot({ agents: [{ ...ROW, ordinal: agentOrdinal("A1.2") }] });
     writeSnapshot(CHILD_1, value);
-    expect(readKnownChildSnapshots(agentDir, [CHILD_1]).snapshots.get(CHILD_1)).toEqual(value);
+    expect(readKnownChildSnapshots(agentDir, [CHILD_1]).skipped.get(CHILD_1)).toBe("malformed");
   });
 
   test.each([
@@ -135,6 +146,28 @@ describe("readKnownChildSnapshots hardening", () => {
     writeSnapshot(CHILD_1, { ...raw(snapshot()), ignored: "x".repeat(Number(MAX_SNAPSHOT_BYTES)) });
     expect(readKnownChildSnapshots(agentDir, [CHILD_1]).skipped.get(CHILD_1)).toBe("oversized");
     expect(readKnownChildSnapshots(agentDir, [smuggled("../escape")]).skipped.get(smuggled("../escape"))).toBe("invalid-session-id");
+  });
+
+  test("contains descriptor close failure and preserves an earlier read failure", () => {
+    writeSnapshot(CHILD_1, snapshot());
+    const filesystem = {
+      open: openSync,
+      fstat: fstatSync,
+      read: readSync,
+      close: (fd: number): void => {
+        closeSync(fd);
+        throw new Error("close failed");
+      },
+    };
+
+    const closeOnly = readKnownChildSnapshots(agentDir, [CHILD_1], filesystem);
+    expect(closeOnly.skipped.get(CHILD_1)).toBe("unreadable");
+
+    const readThenClose = readKnownChildSnapshots(agentDir, [CHILD_1], {
+      ...filesystem,
+      read: (): number => { throw Object.assign(new Error("missing during read"), { code: "ENOENT" }); },
+    });
+    expect(readThenClose.skipped.get(CHILD_1)).toBe("missing");
   });
 
   test("refuses a child slot symlinked outside the managed root", () => {

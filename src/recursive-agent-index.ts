@@ -145,65 +145,78 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
       }
     }
 
-    for (let cursor = 0; cursor < activeQueue.length; cursor += 1) {
-      const parent = activeQueue[cursor]!;
-      let result: KnownChildSnapshots;
-      try {
-        result = this.readSlots(this.dependencies.agentDir, [parent.sessionId]);
-      } catch {
+    let levelStart = 0;
+    while (levelStart < activeQueue.length) {
+      if (admittedCount >= maximumRows) {
         degraded = true;
-        continue;
+        break;
       }
-      const incoming = result.snapshots.get(parent.sessionId);
-      if (incoming === undefined) {
-        degraded = true;
-        continue;
-      }
-
-      const retained = this.retained.get(parent.sessionId);
-      let selected = incoming;
-      if (retained !== undefined && retained.snapshot.incarnation === incoming.incarnation &&
-          Number(incoming.revision) < Number(retained.snapshot.revision)) {
-        selected = retained.snapshot;
-        degraded = true;
-      }
-      nextRetained.set(parent.sessionId, { snapshot: selected });
-      if (selected.degraded) degraded = true;
-      const addition = saturatingAdd(total, Number(selected.total));
-      total = addition.value;
-      if (addition.saturated) degraded = true;
-
-      for (const child of selected.agents) {
-        const depth = Number(parent.row.depth) + 1;
-        if (depth >= Number(MAX_WALK_DEPTH) || admittedCount >= maximumRows || seen.has(child.sessionId)) {
+      const levelEnd = activeQueue.length;
+      for (let cursor = levelStart; cursor < levelEnd; cursor += 1) {
+        const parent = activeQueue[cursor]!;
+        let result: KnownChildSnapshots;
+        try {
+          result = this.readSlots(this.dependencies.agentDir, [parent.sessionId]);
+        } catch {
           degraded = true;
           continue;
         }
-        const ordinal = composeOrdinal(parent.row.ordinal, child.ordinal);
-        if (ordinal === undefined) {
+        const incoming = result.snapshots.get(parent.sessionId);
+        if (incoming === undefined) {
           degraded = true;
           continue;
         }
-        const node: AdmittedNode = {
-          sessionId: child.sessionId,
-          row: {
-            ordinal,
-            depth: agentDepth(depth),
-            model: child.model,
-            context: child.context,
-            taskLabel: child.taskLabel,
-            state: child.state,
-          },
-          children: [],
-        };
-        parent.children.push(node);
-        seen.add(child.sessionId);
-        admittedCount += 1;
-        if (!isTerminal(child.state)) {
-          activeQueue.push(node);
-          tracked.push(child.sessionId);
+
+        const retained = this.retained.get(parent.sessionId);
+        let selected = incoming;
+        if (retained !== undefined && retained.snapshot.incarnation === incoming.incarnation &&
+            Number(incoming.revision) < Number(retained.snapshot.revision)) {
+          selected = retained.snapshot;
+          degraded = true;
+        }
+        nextRetained.set(parent.sessionId, { snapshot: selected });
+        if (selected.degraded) degraded = true;
+        const addition = saturatingAdd(total, Number(selected.total));
+        total = addition.value;
+        if (addition.saturated) degraded = true;
+
+        for (const child of selected.agents) {
+          const depth = Number(parent.row.depth) + 1;
+          if (depth >= Number(MAX_WALK_DEPTH) || admittedCount >= maximumRows || seen.has(child.sessionId)) {
+            degraded = true;
+            continue;
+          }
+          const ordinal = composeOrdinal(parent.row.ordinal, child.ordinal);
+          if (ordinal === undefined) {
+            degraded = true;
+            continue;
+          }
+          const node: AdmittedNode = {
+            sessionId: child.sessionId,
+            row: {
+              ordinal,
+              depth: agentDepth(depth),
+              model: child.model,
+              context: child.context,
+              taskLabel: child.taskLabel,
+              state: child.state,
+            },
+            children: [],
+          };
+          parent.children.push(node);
+          seen.add(child.sessionId);
+          admittedCount += 1;
+          if (!isTerminal(child.state)) {
+            activeQueue.push(node);
+            tracked.push(child.sessionId);
+          }
         }
       }
+      if (admittedCount >= maximumRows && activeQueue.length > levelEnd) {
+        degraded = true;
+        break;
+      }
+      levelStart = levelEnd;
     }
 
     const rows: AgentRow[] = [];

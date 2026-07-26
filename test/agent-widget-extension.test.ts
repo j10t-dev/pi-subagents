@@ -214,8 +214,10 @@ function ambientRecorder(): { text: string | undefined } {
   return state;
 }
 
-function publisherPort(label: string) {
+function publisherPort(label: string, options: { readonly unsubscribeFailures?: number } = {}) {
   const listeners = new Set<(change: ObservationChange) => void>();
+  let unsubscribeFailures = options.unsubscribeFailures ?? 0;
+  let unsubscribeAttempts = 0;
   const id = agentId("publisher-child");
   const observation: AgentObservation = {
     agentId: id, ordinal: agentOrdinal("A1"), taskLabel: label as TaskLabel, modelLabel: "luna:h" as ModelLabel,
@@ -238,7 +240,17 @@ function publisherPort(label: string) {
       }],
     }),
     transcriptSource: () => undefined,
-    subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        unsubscribeAttempts += 1;
+        if (unsubscribeFailures > 0) {
+          unsubscribeFailures -= 1;
+          throw new Error("publisher port unsubscribe");
+        }
+        listeners.delete(listener);
+      };
+    },
   };
   return {
     port,
@@ -248,6 +260,8 @@ function publisherPort(label: string) {
       };
       for (const listener of listeners) listener(change);
     },
+    listenerCount: () => listeners.size,
+    unsubscribeAttempts: () => unsubscribeAttempts,
   };
 }
 
@@ -342,6 +356,39 @@ describe("publisher roles", () => {
       h.arrive(undefined);
       await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
       expect(h.bytes()).toBe(prior);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  test("handover subscribes the new publisher port when old unsubscription fails and retries both cleanups", async () => {
+    const context = parseExtensionLaunchContext({ PI_SUBAGENT_CHILD: "1" });
+    const first = publisherPort("first task", { unsubscribeFailures: 1 });
+    const second = publisherPort("second task");
+    const h = publisherFor(context, "rpc");
+    try {
+      h.arrive(first.port);
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(first.listenerCount()).toBe(1);
+
+      h.arrive(second.port);
+      expect(second.listenerCount()).toBe(1);
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      const handoverRevision = h.published()!.revision;
+
+      first.emit();
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(h.published()!.revision).toBe(handoverRevision);
+
+      second.emit();
+      await Bun.sleep(Number(RELAY_FLUSH_WINDOW_MS) + 30);
+      expect(Number(h.published()!.revision)).toBe(Number(handoverRevision) + 1);
+
+      h.shutdown();
+      expect(first.unsubscribeAttempts()).toBe(2);
+      expect(second.unsubscribeAttempts()).toBe(1);
+      expect(first.listenerCount()).toBe(0);
+      expect(second.listenerCount()).toBe(0);
     } finally {
       h.dispose();
     }

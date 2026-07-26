@@ -1,7 +1,7 @@
 import { watch } from "node:fs";
 
 import { MAX_WATCH_RETRY_INTERVAL_MS, WATCH_FALLBACK_INTERVAL_MS } from "./constants.ts";
-import type { AbsolutePath, AgentId, Milliseconds } from "./domain.ts";
+import { milliseconds, type AbsolutePath, type AgentId, type Milliseconds } from "./domain.ts";
 import { observationSlotDirectory } from "./observation-snapshot-path.ts";
 import { WidgetDiagnosticCode, type WidgetDiagnosticCode as WidgetDiagnosticCodeValue } from "./widget-diagnostics.ts";
 
@@ -120,7 +120,7 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
     for (const handle of liveHandles) this.close(handle);
   }
 
-  private attach(sessionId: AgentId): void {
+  private attach(sessionId: AgentId, notifyOnSuccess = true): void {
     if (this.disposed) return;
     const prior = this.slots.get(sessionId);
     let handle: SnapshotWatchHandle;
@@ -143,7 +143,7 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
       this.attachFailed(sessionId, prior, error);
       return;
     }
-    this.notifyChange();
+    if (notifyOnSuccess) this.notifyChange();
     this.updateInterval();
   }
 
@@ -179,7 +179,10 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
     const now = this.clock.now();
     for (const [sessionId, state] of [...this.slots]) {
       if (state.kind === "unavailable") this.notifyChange();
-      else if (state.kind === "pending" && state.dueAt <= now) this.attach(sessionId);
+      else if (state.kind === "pending" && state.dueAt <= now) {
+        try { this.attach(sessionId, false); }
+        finally { this.notifyChange(); }
+      }
     }
     this.updateInterval();
   }
@@ -213,7 +216,7 @@ class ManagedSnapshotWatcher implements SnapshotWatcher {
 }
 
 function doubledDelay(delay: Milliseconds, maximum: Milliseconds): Milliseconds {
-  return Math.min(Number(delay) * 2, Number(maximum)) as Milliseconds;
+  return milliseconds(Math.min(Number(delay) * 2, Number(maximum)));
 }
 
 function isMissing(error: unknown): boolean {

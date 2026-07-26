@@ -114,21 +114,23 @@ function fixture() {
 }
 
 describe("SnapshotWatcher", () => {
-  test("retries missing slots with capped exponential backoff and refreshes only after attachment", () => {
-    const { clock, watches, changes, watcher } = fixture();
+  test("refreshes exactly once for every due missing-slot retry, including successful attachment", () => {
+    const { clock, watches, changes, diagnostics, watcher } = fixture();
     watches.queue(CHILD, "ENOENT", "ENOENT", "ENOENT", "ENOENT", "ENOENT", "ENOENT", "success");
 
     watcher.track([CHILD]);
     expect(changes).toEqual([]);
     expect(Number(MAX_WATCH_RETRY_INTERVAL_MS)).toBe(30_000);
-    for (const delay of [2_000, 4_000, 8_000, 16_000, 30_000]) {
+    for (const [index, delay] of [2_000, 4_000, 8_000, 16_000, 30_000].entries()) {
       clock.advance(milliseconds(delay));
-      expect(changes).toEqual([]);
+      expect(changes).toHaveLength(index + 1);
+      expect(diagnostics).toEqual([]);
     }
     clock.advance(MAX_WATCH_RETRY_INTERVAL_MS);
 
     expect(watches.attempts).toEqual([CHILD, CHILD, CHILD, CHILD, CHILD, CHILD, CHILD]);
-    expect(changes).toEqual(["change"]);
+    expect(changes).toHaveLength(6);
+    expect(diagnostics).toEqual([]);
     expect(clock.intervals.size).toBe(0);
   });
 
@@ -161,7 +163,7 @@ describe("SnapshotWatcher", () => {
     clock.advance(milliseconds(2_000));
     clock.advance(milliseconds(4_000));
 
-    expect(changes).toEqual(["change", "change", "change"]);
+    expect(changes).toEqual(["change", "change", "change", "change"]);
     expect(clock.intervals.size).toBe(0);
   });
 
@@ -179,6 +181,29 @@ describe("SnapshotWatcher", () => {
     expect(changes).toEqual(["change", "change"]);
     watcher.track([]);
     expect(clock.intervals.size).toBe(0);
+  });
+
+  test("dispose releases a live handle and the shared pending/unavailable interval", () => {
+    const pending = agentId("pending");
+    const unavailable = agentId("unavailable");
+    const { clock, watches, changes, watcher } = fixture();
+    watches.queue(CHILD, "success");
+    watches.queue(pending, "ENOENT");
+    watches.queue(unavailable, "EACCES");
+
+    watcher.track([CHILD, pending, unavailable]);
+    expect(clock.intervals.size).toBe(1);
+    expect(watches.latest(CHILD).closed).toBe(false);
+
+    watcher.dispose();
+    const attemptsAtDispose = [...watches.attempts];
+    const changesAtDispose = [...changes];
+    clock.advance(MAX_WATCH_RETRY_INTERVAL_MS);
+
+    expect(watches.latest(CHILD).closed).toBe(true);
+    expect(clock.intervals.size).toBe(0);
+    expect(watches.attempts).toEqual(attemptsAtDispose);
+    expect(changes).toEqual(changesAtDispose);
   });
 
   test("closes dropped live handles and contains consumer callback failures", () => {

@@ -80,6 +80,21 @@ export interface KnownChildSnapshots {
   readonly skipped: ReadonlyMap<AgentId, SnapshotSkipReason>;
 }
 
+/** Narrow synchronous filesystem boundary for bounded snapshot reads. */
+export interface SnapshotReadFileSystem {
+  open(path: ObservationSnapshotPath, flags: number): number;
+  fstat(fd: number): { isFile(): boolean };
+  read(fd: number, buffer: Buffer, offset: number, length: number, position: number): number;
+  close(fd: number): void;
+}
+
+const productionSnapshotReadFileSystem: SnapshotReadFileSystem = {
+  open: openSync,
+  fstat: fstatSync,
+  read: readSync,
+  close: closeSync,
+};
+
 /** Shared lexical owner slot directory for relay publication and watcher reads. */
 export function observationSlotDirectory(agentDir: AbsolutePath, ownerSessionId: AgentId): AbsolutePath {
   try {
@@ -104,11 +119,12 @@ export function observationSnapshotPath(agentDir: AbsolutePath, ownerSessionId: 
 export function readKnownChildSnapshots(
   agentDir: AbsolutePath,
   knownChildSessionIds: readonly AgentId[],
+  filesystem: SnapshotReadFileSystem = productionSnapshotReadFileSystem,
 ): KnownChildSnapshots {
   const snapshots = new Map<AgentId, ObservationSnapshot>();
   const skipped = new Map<AgentId, SnapshotSkipReason>();
   for (const sessionId of knownChildSessionIds) {
-    const outcome = readOne(agentDir, sessionId);
+    const outcome = readOne(agentDir, sessionId, filesystem);
     if (outcome.ok) snapshots.set(sessionId, outcome.snapshot);
     else skipped.set(sessionId, outcome.reason);
   }
@@ -122,7 +138,11 @@ type BoundedRead =
   | { readonly ok: true; readonly text: string }
   | { readonly ok: false; readonly reason: SnapshotSkipReason };
 
-function readOne(agentDir: AbsolutePath, sessionId: AgentId): ReadOutcome {
+function readOne(
+  agentDir: AbsolutePath,
+  sessionId: AgentId,
+  filesystem: SnapshotReadFileSystem,
+): ReadOutcome {
   let path: ObservationSnapshotPath;
   try {
     path = observationSnapshotPath(agentDir, sessionId);
@@ -134,7 +154,7 @@ function readOne(agentDir: AbsolutePath, sessionId: AgentId): ReadOutcome {
   } catch (error) {
     return { ok: false, reason: isMissing(error) ? "missing" : "escapes-managed-root" };
   }
-  const read = readBounded(path);
+  const read = readBounded(path, filesystem);
   if (!read.ok) return read;
   let parsed: unknown;
   try {
@@ -149,20 +169,32 @@ function readOne(agentDir: AbsolutePath, sessionId: AgentId): ReadOutcome {
 }
 
 /** Reads a capped amount in one pass and refuses links, FIFOs, devices and directories. */
-function readBounded(path: ObservationSnapshotPath): BoundedRead {
-  let fd = -1;
+function readBounded(path: ObservationSnapshotPath, filesystem: SnapshotReadFileSystem): BoundedRead {
+  let fd: number | undefined;
+  let failure: unknown;
+  let outcome: BoundedRead = { ok: false, reason: "unreadable" };
   try {
-    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-    if (!fstatSync(fd).isFile()) return { ok: false, reason: "not-a-regular-file" };
-    const buffer = Buffer.allocUnsafe(Number(MAX_SNAPSHOT_BYTES) + 1);
-    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-    if (bytesRead > MAX_SNAPSHOT_BYTES) return { ok: false, reason: "oversized" };
-    return { ok: true, text: buffer.toString("utf-8", 0, bytesRead) };
+    fd = filesystem.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    if (!filesystem.fstat(fd).isFile()) {
+      outcome = { ok: false, reason: "not-a-regular-file" };
+    } else {
+      const buffer = Buffer.allocUnsafe(Number(MAX_SNAPSHOT_BYTES) + 1);
+      const bytesRead = filesystem.read(fd, buffer, 0, buffer.length, 0);
+      outcome = bytesRead > MAX_SNAPSHOT_BYTES
+        ? { ok: false, reason: "oversized" }
+        : { ok: true, text: buffer.toString("utf-8", 0, bytesRead) };
+    }
   } catch (error) {
-    return { ok: false, reason: isMissing(error) ? "missing" : "unreadable" };
+    failure = error;
   } finally {
-    if (fd >= 0) closeSync(fd);
+    if (fd !== undefined) {
+      try { filesystem.close(fd); }
+      catch (error) { failure ??= error; }
+    }
   }
+  return failure === undefined
+    ? outcome
+    : { ok: false, reason: isMissing(failure) ? "missing" : "unreadable" };
 }
 
 function decodeSnapshot(value: unknown, requestedSessionId: AgentId): ObservationSnapshot | "session-id-mismatch" | undefined {
@@ -205,8 +237,10 @@ function decodeRow(value: unknown): ObservationRow | undefined {
   if (!isDisplayText(value.model, 1_024) || !isDisplayText(value.taskLabel, 512) ||
       !isDisplayText(value.context, Number.POSITIVE_INFINITY) || [...value.context].length > 8 || !isDisplayState(value.state)) return undefined;
   try {
+    const ordinal = agentOrdinal(value.ordinal);
+    if (value.ordinal.includes(".")) return undefined;
     return {
-      ordinal: agentOrdinal(value.ordinal), sessionId: agentId(value.sessionId), model: value.model as ModelLabel,
+      ordinal, sessionId: agentId(value.sessionId), model: value.model as ModelLabel,
       context: value.context as ContextLabel, taskLabel: value.taskLabel as TaskLabel, state: value.state,
     };
   } catch {

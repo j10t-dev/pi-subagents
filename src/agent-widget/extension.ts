@@ -136,19 +136,21 @@ function startPublisher(
   let relayDisposed = false;
   let coalescerDisposed = false;
   let unsubscribeRegistry: (() => void) | undefined;
-  let unsubscribePort: (() => void) | undefined;
+  const unsubscribePorts = new Set<() => void>();
+  let portGeneration = 0;
 
-  const releasePort = (): boolean => {
-    const pending = unsubscribePort;
-    if (pending === undefined) return true;
-    try {
-      pending();
-      if (unsubscribePort === pending) unsubscribePort = undefined;
-      return true;
-    } catch {
-      report(WidgetDiagnosticCode.SourceFailed);
-      return false;
+  const releasePorts = (): boolean => {
+    let released = true;
+    for (const pending of [...unsubscribePorts]) {
+      try {
+        pending();
+        unsubscribePorts.delete(pending);
+      } catch {
+        released = false;
+        report(WidgetDiagnosticCode.SourceFailed);
+      }
     }
+    return released;
   };
   const releaseRegistry = (): boolean => {
     const pending = unsubscribeRegistry;
@@ -166,17 +168,20 @@ function startPublisher(
     relay.markDirty();
     coalescer.request();
   };
-  const onPortChange = (): void => {
-    if (!stopping) requestFlush();
-  };
   const onRegistryPort = (port: SubagentObservationPort | undefined): void => {
     if (stopping) return;
-    const released = releasePort();
+    portGeneration += 1;
+    const mine = portGeneration;
+    releasePorts();
     relay.setPort(port);
     if (port === undefined) return;
-    if (released) {
-      try { unsubscribePort = port.subscribe(onPortChange); }
-      catch { report(WidgetDiagnosticCode.SourceFailed); }
+    try {
+      const unsubscribe = port.subscribe(() => {
+        if (!stopping && mine === portGeneration) requestFlush();
+      });
+      unsubscribePorts.add(() => { unsubscribe(); });
+    } catch {
+      report(WidgetDiagnosticCode.SourceFailed);
     }
     requestFlush();
   };
@@ -200,13 +205,13 @@ function startPublisher(
       catch { report(WidgetDiagnosticCode.LifecycleFailed); }
     }
     const registryReleased = releaseRegistry();
-    const portReleased = releasePort();
+    const portsReleased = releasePorts();
     return coalescerDisposed
       && relayDisposed
       && registryReleased
-      && portReleased
+      && portsReleased
       && unsubscribeRegistry === undefined
-      && unsubscribePort === undefined;
+      && unsubscribePorts.size === 0;
   };
 }
 
