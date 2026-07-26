@@ -297,6 +297,26 @@ describe("createAgentWidgetSource", () => {
     expect(source.snapshot().revision).toBe(atDisposal);
   });
 
+  test("prioritises active published descendants over earlier terminal descendants", () => {
+    const store = new AgentObservationStore();
+    register(store, "priority-root", 1, "Priority root");
+    writePublished("priority-root", [
+      { ordinal: "A1", sessionId: "priority-terminal-one" },
+      { ordinal: "A2", sessionId: "priority-active-two", state: AgentState.Running },
+      { ordinal: "A3", sessionId: "priority-terminal-three" },
+      { ordinal: "A4", sessionId: "priority-active-four", state: AgentState.Running },
+    ]);
+
+    const source = sourceOver(store, agentCount(3));
+
+    expect(source.snapshot().rows.map((row) => row.ordinal)).toEqual([
+      agentOrdinal("A1"), agentOrdinal("A1.2"), agentOrdinal("A1.4"),
+    ]);
+    expect(Number(source.snapshot().total)).toBe(5);
+    expect(Number(source.snapshot().omitted)).toBe(2);
+    source.dispose();
+  });
+
   test("honours maxRows by dropping the tail and counting it as omitted", () => {
     const store = new AgentObservationStore();
     register(store, "agent-a", 1, "One");

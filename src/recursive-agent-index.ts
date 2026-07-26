@@ -21,6 +21,7 @@ import {
 import {
   readKnownChildSnapshots,
   type KnownChildSnapshots,
+  type ObservationRow,
   type ObservationSnapshot,
   type SnapshotSkipReason,
 } from "./observation-snapshot-path.ts";
@@ -62,6 +63,14 @@ interface AdmittedNode {
 
 interface RetainedSlot {
   readonly snapshot: ObservationSnapshot;
+}
+
+interface TraversalCandidate {
+  readonly owner: AgentId;
+  readonly parent: AdmittedNode | undefined;
+  readonly node: AdmittedNode;
+  readonly localOrdinal: AgentOrdinal;
+  readonly ownerState: AgentDisplayState;
 }
 
 class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
@@ -126,31 +135,42 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     let total = Number(direct.total);
     let degraded = direct.health.kind === "degraded" || Number(direct.omittedActive) > 0;
 
+    const directCandidates: TraversalCandidate[] = [];
+    const directOwners = new Set<AgentId>();
     for (const entry of direct.entries) {
-      if (admittedCount >= maximumRows) {
+      if (directOwners.has(entry.agentId)) {
         degraded = true;
         continue;
       }
-      if (seen.has(entry.agentId)) {
-        degraded = true;
-        continue;
-      }
-      const node: AdmittedNode = { sessionId: entry.agentId, row: entry.row, children: [] };
-      roots.push(node);
-      seen.add(entry.agentId);
-      admittedCount += 1;
-      if (!nextOwners.has(entry.row.ordinal)) nextOwners.set(entry.row.ordinal, entry.agentId);
-      ownerQueue.push(node);
-      if (!isTerminal(entry.row.state)) tracked.add(entry.agentId);
+      directOwners.add(entry.agentId);
+      directCandidates.push({
+        owner: entry.agentId,
+        parent: undefined,
+        node: { sessionId: entry.agentId, row: entry.row, children: [] },
+        localOrdinal: entry.row.ordinal,
+        ownerState: entry.row.state,
+      });
     }
+    const directAdmission = selectLevelCandidates(directCandidates, maximumRows - admittedCount);
+    if (directAdmission.rejected) degraded = true;
+    admittedCount += admitCandidates(
+      directAdmission.candidates,
+      roots,
+      ownerQueue,
+      seen,
+      tracked,
+      nextOwners,
+    );
 
     let levelStart = 0;
     while (levelStart < ownerQueue.length) {
       if (admittedCount >= maximumRows) {
-        if (ownerQueue.length > levelStart) degraded = true;
+        degraded = true;
         break;
       }
       const levelEnd = ownerQueue.length;
+      const candidates: TraversalCandidate[] = [];
+      const levelOwners = new Set<AgentId>();
       for (let cursor = levelStart; cursor < levelEnd; cursor += 1) {
         const parent = ownerQueue[cursor]!;
         let result: KnownChildSnapshots;
@@ -194,35 +214,24 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
 
         for (const child of selected.agents) {
           if (terminal && !isTerminal(child.state)) degraded = true;
-          const depth = Number(parent.row.depth) + 1;
-          if (depth >= Number(MAX_WALK_DEPTH) || admittedCount >= maximumRows || seen.has(child.sessionId)) {
+          const candidate = childCandidate(parent, child, seen, levelOwners);
+          if (candidate === undefined) {
             degraded = true;
             continue;
           }
-          const ordinal = composeOrdinal(parent.row.ordinal, child.ordinal);
-          if (ordinal === undefined) {
-            degraded = true;
-            continue;
-          }
-          const node: AdmittedNode = {
-            sessionId: child.sessionId,
-            row: {
-              ordinal,
-              depth: agentDepth(depth),
-              model: child.model,
-              context: child.context,
-              taskLabel: child.taskLabel,
-              state: child.state,
-            },
-            children: [],
-          };
-          parent.children.push(node);
-          seen.add(child.sessionId);
-          admittedCount += 1;
-          ownerQueue.push(node);
-          if (!isTerminal(child.state)) tracked.add(child.sessionId);
+          candidates.push(candidate);
         }
       }
+      const admission = selectLevelCandidates(candidates, maximumRows - admittedCount);
+      if (admission.rejected) degraded = true;
+      admittedCount += admitCandidates(
+        admission.candidates,
+        roots,
+        ownerQueue,
+        seen,
+        tracked,
+        nextOwners,
+      );
       if (admittedCount >= maximumRows && ownerQueue.length > levelEnd) {
         degraded = true;
         break;
@@ -305,6 +314,88 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
       // Watch ownership ends even if the adapter rejects disposal.
     }
   }
+}
+
+function admitCandidates(
+  candidates: readonly TraversalCandidate[],
+  roots: AdmittedNode[],
+  ownerQueue: AdmittedNode[],
+  seen: Set<AgentId>,
+  tracked: Set<AgentId>,
+  nextOwners: Map<AgentOrdinal, AgentId>,
+): number {
+  for (const candidate of candidates) {
+    seen.add(candidate.owner);
+    ownerQueue.push(candidate.node);
+    if (!isTerminal(candidate.ownerState)) tracked.add(candidate.owner);
+  }
+  for (const candidate of [...candidates].sort(compareCandidatesByLocalOrdinal)) {
+    if (candidate.parent === undefined) {
+      roots.push(candidate.node);
+      if (!nextOwners.has(candidate.node.row.ordinal)) {
+        nextOwners.set(candidate.node.row.ordinal, candidate.owner);
+      }
+    } else {
+      candidate.parent.children.push(candidate.node);
+    }
+  }
+  return candidates.length;
+}
+
+function childCandidate(
+  parent: AdmittedNode,
+  child: ObservationRow,
+  seen: ReadonlySet<AgentId>,
+  levelOwners: Set<AgentId>,
+): TraversalCandidate | undefined {
+  const depth = Number(parent.row.depth) + 1;
+  if (depth >= Number(MAX_WALK_DEPTH) || seen.has(child.sessionId) || levelOwners.has(child.sessionId)) {
+    return undefined;
+  }
+  const ordinal = composeOrdinal(parent.row.ordinal, child.ordinal);
+  if (ordinal === undefined) return undefined;
+  levelOwners.add(child.sessionId);
+  return {
+    owner: child.sessionId,
+    parent,
+    node: {
+      sessionId: child.sessionId,
+      row: {
+        ordinal,
+        depth: agentDepth(depth),
+        model: child.model,
+        context: child.context,
+        taskLabel: child.taskLabel,
+        state: child.state,
+      },
+      children: [],
+    },
+    localOrdinal: child.ordinal,
+    ownerState: child.state,
+  };
+}
+
+function selectLevelCandidates(
+  candidates: readonly TraversalCandidate[],
+  remainingRows: number,
+): { readonly candidates: readonly TraversalCandidate[]; readonly rejected: boolean } {
+  const active = candidates.filter((candidate) => !isTerminal(candidate.ownerState));
+  const terminal = candidates
+    .filter((candidate) => isTerminal(candidate.ownerState))
+    .sort((left, right) => compareLocalOrdinals(right.localOrdinal, left.localOrdinal));
+  const admitted = [...active, ...terminal].slice(0, remainingRows);
+  return { candidates: admitted, rejected: admitted.length !== candidates.length };
+}
+
+function compareCandidatesByLocalOrdinal(left: TraversalCandidate, right: TraversalCandidate): number {
+  return compareLocalOrdinals(left.localOrdinal, right.localOrdinal);
+}
+
+function compareLocalOrdinals(left: AgentOrdinal, right: AgentOrdinal): number {
+  const leftDigits = left.slice(1);
+  const rightDigits = right.slice(1);
+  if (leftDigits.length !== rightDigits.length) return leftDigits.length - rightDigits.length;
+  return leftDigits < rightDigits ? -1 : leftDigits > rightDigits ? 1 : 0;
 }
 
 function isTerminal(state: AgentDisplayState): boolean {

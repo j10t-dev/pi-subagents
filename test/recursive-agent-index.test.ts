@@ -441,6 +441,204 @@ describe("RecursiveAgentIndex", () => {
     expect(index.snapshot().degraded).toBe(true);
   });
 
+  test("prioritises active children over earlier terminal children within the row bound", () => {
+    const root = agentId("priority-root");
+    const activeTwo = agentId("priority-active-two");
+    const activeFour = agentId("priority-active-four");
+    const reads: AgentId[] = [];
+    writeSnapshot(snapshot(root, [
+      observationRow("A1", "priority-terminal-one", CompletionState.Completed),
+      observationRow("A2", activeTwo, AgentState.Running),
+      observationRow("A3", "priority-terminal-three", CompletionState.Completed),
+      observationRow("A4", activeFour, AgentState.Running),
+    ]));
+    const reader: typeof readKnownChildSnapshots = (rootDir, ids) => {
+      reads.push(...ids);
+      return readKnownChildSnapshots(rootDir, ids);
+    };
+    const { index, watcher } = fixture(direct([projection(root, "A1")]), {
+      maxRows: 3,
+      readKnownChildSnapshots: reader,
+    });
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.2", "A1.4"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(5), omitted: agentCount(2), degraded: true });
+    expect(reads).toEqual([root]);
+    expect(watcher.calls.at(-1)).toEqual([root, activeTwo, activeFour]);
+  });
+
+  test("admits contended active children in source order while emitting ordinal order", () => {
+    const root = agentId("active-source-order-root");
+    const activeFour = agentId("active-source-order-four");
+    const activeTwo = agentId("active-source-order-two");
+    const activeThree = agentId("active-source-order-three");
+    const reads: AgentId[] = [];
+    writeSnapshot(snapshot(root, [
+      observationRow("A1", "active-source-order-terminal", CompletionState.Completed),
+      observationRow("A4", activeFour, AgentState.Running),
+      observationRow("A2", activeTwo, AgentState.Running),
+      observationRow("A3", activeThree, AgentState.Running),
+    ]));
+    const reader: typeof readKnownChildSnapshots = (rootDir, ids) => {
+      reads.push(...ids);
+      return readKnownChildSnapshots(rootDir, ids);
+    };
+    const { index, watcher } = fixture(direct([projection(root, "A1")]), {
+      maxRows: 3,
+      readKnownChildSnapshots: reader,
+    });
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.2", "A1.4"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(5), omitted: agentCount(2), degraded: true });
+    expect(reads).toEqual([root]);
+    expect(watcher.calls.at(-1)).toEqual([root, activeFour, activeTwo]);
+    expect(reads).not.toContain(activeThree);
+    expect(watcher.calls.at(-1)).not.toContain(activeThree);
+    expect(index.snapshot().rows).toHaveLength(3);
+    expect(reads.length).toBeLessThanOrEqual(3);
+    expect(watcher.calls.at(-1)!.length).toBeLessThanOrEqual(3);
+  });
+
+  test("admits A10 over A9 for one bounded terminal slot", () => {
+    const root = agentId("terminal-numeric-recency-root");
+    writeSnapshot(snapshot(root, [
+      observationRow("A9", "terminal-numeric-recency-nine", CompletionState.Completed),
+      observationRow("A10", "terminal-numeric-recency-ten", CompletionState.Completed),
+    ]));
+    const { index, watcher } = fixture(direct([projection(root, "A1")]), { maxRows: 2 });
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.10"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(3), omitted: agentCount(1), degraded: true });
+    expect(watcher.calls.at(-1)).toEqual([root]);
+  });
+
+  test("keeps retained terminal fallback isolated from rejected active owners", () => {
+    const root = agentId("terminal-fallback-bound-root");
+    const admittedNine = agentId("terminal-fallback-active-nine");
+    const admittedTen = agentId("terminal-fallback-active-ten");
+    const rejected = agentId("terminal-fallback-rejected-active");
+    const reads: AgentId[] = [];
+    let fallback = false;
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => {
+      reads.push(...ids);
+      if (!ids.includes(root)) {
+        return {
+          snapshots: new Map(),
+          skipped: new Map(ids.map((owner) => [owner, "missing-directory"] as const)),
+        };
+      }
+      if (fallback) {
+        return { snapshots: new Map(), skipped: new Map([[root, "malformed"]]) };
+      }
+      return {
+        snapshots: new Map([[root, snapshot(root, [
+          observationRow("A9", admittedNine, AgentState.Running, "admitted-nine"),
+          observationRow("A10", admittedTen, AgentState.Running, "admitted-ten"),
+          observationRow("A1", rejected, AgentState.Running, "rejected"),
+        ])]]),
+        skipped: new Map(),
+      };
+    };
+    const { index, watcher } = fixture(
+      direct([projection(root, "A1", CompletionState.Completed)]),
+      { maxRows: 3, readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+    fallback = true;
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.9", "A1.10"]);
+    expect(index.snapshot().rows.map((row) => row.taskLabel)).toEqual([
+      "A1" as TaskLabel,
+      "admitted-nine" as TaskLabel,
+      "admitted-ten" as TaskLabel,
+    ]);
+    expect(index.snapshot().rows.slice(1).map((row) => row.state)).toEqual([
+      AgentState.Running,
+      AgentState.Running,
+    ]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(4), omitted: agentCount(1), degraded: true });
+    expect(reads).toEqual([root, root]);
+    expect(reads).not.toContain(admittedNine);
+    expect(reads).not.toContain(admittedTen);
+    expect(reads).not.toContain(rejected);
+    expect(watcher.calls).toEqual([[root, admittedNine, admittedTen], [root, admittedNine, admittedTen]]);
+    expect(watcher.calls.flat()).not.toContain(rejected);
+    expect(ordinals(index.snapshot().rows)).not.toContain("A1.1");
+    expect(index.snapshot().rows).toHaveLength(3);
+    expect(reads.length).toBeLessThanOrEqual(3);
+    expect(watcher.calls.at(-1)!.length).toBeLessThanOrEqual(3);
+  });
+
+  test("admits recent terminal children but emits them in local ordinal order", () => {
+    const root = agentId("terminal-recency-root");
+    const reads: AgentId[] = [];
+    writeSnapshot(snapshot(root, [
+      observationRow("A1", "terminal-recency-one", CompletionState.Completed),
+      observationRow("A2", "terminal-recency-two", CompletionState.Completed),
+      observationRow("A3", "terminal-recency-three", CompletionState.Completed),
+      observationRow("A4", "terminal-recency-four", CompletionState.Completed),
+    ]));
+    const reader: typeof readKnownChildSnapshots = (rootDir, ids) => {
+      reads.push(...ids);
+      return readKnownChildSnapshots(rootDir, ids);
+    };
+    const { index, watcher } = fixture(direct([projection(root, "A1")]), {
+      maxRows: 3,
+      readKnownChildSnapshots: reader,
+    });
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.3", "A1.4"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(5), omitted: agentCount(2), degraded: true });
+    expect(reads).toEqual([root]);
+    expect(watcher.calls.at(-1)).toEqual([root]);
+  });
+
+  test("prioritises active grandchildren at each breadth-first level", () => {
+    const root = agentId("multi-level-root");
+    const earlierTerminal = agentId("multi-level-earlier-terminal");
+    const laterActive = agentId("multi-level-later-active");
+    const activeOne = agentId("multi-level-active-one");
+    const activeTwo = agentId("multi-level-active-two");
+    const reads: AgentId[] = [];
+    writeSnapshot(snapshot(root, [
+      observationRow("A1", earlierTerminal, CompletionState.Completed),
+      observationRow("A2", laterActive, AgentState.Running),
+    ]));
+    writeSnapshot(snapshot(earlierTerminal, [
+      observationRow("A1", "multi-level-terminal-one", CompletionState.Completed),
+      observationRow("A2", "multi-level-terminal-two", CompletionState.Completed),
+    ]));
+    writeSnapshot(snapshot(laterActive, [
+      observationRow("A1", activeOne, AgentState.Running),
+      observationRow("A2", activeTwo, AgentState.Running),
+    ]));
+    const reader: typeof readKnownChildSnapshots = (rootDir, ids) => {
+      reads.push(...ids);
+      return readKnownChildSnapshots(rootDir, ids);
+    };
+    const { index, watcher } = fixture(direct([projection(root, "A1")]), {
+      maxRows: 5,
+      readKnownChildSnapshots: reader,
+    });
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1", "A1.2", "A1.2.1", "A1.2.2"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(7), omitted: agentCount(2), degraded: true });
+    expect(reads).toEqual([root, laterActive, earlierTerminal]);
+    expect(watcher.calls.at(-1)).toEqual([root, laterActive, earlierTerminal, activeOne, activeTwo]);
+  });
+
   test("propagates publisher totals and degradation", () => {
     const root = agentId("root");
     writeSnapshot(snapshot(root, [observationRow("A1", "leaf", CompletionState.Completed)], {
@@ -455,7 +653,9 @@ describe("RecursiveAgentIndex", () => {
   test("saturates count arithmetic and degrades", () => {
     const root = agentId("root");
     writeSnapshot(snapshot(root, [], { total: 1 }));
-    const { index } = fixture(direct([projection(root, "A1")], { total: Number.MAX_SAFE_INTEGER }));
+    const { index } = fixture(direct([projection(root, "A1", CompletionState.Completed)], {
+      total: Number.MAX_SAFE_INTEGER,
+    }));
     index.refresh();
     expect(index.snapshot()).toMatchObject({
       total: agentCount(Number.MAX_SAFE_INTEGER),
@@ -685,9 +885,14 @@ describe("RecursiveAgentIndex", () => {
     writeSnapshot(snapshot(bounded, Array.from({ length: Number(MAX_WIDGET_ROWS) }, (_, index) =>
       observationRow(`A${index + 1}`, `terminal-row-${index + 1}`, CompletionState.Completed),
     )));
+    const boundedReads: AgentId[] = [];
+    const boundedReader: typeof readKnownChildSnapshots = (rootDir, ids) => {
+      boundedReads.push(...ids);
+      return readKnownChildSnapshots(rootDir, ids);
+    };
     const boundedIndex = fixture(
       direct([projection(bounded, "A1", CompletionState.Completed)]),
-      { maxRows: Number(MAX_WIDGET_ROWS) },
+      { maxRows: Number(MAX_WIDGET_ROWS), readKnownChildSnapshots: boundedReader },
     );
     boundedIndex.index.refresh();
     expect(boundedIndex.index.snapshot().rows).toHaveLength(Number(MAX_WIDGET_ROWS));
@@ -696,6 +901,10 @@ describe("RecursiveAgentIndex", () => {
       omitted: agentCount(1),
       degraded: true,
     });
+    expect(boundedReads).toEqual([bounded]);
+    expect(boundedIndex.watcher.calls.at(-1)).toEqual([bounded]);
+    expect(boundedReads.length).toBeLessThanOrEqual(Number(MAX_WIDGET_ROWS));
+    expect(boundedIndex.watcher.calls.at(-1)!.length).toBeLessThanOrEqual(Number(MAX_WIDGET_ROWS));
   });
 
   test("reconstructs a completed three-level tree after fresh index creation", () => {
