@@ -23,6 +23,7 @@ export const TEST_GROUP_RULES: Readonly<Record<TestGroupName, ReadonlySet<string
     "child-conversation-component.test.ts",
     "child-conversation-gate.test.ts",
     "child-conversation-model.test.ts",
+    "child-conversation-native-adapter.test.ts",
     "child-conversation-projection.test.ts",
     "child-conversation-render.test.ts",
     "child-selection.test.ts",

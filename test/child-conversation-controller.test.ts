@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Theme, type KeybindingsManager as AppKeybindingsManager, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { initTheme, Theme, type KeybindingsManager as AppKeybindingsManager, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import {
   KeybindingsManager, TUI, TUI_KEYBINDINGS, type Component, type Focusable,
   type OverlayHandle, type OverlayOptions, type Terminal,
@@ -55,6 +55,7 @@ const background = {
   selectedBg: "#222244", userMessageBg: "#222222", customMessageBg: "#222222",
   toolPendingBg: "#332200", toolSuccessBg: "#113311", toolErrorBg: "#331111",
 };
+initTheme(undefined, false);
 const theme = new Theme(foreground, background, "truecolor");
 
 function keybindings(): AppKeybindingsManager {
@@ -171,6 +172,7 @@ describe("createChildConversationController", () => {
     queued?.();
     const rendered = Bun.stripANSI(component!.render(80).join("\n"));
     expect(rendered).toContain("safe text");
+    expect(rendered).not.toContain("You · safe text");
     expect(rendered).not.toContain("deadbeef");
     expect(rendered).not.toContain("999");
 

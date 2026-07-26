@@ -1,14 +1,36 @@
 import { describe, expect, test } from "bun:test";
 import { initTheme, Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { TUI, visibleWidth, type Terminal } from "@earendil-works/pi-tui";
 
 import type { AgentDisplayState, ConversationAssistantBlock, ConversationSnapshot, ConversationTurn } from "../src/agent-observation.ts";
 import { createChildConversationModel, toggleConversationThinking, toggleConversationTools } from "../src/agent-widget/conversation-model.ts";
-import { renderChildConversation } from "../src/agent-widget/conversation-render.ts";
+import { createPiConversationAdapter, type PiConversationAdapter } from "../src/agent-widget/conversation-native-adapter.ts";
+import {
+  renderChildConversation as renderNativeChildConversation,
+  type ChildConversationRender,
+} from "../src/agent-widget/conversation-render.ts";
 import {
   AgentState, agentOrdinal, conversationCallKey, conversationRevision, conversationTurnKey, renderWidth, terminalRows,
   type ContextLabel, type ModelLabel, type TaskLabel, type ToolDisplayName, type TranscriptText,
 } from "../src/domain.ts";
+
+class FakeTerminal implements Terminal {
+  columns = 160;
+  rows = 5_000;
+  readonly kittyProtocolActive = false;
+  start(_onInput: (data: string) => void, _onResize: () => void): void {}
+  stop(): void {}
+  async drainInput(_maxMs?: number, _idleMs?: number): Promise<void> {}
+  write(_data: string): void {}
+  moveBy(_lines: number): void {}
+  hideCursor(): void {}
+  showCursor(): void {}
+  clearLine(): void {}
+  clearFromCursor(): void {}
+  clearScreen(): void {}
+  setTitle(_title: string): void {}
+  setProgress(_active: boolean): void {}
+}
 
 const foreground: Record<ThemeColor, string> = {
   accent: "#5577ff",
@@ -61,6 +83,18 @@ const foreground: Record<ThemeColor, string> = {
 const background = { selectedBg: "#222244", userMessageBg: "#222222", customMessageBg: "#222222", toolPendingBg: "#332200", toolSuccessBg: "#113311", toolErrorBg: "#331111" };
 initTheme(undefined, false);
 const theme = new Theme(foreground, background, "truecolor");
+const tui = new TUI(new FakeTerminal());
+
+function renderChildConversation(
+  model: ReturnType<typeof createChildConversationModel>,
+  renderTheme: Theme,
+  width: ReturnType<typeof renderWidth>,
+  rows: ReturnType<typeof terminalRows>,
+  adapter: PiConversationAdapter = createPiConversationAdapter({ tui, theme: renderTheme }),
+): ChildConversationRender {
+  return renderNativeChildConversation(model, renderTheme, width, rows, adapter);
+}
+
 const OSC_133_A = "\u001b]133;A\u0007";
 const OSC_133_B = "\u001b]133;B;payload\u001b\\";
 const OSC_133_C = "\u001b]133;C;payload\u0007";
@@ -135,6 +169,25 @@ function snapshot(options: Partial<ConversationSnapshot> = {}): ConversationSnap
 }
 
 describe("renderChildConversation", () => {
+  test("uses adapter body lines without changing viewport framing", () => {
+    const adapter: PiConversationAdapter = {
+      constructionCount: 0,
+      render: () => Object.freeze(["native body"]),
+      invalidate: () => {},
+      dispose: () => {},
+    };
+    const rendered = renderChildConversation(
+      createChildConversationModel(snapshotWith([], { truncatedBefore: false })),
+      theme,
+      renderWidth(80),
+      terminalRows(8),
+      adapter,
+    );
+
+    expect(rendered.transcriptLines).toEqual(["native body"]);
+    expect(Bun.stripANSI(rendered.lines.join("\n"))).toContain("native body");
+  });
+
   test("renders the complete Pi-styled grammar and local visibility states", () => {
     let model = createChildConversationModel(snapshot());
     model = toggleConversationTools(model);
@@ -145,13 +198,12 @@ describe("renderChildConversation", () => {
       "Research terminal UX",
       "Live conversation",
       "Earlier source history omitted",
-      "You · ASCII question 界 é",
-      "Thinking · considering options",
+      "ASCII question 界 é",
+      "considering options",
       "Answer",
-      "Tool · read · running",
-      "first preview line",
-      "Tool · write · completed",
-      "Tool · bash · failed",
+      "read",
+      "write",
+      "bash",
       "Context compacted",
       "Transport unavailable",
       "Projection unavailable",
@@ -160,6 +212,30 @@ describe("renderChildConversation", () => {
     for (const value of expected) expect(plain).toContain(value);
     model = toggleConversationThinking(model);
     expect(Bun.stripANSI(renderChildConversation(model, theme, renderWidth(160), terminalRows(40)).lines.join("\n"))).not.toContain("considering options");
+  });
+
+  test("the final bounded path removes C1 OSC 133 forms and preserves trailing styling", () => {
+    const styledTail = `${OSC_8_OPEN}link${OSC_8_CLOSE}\u001b[31mred\u001b[0m`;
+    const adapter: PiConversationAdapter = {
+      constructionCount: 0,
+      render: () => [
+        `a\u009d133;A\u009cb\u001b]133;D;payload\u009cc${styledTail}`,
+        "safe\u009d133;B;unterminated secret",
+      ],
+      invalidate: () => {},
+      dispose: () => {},
+    };
+    const rendered = renderChildConversation(
+      createChildConversationModel(snapshotWith([], { truncatedBefore: false })),
+      theme,
+      renderWidth(80),
+      terminalRows(10),
+      adapter,
+    );
+
+    expect(rendered.transcriptLines).toEqual([`abc${styledTail}`, "safe"]);
+    expect(rendered.lines.join("\n")).not.toContain("\u009d133;");
+    expect(rendered.lines.join("\n")).toContain(styledTail);
   });
 
   test("removes terminated and malformed OSC 133 family sequences before transcript layout", () => {
@@ -202,19 +278,19 @@ describe("renderChildConversation", () => {
         text: text(`user${UNTERMINATED_OSC_133}`),
       }],
       expandTools: false,
-      expected: theme.fg("userMessageText", "You · user"),
+      expected: "user",
     },
     {
       path: "thinking text",
       turns: [assistantTurn(0, [block("thinking", `thinking${UNTERMINATED_OSC_133}`)])],
       expandTools: false,
-      expected: theme.fg("thinkingText", "Thinking · thinking"),
+      expected: "thinking",
     },
     {
       path: "tool-preview text",
       turns: [assistantTurn(0, [toolBlock("read", "completed", `preview${UNTERMINATED_OSC_133}`)])],
       expandTools: true,
-      expected: theme.fg("toolOutput", "preview"),
+      expected: "Result shown in bounded form",
     },
   ])("preserves renderer-owned style boundaries after malformed OSC 133 in $path", ({ turns, expandTools, expected }) => {
     let model = createChildConversationModel(snapshotWith(turns, { truncatedBefore: false }));
@@ -222,7 +298,8 @@ describe("renderChildConversation", () => {
 
     const transcript = renderChildConversation(model, theme, renderWidth(80), terminalRows(24)).transcriptLines;
 
-    expect(transcript).toContain(expected);
+    expect(Bun.stripANSI(transcript.join("\n"))).toContain(expected);
+    expect(transcript.join("\n")).toContain("\u001b[");
     expect(transcript.join("\n")).not.toContain("\u001b]133;");
   });
 
@@ -230,9 +307,12 @@ describe("renderChildConversation", () => {
     const rendered = renderChildConversation(createChildConversationModel(snapshotWith([
       assistantTurn(0, [block("thinking", "plan"), block("text", "reading"), toolBlock("read", "completed")]),
     ])), theme, renderWidth(80), terminalRows(24));
-    const body = rendered.transcriptLines.join("\n");
-    expect(body.indexOf("plan")).toBeLessThan(body.indexOf("reading"));
-    expect(body.indexOf("reading")).toBeLessThan(body.indexOf("Tool · read"));
+    const plainLines = rendered.transcriptLines.map(Bun.stripANSI);
+    const planLine = plainLines.findIndex((line) => line.includes("plan"));
+    const readingLine = plainLines.findIndex((line) => line.includes("reading"));
+    const toolLine = plainLines.findIndex((line) => line.trim() === "read");
+    expect(planLine).toBeLessThan(readingLine);
+    expect(readingLine).toBeLessThan(toolLine);
   });
 
   test.each([

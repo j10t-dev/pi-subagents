@@ -1,13 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { Theme, type KeybindingsManager as AppKeybindingsManager, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { initTheme, Theme, type KeybindingsManager as AppKeybindingsManager, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, TUI, TUI_KEYBINDINGS, visibleWidth, type Terminal } from "@earendil-works/pi-tui";
 
 import type { AgentDisplayState, ConversationAssistantBlock, ConversationSnapshot, ConversationTurn } from "../src/agent-observation.ts";
 import { ChildConversationComponent } from "../src/agent-widget/conversation-component.ts";
-import { createChildConversationModel } from "../src/agent-widget/conversation-model.ts";
+import {
+  createChildConversationModel,
+  toggleConversationThinking,
+  toggleConversationTools,
+} from "../src/agent-widget/conversation-model.ts";
+import { createPiConversationAdapter } from "../src/agent-widget/conversation-native-adapter.ts";
+import { renderChildConversation } from "../src/agent-widget/conversation-render.ts";
 import {
   AgentState, agentOrdinal, conversationCallKey, conversationRevision, conversationTurnKey,
-  type ContextLabel, type ModelLabel, type TaskLabel, type ToolDisplayName, type TranscriptText,
+  renderWidth, terminalRows, tryPresentationCwd,
+  type ContextLabel, type ModelLabel, type PresentationCwd, type SafePresentationJson, type TaskLabel,
+  type ToolDisplayName, type TranscriptText,
 } from "../src/domain.ts";
 
 class MutableTerminal implements Terminal {
@@ -47,7 +55,15 @@ const background = {
   selectedBg: "#222244", userMessageBg: "#222222", customMessageBg: "#222222",
   toolPendingBg: "#332200", toolSuccessBg: "#113311", toolErrorBg: "#331111",
 };
+initTheme(undefined, false);
 const theme = new Theme(foreground, background, "truecolor");
+
+function safeJson(value: object): SafePresentationJson { return value as SafePresentationJson }
+function presentationCwd(value: string): PresentationCwd {
+  const cwd = tryPresentationCwd(value);
+  if (cwd === undefined) throw new Error("invalid test presentation cwd");
+  return cwd;
+}
 
 function conversation(revision = 1): ConversationSnapshot {
   const r = conversationRevision(revision);
@@ -55,7 +71,10 @@ function conversation(revision = 1): ConversationSnapshot {
     { kind: "thinking", text: "private thought" as TranscriptText },
     { kind: "tool", presentation: {
       callKey: conversationCallKey(r, 0, 1), tool: "read" as ToolDisplayName,
-      phase: "completed", preview: "expanded preview" as TranscriptText, rendering: "renderer-override",
+      phase: "completed",
+      arguments: safeJson({ path: "/home/child/a.ts" }),
+      result: { content: ["expanded preview" as TranscriptText], isError: false },
+      rendering: "native-built-in",
     } },
   ];
   const turns: readonly ConversationTurn[] = [
@@ -72,6 +91,7 @@ function conversation(revision = 1): ConversationSnapshot {
       state: AgentState.Running as AgentDisplayState,
     }),
     routeAvailable: true,
+    renderingCwd: presentationCwd("/home/child"),
   });
 }
 
@@ -85,6 +105,45 @@ function keybindings(): AppKeybindingsManager {
     "tui.editor.pageUp": "u", "tui.editor.pageDown": "d",
     "app.thinking.toggle": "t", "app.tools.expand": "o", "tui.select.cancel": "x",
   }) as AppKeybindingsManager;
+}
+
+interface VisibilityState {
+  readonly thinkingVisible: boolean;
+  readonly toolsExpanded: boolean;
+}
+
+function maximumOffsets(
+  rows: number,
+  states: readonly VisibilityState[],
+  snapshot: ConversationSnapshot = conversation(),
+): readonly number[] {
+  const terminal = new MutableTerminal(rows);
+  const tui = new TUI(terminal);
+  const adapter = createPiConversationAdapter({ tui, theme });
+  return states.map((state) => {
+    let model = createChildConversationModel(snapshot);
+    if (!state.thinkingVisible) model = toggleConversationThinking(model);
+    if (state.toolsExpanded) model = toggleConversationTools(model);
+    const rendered = renderChildConversation(model, theme, renderWidth(80), terminalRows(rows), adapter);
+    return Math.max(0, Number(rendered.layout.contentLines) - Number(rendered.layout.viewportLines));
+  });
+}
+
+function maximumOffset(rows: number, state: VisibilityState): number {
+  return maximumOffsets(rows, [state])[0]!;
+}
+
+function viewportLines(rows: number): number {
+  return Math.max(0, rows - 4);
+}
+
+function expectOffset(frame: string, expected: number): void {
+  if (expected === 0) {
+    expect(frame).toContain("following");
+    expect(frame).not.toContain("paused ·");
+    return;
+  }
+  expect(frame).toContain(`paused · ${expected} lines from tail`);
 }
 
 function harness(rows = 12) {
@@ -112,66 +171,121 @@ describe("ChildConversationComponent", () => {
     }
   });
 
-  test("uses the injected keybinding manager for every approved transition and raw g/G", () => {
-    const h = harness(10);
+  test("renders conversation turns through native Pi components", () => {
+    const h = harness(12);
+    const frame = Bun.stripANSI(h.component.render(80).join("\n"));
+
+    expect(frame).toContain("line 29");
+    expect(frame).not.toContain("You · line 29");
+  });
+
+  test("applies exact line, page, top, tail and toggle transitions with one render request each", () => {
+    const rows = 10;
+    const h = harness(rows);
     const state = () => Bun.stripANSI(h.component.render(80).join("\n"));
-    expect(state()).toContain("following");
+    const expectedMaximums = maximumOffsets(rows, [
+      { thinkingVisible: true, toolsExpanded: false },
+      { thinkingVisible: false, toolsExpanded: false },
+      { thinkingVisible: false, toolsExpanded: true },
+    ]);
+    const visibleCollapsed = expectedMaximums[0]!;
+    const hiddenCollapsed = expectedMaximums[1]!;
+    const hiddenExpanded = expectedMaximums[2]!;
+
+    expectOffset(state(), 0);
+    const baselineRenders = h.renders();
     h.component.handleInput("g");
+    expectOffset(state(), visibleCollapsed);
     expect(state()).toContain("private thought");
     expect(state()).not.toContain("expanded preview");
-    h.component.handleInput("t"); expect(state()).not.toContain("private thought");
-    h.component.handleInput("o"); expect(state()).toContain("expanded preview");
-    h.component.handleInput("G"); expect(state()).toContain("following");
 
-    h.component.handleInput("k"); expect(state()).toContain("paused");
-    h.component.handleInput("j"); expect(state()).toContain("following");
-    h.component.handleInput("u"); expect(state()).toContain("paused");
-    h.component.handleInput("d"); expect(state()).toContain("following");
-    h.component.handleInput("g"); expect(state()).toContain("paused");
-    h.component.handleInput("G"); expect(state()).toContain("following");
-    expect(h.renders()).toBe(10);
+    h.component.handleInput("t");
+    expectOffset(state(), hiddenCollapsed);
+    expect(state()).not.toContain("private thought");
+    h.component.handleInput("o");
+    expectOffset(state(), Math.min(hiddenCollapsed!, hiddenExpanded!));
+    expect(state()).toContain("expanded preview");
+    h.component.handleInput("G");
+    expectOffset(state(), 0);
+
+    h.component.handleInput("k"); expectOffset(state(), 1);
+    h.component.handleInput("j"); expectOffset(state(), 0);
+    h.component.handleInput("u"); expectOffset(state(), Math.min(viewportLines(rows), hiddenExpanded));
+    h.component.handleInput("d"); expectOffset(state(), 0);
+    h.component.handleInput("g"); expectOffset(state(), hiddenExpanded);
+    h.component.handleInput("G"); expectOffset(state(), 0);
+    expect(h.renders()).toBe(baselineRenders + 10);
 
     h.component.handleInput("z");
-    expect(h.renders()).toBe(10);
+    expect(h.renders()).toBe(baselineRenders + 10);
     h.component.handleInput("x");
     expect(h.closes()).toBe(1);
   });
 
   test.each([
-    ["thinking", [] as const, "t", 25, 24],
-    ["tools", ["o"] as const, "o", 26, 25],
-  ])("clamps a top-paused offset when the %s toggle removes visual lines", (_name, setup, toggle, clamped, afterDown) => {
-    const h = harness(10);
+    {
+      name: "thinking",
+      setup: [] as const,
+      toggle: "t",
+      before: { thinkingVisible: true, toolsExpanded: false },
+      after: { thinkingVisible: false, toolsExpanded: false },
+    },
+    {
+      name: "tools",
+      setup: ["o"] as const,
+      toggle: "o",
+      before: { thinkingVisible: true, toolsExpanded: true },
+      after: { thinkingVisible: true, toolsExpanded: false },
+    },
+  ])("clamps to the exact native-body maximum after the $name toggle", ({ setup, toggle, before, after }) => {
+    const rows = 10;
+    const h = harness(rows);
     const state = () => Bun.stripANSI(h.component.render(80).join("\n"));
     state();
+    const [, expectedBefore, clamped] = maximumOffsets(rows, [
+      { thinkingVisible: true, toolsExpanded: false },
+      before,
+      after,
+    ]);
     for (const key of setup) h.component.handleInput(key);
     h.component.handleInput("g");
+    expectOffset(state(), expectedBefore!);
 
     h.component.handleInput(toggle);
-    expect(state()).toContain(`paused · ${clamped} lines from tail`);
+    expectOffset(state(), clamped!);
     h.component.handleInput("j");
-    expect(state()).toContain(`paused · ${afterDown} lines from tail`);
+    expectOffset(state(), Math.max(0, clamped! - 1));
   });
 
-  test("clamps a top-paused offset on resize before the next Down movement", () => {
-    const h = harness(10);
+  test("clamps to the exact resized native-body maximum before the next Down movement", () => {
+    const initialRows = 10;
+    const resizedRows = 20;
+    const visibility = { thinkingVisible: true, toolsExpanded: false };
+    const h = harness(initialRows);
     const state = () => Bun.stripANSI(h.component.render(80).join("\n"));
     state();
     h.component.handleInput("g");
+    expectOffset(state(), maximumOffset(initialRows, visibility));
 
-    h.terminal.rows = 20;
-    expect(state()).toContain("paused · 16 lines from tail");
+    h.terminal.rows = resizedRows;
+    const resized = maximumOffset(resizedRows, visibility);
+    expectOffset(state(), resized);
     h.component.handleInput("j");
-    expect(state()).toContain("paused · 15 lines from tail");
+    expectOffset(state(), Math.max(0, resized - 1));
   });
 
-  test("snapshot replacement invalidates once and preserves component-local navigation", () => {
+  test("snapshot replacement preserves the exact offset and requests only native rebuild plus apply renders", () => {
     const h = harness(10);
+    const state = () => Bun.stripANSI(h.component.render(80).join("\n"));
+    expectOffset(state(), 0);
     h.component.handleInput("k");
+    expectOffset(state(), 1);
+    const before = h.renders();
+
     h.component.setConversation(conversation(2));
 
-    expect(Bun.stripANSI(h.component.render(80).join("\n"))).toContain("paused");
-    expect(h.renders()).toBe(2);
+    expectOffset(state(), 1);
+    expect(h.renders()).toBe(before + 2);
   });
 
   test("a throwing close callback is contained and switches to an opaque fallback", () => {

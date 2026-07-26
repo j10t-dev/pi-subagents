@@ -12,6 +12,7 @@ import {
   type ChildConversationModel,
   type ConversationMovement,
 } from "./conversation-model.ts";
+import { createPiConversationAdapter, type PiConversationAdapter } from "./conversation-native-adapter.ts";
 import { renderChildConversation, type ChildConversationRender } from "./conversation-render.ts";
 
 export interface ChildConversationComponentOptions {
@@ -25,6 +26,7 @@ export class ChildConversationComponent implements Component {
   private disposed = false;
   private failed = false;
   private lastWidth: number | undefined;
+  private readonly adapter: PiConversationAdapter;
 
   constructor(
     private readonly tui: TUI,
@@ -34,6 +36,7 @@ export class ChildConversationComponent implements Component {
     private readonly options: ChildConversationComponentOptions,
   ) {
     this.model = model;
+    this.adapter = createPiConversationAdapter({ tui, theme });
   }
 
   render(width: number): string[] {
@@ -84,13 +87,17 @@ export class ChildConversationComponent implements Component {
 
   invalidate(): void {
     if (this.disposed) return;
-    this.guard(() => { this.tui.requestRender() }, () => undefined);
+    this.guard(() => {
+      this.adapter.invalidate();
+      this.tui.requestRender();
+    }, () => undefined);
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.failed = true;
+    this.guard(() => { this.adapter.dispose() }, () => undefined);
   }
 
   private move(movement: ConversationMovement): void {
@@ -112,7 +119,13 @@ export class ChildConversationComponent implements Component {
 
   private layoutFor(model: ChildConversationModel): ChildConversationRender {
     const width = renderWidth(this.lastWidth ?? this.tui.terminal.columns);
-    return renderChildConversation(model, this.theme, width, terminalRows(this.tui.terminal.rows));
+    return renderChildConversation(
+      model,
+      this.theme,
+      width,
+      terminalRows(this.tui.terminal.rows),
+      this.adapter,
+    );
   }
 
   private apply(next: ChildConversationModel): void {
