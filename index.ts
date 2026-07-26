@@ -53,6 +53,7 @@ export interface ExtensionController {
   beforeTree?(): boolean;
   beforeSwitch?(): boolean;
   beforeFork?(): boolean;
+  parentSettled?(): Promise<void>;
 }
 
 export type ExtensionRegistration =
@@ -153,7 +154,6 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
       await closeCurrent();
       unsubscribeStatus?.(); unsubscribeStatus = undefined;
     }));
-
     if (widgetStartup !== undefined) {
       return widgetStartup.then(finishInstallation);
     }
@@ -177,6 +177,9 @@ export function createPiSubagentsExtension(options: PiSubagentsExtensionOptions)
         setAmbientStatus(controller.status());
       }));
       registerTools();
+      pi.on("agent_settled", async () => {
+        await current?.parentSettled?.();
+      });
     }
 
     function installWidget(): void | Promise<void> {

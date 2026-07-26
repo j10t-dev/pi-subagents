@@ -120,8 +120,83 @@ describe("Pi subagents extension", () => {
     expect(h.tools[2]?.parameters).toBe(awaitAgentSchema);
     expect(h.tools[3]?.parameters).toBe(stopAgentSchema);
     expect([...h.handlers.keys()]).toEqual([
-      "session_start", "session_before_tree", "session_tree", "session_before_switch", "session_before_fork", "session_shutdown",
+      "session_start", "session_before_tree", "session_tree", "session_before_switch", "session_before_fork", "session_shutdown", "agent_settled",
     ]);
+  });
+
+  test("forwards parent settlement only to the active controller", async () => {
+    const h = harness();
+    const log: string[] = [];
+    void createPiSubagentsExtension({
+      platform: "linux", registration: { enabled: true },
+      createController: () => ({ ...controller(log), parentSettled: async () => { log.push("parentSettled"); } }),
+      diagnostic: () => {},
+    })(extensionApiForTest(h.api));
+
+    expect([...h.handlers.keys()]).toEqual([
+      "session_start", "session_before_tree", "session_tree", "session_before_switch",
+      "session_before_fork", "session_shutdown", "agent_settled",
+    ]);
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(log).toEqual([]);
+
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(log).toEqual(["restore", "parentSettled"]);
+  });
+
+  test("forwards settlement to the replacement controller", async () => {
+    const h = harness();
+    const log: string[] = [];
+    let created = 0;
+    void createPiSubagentsExtension({
+      platform: "linux", registration: { enabled: true },
+      createController: () => {
+        const index = created++;
+        return {
+          ...controller(log),
+          parentSettled: async () => { log.push(`parentSettled:${index}`); },
+        };
+      },
+      diagnostic: () => {},
+    })(extensionApiForTest(h.api));
+
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    await h.emit("session_start", { type: "session_start", reason: "reload" });
+    await h.emit("agent_settled", { type: "agent_settled" });
+
+    expect(log).toEqual(["restore", "shutdown", "restore", "parentSettled:1"]);
+  });
+
+  test("tolerates a controller without the optional parent settlement seam", async () => {
+    const h = harness();
+    const log: string[] = [];
+    void createPiSubagentsExtension({
+      platform: "linux", registration: { enabled: true },
+      createController: () => controller(log),
+      diagnostic: () => {},
+    })(extensionApiForTest(h.api));
+
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    await expect(h.emit("agent_settled", { type: "agent_settled" })).resolves.toBeDefined();
+  });
+
+  test("registers settlement forwarding when widget startup fails", async () => {
+    const h = harness();
+    const log: string[] = [];
+    const startup = createPiSubagentsExtension({
+      platform: "linux", registration: { enabled: true },
+      loadWidget: async () => { throw new Error("widget failed"); },
+      createController: () => ({ ...controller(log), parentSettled: async () => { log.push("parentSettled"); } }),
+      diagnostic: (message) => log.push(message),
+    })(extensionApiForTest(h.api));
+
+    await startup;
+    expect(h.handlers.has("agent_settled")).toBe(true);
+    await h.emit("session_start", { type: "session_start", reason: "startup" });
+    await h.emit("agent_settled", { type: "agent_settled" });
+
+    expect(log).toContain("parentSettled");
   });
 
   test("renders historical tool results without exposing raw details", async () => {

@@ -97,9 +97,11 @@ Restoration never grants lifecycle tools omitted by the persisted allowlist. It 
 
 ## Completion delivery
 
+`CompletionService` owns queue-linked in-memory notification epochs. Only an empty-to-non-empty transition without an active receiver creates an epoch. Any successful drain clears the epoch atomically, including partial drains. Controller delivery uses candidate/send/exact-acknowledgement and never holds the queue mutex over host I/O.
+
 `await_agent` delivers at most one newly ready completion and a bounded lexical inventory page. Paging cursors operate on native agent IDs, not display ordinals. Complete summaries are never sliced to fit the provider envelope; inventory metadata reports omissions and remaining entries.
 
-A completion leaving the ready queue does not erase its durable event or output. Restoration can reconstruct visibility from persistence.
+A completion leaving the ready queue does not erase its durable event or output. Restoration can reconstruct visibility from persistence. Parent settlement revalidates deferred delivery; restoration and shutdown create no stale dispatch.
 
 ## Branch and replacement safety
 

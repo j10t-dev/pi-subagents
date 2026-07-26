@@ -791,7 +791,7 @@ describe("startup integration", () => {
     expect(h.tools()).toEqual([]);
   });
 
-  test("a throwing startup is reported on both channels and costs no tool or lifecycle handler", async () => {
+  test("a throwing startup is reported on both channels and costs no tool installation", async () => {
     const h = startupHarness({ startWidget: () => { throw new Error("widget boom"); } });
     expect(h.tools()).toHaveLength(4);
     expect(h.diagnostics).toEqual(["Subagent widget unavailable (startup_failed)."]);
@@ -806,7 +806,7 @@ describe("startup integration", () => {
     expect(result.content[0]?.text).toBe("spawn_agent");
     expect(h.handlerNames()).toEqual([
       "session_start", "session_start", "session_start", "session_before_tree", "session_tree",
-      "session_before_switch", "session_before_fork", "session_shutdown",
+      "session_before_switch", "session_before_fork", "session_shutdown", "agent_settled",
     ]);
   });
 
@@ -827,7 +827,7 @@ describe("startup integration", () => {
     }).not.toThrow();
     expect(h!.tools()).toHaveLength(4);
     expect(h!.handlerNames()).toEqual([
-      "session_start", "session_start", "session_before_tree", "session_tree", "session_before_switch", "session_before_fork", "session_shutdown",
+      "session_start", "session_start", "session_before_tree", "session_tree", "session_before_switch", "session_before_fork", "session_shutdown", "agent_settled",
     ]);
   });
 
@@ -839,7 +839,7 @@ describe("startup integration", () => {
     expect(h!.tools()).toHaveLength(4);
     expect(h!.handlerNames()).toEqual([
       "session_start", "session_start", "session_start", "session_before_tree", "session_tree",
-      "session_before_switch", "session_before_fork", "session_shutdown",
+      "session_before_switch", "session_before_fork", "session_shutdown", "agent_settled",
     ]);
     await expect(h!.start()).resolves.toBeUndefined();
   });
