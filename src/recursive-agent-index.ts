@@ -159,6 +159,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     let levelStart = 0;
     while (levelStart < ownerQueue.length) {
       if (admittedCount >= maximumRows) {
+        preserveRetainedUnprocessedOwners(this.retained, nextRetained, ownerQueue, levelStart);
         degraded = true;
         break;
       }
@@ -226,6 +227,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
         nextOwners,
       );
       if (admittedCount >= maximumRows && ownerQueue.length > levelEnd) {
+        preserveRetainedUnprocessedOwners(this.retained, nextRetained, ownerQueue, levelEnd);
         degraded = true;
         break;
       }
@@ -306,6 +308,19 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     } catch {
       // Watch ownership ends even if the adapter rejects disposal.
     }
+  }
+}
+
+function preserveRetainedUnprocessedOwners(
+  retained: ReadonlyMap<AgentId, RetainedSlot>,
+  nextRetained: Map<AgentId, RetainedSlot>,
+  ownerQueue: readonly AdmittedNode[],
+  firstUnprocessed: number,
+): void {
+  for (let cursor = firstUnprocessed; cursor < ownerQueue.length; cursor += 1) {
+    const owner = ownerQueue[cursor]!.sessionId;
+    const previous = retained.get(owner);
+    if (previous !== undefined) nextRetained.set(owner, previous);
   }
 }
 

@@ -330,6 +330,127 @@ describe("RecursiveAgentIndex", () => {
     expect(watcher.calls.at(-1)).toEqual([left]);
   });
 
+  test("retains only admitted terminal snapshots skipped by temporary row saturation", () => {
+    const retained = agentId("saturation-retained-owner");
+    const rejected = agentId("saturation-rejected-owner");
+    const retainedChild = agentId("saturation-retained-child");
+    const rejectedChild = agentId("saturation-rejected-child");
+    const saturatedTwo = agentId("saturation-direct-two");
+    const saturatedThree = agentId("saturation-direct-three");
+    const saturatedFour = agentId("saturation-direct-four");
+    const reads: AgentId[] = [];
+    let phase: "spare" | "saturated" | "stale" | "malformed" = "spare";
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => {
+      reads.push(...ids);
+      if (phase === "spare") {
+        return {
+          snapshots: new Map([
+            [retained, snapshot(retained, [observationRow("A1", retainedChild, CompletionState.Completed, "revision-five-child")], {
+              incarnation: incarnationId("saturation-inc"), revision: 5,
+            })],
+            [rejected, snapshot(rejected, [observationRow("A1", rejectedChild, CompletionState.Completed, "rejected-history")], {
+              incarnation: incarnationId("saturation-inc"), revision: 5,
+            })],
+          ]),
+          skipped: new Map(ids.filter((id) => id !== retained && id !== rejected)
+            .map((id) => [id, "missing-directory"] as const)),
+        };
+      }
+      if (phase === "stale") {
+        return {
+          snapshots: new Map(ids.flatMap((id) => id === retained
+            ? [[retained, snapshot(retained, [observationRow("A1", retainedChild, CompletionState.Completed, "revision-four-child")], {
+              incarnation: incarnationId("saturation-inc"), revision: 4,
+            })] as const]
+            : [])),
+          skipped: new Map(ids.filter((id) => id !== retained)
+            .map((id) => [id, "missing-directory"] as const)),
+        };
+      }
+      if (phase === "malformed") {
+        return {
+          snapshots: new Map(),
+          skipped: new Map(ids.map((id) => [
+            id,
+            id === retained || id === rejected ? "malformed" : "missing-directory",
+          ] as const)),
+        };
+      }
+      throw new Error("saturated owners must not be read");
+    };
+    const { index, port, watcher } = fixture(
+      direct([
+        projection(rejected, "A1", CompletionState.Completed, "capacity-rejected"),
+        projection(retained, "A5", CompletionState.Completed, "retained-owner"),
+      ]),
+      { maxRows: 4, readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1", "A5", "A5.1"]);
+    expect(index.snapshot().rows.map((row) => row.taskLabel)).toEqual([
+      "capacity-rejected" as TaskLabel,
+      "rejected-history" as TaskLabel,
+      "retained-owner" as TaskLabel,
+      "revision-five-child" as TaskLabel,
+    ]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(4), omitted: agentCount(0), degraded: true });
+    expect(reads).toEqual([retained, rejected]);
+    expect(watcher.calls.at(-1)).toEqual([retained, rejected]);
+
+    phase = "saturated";
+    port.result = direct([
+      projection(rejected, "A1", CompletionState.Completed, "capacity-rejected"),
+      projection(saturatedTwo, "A2", CompletionState.Completed),
+      projection(saturatedThree, "A3", CompletionState.Completed),
+      projection(saturatedFour, "A4", CompletionState.Completed),
+      projection(retained, "A5", CompletionState.Completed, "retained-owner"),
+    ]);
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A2", "A3", "A4", "A5"]);
+    expect(index.snapshot().rows.map((row) => row.taskLabel)).toEqual([
+      "A2" as TaskLabel,
+      "A3" as TaskLabel,
+      "A4" as TaskLabel,
+      "retained-owner" as TaskLabel,
+    ]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(5), omitted: agentCount(1), degraded: true });
+    expect(reads).toEqual([retained, rejected]);
+    expect(watcher.calls.at(-1)).toEqual([]);
+
+    phase = "stale";
+    port.result = direct([projection(retained, "A5", CompletionState.Completed, "retained-owner")]);
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A5", "A5.1"]);
+    expect(index.snapshot().rows.map((row) => row.taskLabel)).toEqual([
+      "retained-owner" as TaskLabel,
+      "revision-five-child" as TaskLabel,
+    ]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: true });
+    expect(reads).toEqual([retained, rejected, retained, retainedChild]);
+    expect(watcher.calls.at(-1)).toEqual([retained]);
+
+    phase = "malformed";
+    port.result = direct([
+      projection(rejected, "A1", CompletionState.Completed, "capacity-rejected"),
+      projection(retained, "A5", CompletionState.Completed, "retained-owner"),
+    ]);
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A5", "A5.1"]);
+    expect(index.snapshot().rows.map((row) => row.taskLabel)).toEqual([
+      "capacity-rejected" as TaskLabel,
+      "retained-owner" as TaskLabel,
+      "revision-five-child" as TaskLabel,
+    ]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(3), omitted: agentCount(0), degraded: true });
+    expect(reads).toEqual([retained, rejected, retained, retainedChild, retained, rejected, retainedChild]);
+    expect(watcher.calls.at(-1)).toEqual([retained, rejected]);
+  });
+
   test("degrades when an admitted terminal direct publisher is unread at the exact row budget", () => {
     const terminal = agentId("terminal-direct-budget");
     const reads: AgentId[] = [];
