@@ -13,7 +13,6 @@ import {
   toAgentError,
   utf8Bytes,
   codedErrorToAgentError,
-  truncateUtf8,
   isPublicPreflightError,
   agentCount,
   type AgentCompletion,
@@ -584,73 +583,8 @@ function stableErrorCode(error: unknown): AgentErrorCode | undefined {
   } catch { return undefined; }
 }
 
-const MAX_RENDER_BYTES = utf8Bytes(8_192);
-
-function modelIdForDisplay(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const separator = value.indexOf("/");
-  return separator < 0 ? undefined : value.slice(separator + 1);
-}
-
-function renderStart(result: object): string {
-  const details = resultDetails(result);
-  const model = modelIdForDisplay(details.model);
-  const selection = `${model === undefined ? "" : field({ model }, "model")}${field(details, "thinkingLevel", "reasoning")}`;
-  return compact([`${fields(details, ["agentId", "runId", "state"])}${selection}`]);
-}
-
-function renderAwait(result: object): string {
-  const details = resultDetails(result);
-  const completions = objectArray(details.completions);
-  const inventory = record(details.inventory) ?? {};
-  const agents = objectArray(inventory.agents);
-  const lines = [
-    `completions=${completions.length} agents=${agents.length}${field(details, "timedOut")}`,
-    ...completions.map((completion) => `completion ${fields(completion, ["agentId", "runId", "state", "outputPath"])}`),
-    ...agents.map((agent) => `agent ${fields(agent, ["agentId", "state", "currentRunId", "latestCompletionState", "latestOutputPath"])}`),
-  ];
-  return compact(lines);
-}
-
-function renderStop(result: object): string {
-  const outcomes = objectArray(resultDetails(result).outcomes);
-  return compact([
-    `outcomes=${outcomes.length}`,
-    ...outcomes.map((outcome) => {
-      const error = record(outcome.error);
-      return fields(outcome, ["agentId", "runId", "state", "agentState"])
-        + (error === undefined ? "" : field(error, "code", "errorCode"));
-    }),
-  ]);
-}
-
 function resultDetails(result: object): Record<string, unknown> {
   const outer = result as Record<string, unknown>;
-  return record(outer.details) ?? outer;
-}
-
-function objectArray(value: unknown): Record<string, unknown>[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
-    const valueRecord = record(item);
-    return valueRecord === undefined ? [] : [valueRecord];
-  });
-}
-
-function record(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
-}
-
-function fields(value: Record<string, unknown>, names: readonly string[]): string {
-  return names.map((name) => field(value, name).trimStart()).filter((value) => value.length > 0).join(" ");
-}
-
-function field(value: Record<string, unknown>, name: string, label = name): string {
-  const raw = value[name];
-  if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") return "";
-  return ` ${label}=${String(raw).replaceAll(/[\r\n]/g, " ")}`;
-}
-
-function compact(lines: readonly string[]): string {
-  return truncateUtf8(lines.filter((line) => line.length > 0).join("\n"), MAX_RENDER_BYTES).text;
+  const details = outer.details;
+  return typeof details === "object" && details !== null ? details as Record<string, unknown> : outer;
 }

@@ -481,7 +481,7 @@ describe("failure boundaries", () => {
     expect(h.notices).toEqual([{ message: "Subagent widget unavailable (mount_failed).", type: "warning" }]);
   });
   test("a throwing diagnostic presenter cannot escape a guarded widget failure", () => { const feed = fakeSource(); harness({ sources: [feed], setWidgetThrowsOn: "mount", notifyThrows: true }); publish(); expect(() => feed.emit(snapshotOf(2))).not.toThrow(); });
-  test("an unmount failure retains the lease until widget removal succeeds", () => { const feed = fakeSource(); setAmbientStatus("2 running"); const ambient = ambientRecorder(); const h = harness({ sources: [feed], unmountFailures: 1 }); publish(); feed.emit(snapshotOf(2)); expect(() => feed.emit(snapshotOf(0, 0))).not.toThrow(); expect(ambient.text).toBeUndefined(); feed.emit(snapshotOf(0, 0)); expect(ambient.text).toBe("2 running"); });
+  test("an unmount failure retains the lease until widget removal succeeds", () => { const feed = fakeSource(); setAmbientStatus("2 running"); const ambient = ambientRecorder(); harness({ sources: [feed], unmountFailures: 1 }); publish(); feed.emit(snapshotOf(2)); expect(() => feed.emit(snapshotOf(0, 0))).not.toThrow(); expect(ambient.text).toBeUndefined(); feed.emit(snapshotOf(0, 0)); expect(ambient.text).toBe("2 running"); });
   test("a failed widget removal remains registered and is retried on the next cleanup", () => {
     const feed = fakeSource();
     setAmbientStatus("2 running");

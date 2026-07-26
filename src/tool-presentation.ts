@@ -9,7 +9,6 @@ import {
 } from "./domain.ts";
 import { directAgentRow, type AgentRow, type SubagentObservationPort } from "./agent-observation.ts";
 import { diagnosticsPath, outputPath, sessionPath } from "./paths.ts";
-import type { DiagnosticsPath, OutputPath, SessionPath } from "./domain.ts";
 
 export interface AgentDisplayResolver {
   resolve(agentId: AgentId): AgentRow | undefined;

@@ -17,7 +17,6 @@ import {
   type RunAttemptId,
   type RunId,
   type RunLaunchRequestedPayloadV1,
-  type RunLaunchRequestedPayloadV2,
   type RunStartedPayload,
   type RunStoppingPayload,
   type SessionEntryId,

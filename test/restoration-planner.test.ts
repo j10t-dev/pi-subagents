@@ -40,7 +40,6 @@ import { completedEntry, launchEntry, spawnedEntry, startedEntry } from "./suppo
 
 const AGENT = testAgentId("agent-a");
 const RUN = testRunId("deadbeef");
-const PREVIOUS_RUN = testRunId("cafebabe");
 const ATTEMPT = testAttemptId("attempt-1");
 const REASON = CancellationReason.ParentShutdown;
 const launchFixture: PendingLaunch = {

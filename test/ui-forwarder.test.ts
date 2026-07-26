@@ -34,6 +34,7 @@ function missingSignalTypeFixture(): void {
   // @ts-expect-error `forward` must require an owning run signal.
   void broker.forward(AGENT_A, confirm("missing-signal"));
 }
+void missingSignalTypeFixture;
 
 function controlledUI(overrides: Partial<ExtensionUIContextLike> = {}): ExtensionUIContextLike {
   return {

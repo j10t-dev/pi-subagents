@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { AgentErrorCode, AgentState, CompletionState, CodedError, PublicPreflightError, agentId, modelSpec, runCapacity, runId, truncateUtf8, utf8Bytes, verifiedContainmentReceiptPath } from "../src/domain.ts";
 import type { AgentId, SessionEntryId } from "../src/domain.ts";
 import { diagnosticsPath, containmentReceiptPath, sessionPath } from "../src/paths.ts";
-import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PreparationScope } from "../src/controller.ts";
+import { SubagentController, type LaunchSession, type LaunchTransport, type PreparationScope } from "../src/controller.ts";
 import { OutputStore } from "../src/output-store.ts";
 import type { RestoreAdmission, RunRuntime } from "../src/run-controller.ts";
 import { testAbsolutePath, testAgentId, testAttemptId, testCommittedOutputPath, testContainmentAttempt, testEntryId, testReceiptPath, testRunId, testSessionPath, testToolName, testVerifiedReceiptPath } from "./support/brands.ts";
@@ -34,7 +34,7 @@ const R1 = runId("deadbeef");
 
 function preparationScopeTypeFixture(scope: PreparationScope): void {
   // @ts-expect-error detached work is scheduling-only and has no awaitable result
-  const scheduled: Promise<void> = scope.scheduleExternal(async () => {});
+  const scheduled: Promise<void> = scope.scheduleExternal(() => {});
   void scheduled;
   // @ts-expect-error the generic result-returning escape hatch must not exist
   scope.runExternal(() => Promise.resolve());

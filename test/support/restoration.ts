@@ -1,6 +1,6 @@
 import { dirname } from "node:path";
 import { AGENT_EVENT_CUSTOM_TYPE } from "../../src/constants.ts";
-import { AgentEventType, AgentState, CancellationReason, type AgentCompletion, type AgentEventPayloadMap, type PersistedAgentEvent } from "../../src/domain.ts";
+import { AgentEventType, CancellationReason, type AgentCompletion, type AgentEventPayloadMap, type PersistedAgentEvent } from "../../src/domain.ts";
 import { AgentEventAppender, foldAgentEvents, type FoldedAgentRecord } from "../../src/persistence.ts";
 import type { RestorationPort } from "../../src/controller.ts";
 import { completedCompletion } from "./messages.ts";

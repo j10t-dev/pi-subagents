@@ -23,7 +23,6 @@ import {
   incarnationId,
   observationRevision,
   type AbsolutePath,
-  type AgentCount,
   type AgentId,
   type ContextLabel,
   type IncarnationId,

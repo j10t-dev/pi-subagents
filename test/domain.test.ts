@@ -88,7 +88,6 @@ import {
   AgentErrorSchema,
   AgentUsageSchema,
   CompletionOutputSchema,
-  PersistedAgentEventSchema,
   RunLaunchRequestedPayloadSchema,
   RunStartedPayloadSchema,
   RunStoppingPayloadSchema,
@@ -146,6 +145,8 @@ void _specAsProvider;
 const DURATION: Milliseconds = milliseconds(10);
 const BYTE_COUNT: Utf8Bytes = utf8Bytes(10);
 const DEPTH: DelegationDepth = delegationDepth(1);
+void BYTE_COUNT;
+void DEPTH;
 const CAPACITY: RunCapacity = runCapacity(4);
 const PROCESS_COUNT: ProcessCount = processCount(4);
 const OFFSET: Utf16CodeUnitOffset = utf16CodeUnitOffset(4);

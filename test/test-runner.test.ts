@@ -18,7 +18,6 @@ import {
   selectTestGroups,
   resolveTestGroupOwner,
   type TestGroup,
-  type TestGroupName,
 } from "../scripts/test-groups.ts";
 import {
   integrationConcurrency,
@@ -451,7 +450,7 @@ describe("runSelectedTestGroups", () => {
     const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
     const output = new EventEmitter() as EventEmitter & RunnerDependencies["stdout"];
     let writes = 0;
-    output.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+    output.write = ((_chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
       writes += 1;
       const error = Object.assign(new Error("heading closed"), { code: "EPIPE" });
       if (writes === 1) {
@@ -471,7 +470,7 @@ describe("runSelectedTestGroups", () => {
     const a = new FakeTestGroupProcess(); const b = new FakeTestGroupProcess(); const h = runnerHarness([a, b]);
     const output = new EventEmitter() as EventEmitter & RunnerDependencies["stdout"];
     let writes = 0;
-    output.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+    output.write = ((_chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
       writes += 1;
       const error = Object.assign(new Error("newline closed"), { code: "EPIPE" });
       if (writes === 3) {

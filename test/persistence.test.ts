@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  AgentEventType, AgentState, RestorationActionType, agentId, modelId, observedCgroupScopePath,
+  AgentEventType, AgentState, RestorationActionType, agentId, observedCgroupScopePath,
   utf8Bytes, type CommittedOutputPath, type ModelId, type OutputPath, type ProviderId,
   type RunCompletedPayload, type RunLaunchRequestedPayload, type RunStartedPayload,
   type RunStoppingPayload, type SpawnedPayload, type ToolName,
 } from "../src/domain.ts";
 import type { ContainmentDescriptor, RestorationContainmentDescriptor } from "../src/containment.ts";
-import { absolutePath, containmentReceiptPath, outputPath, sessionPath } from "../src/paths.ts";
+import { absolutePath, containmentReceiptPath, sessionPath } from "../src/paths.ts";
 import {
   testAgentId, testAttemptId, testCommittedOutputPath, testContainmentAttempt, testModelId,
   testProviderId, testRunId, testToolName,
@@ -22,7 +22,6 @@ import {
   type DecodedPersistedAgentEvent,
   type FoldedAgentRecord,
   type PendingLaunch,
-  type RestorationAction,
   type RestorationRunLaunchRequestedPayloadV2,
 } from "../src/persistence.ts";
 

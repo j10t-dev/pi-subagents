@@ -23,11 +23,14 @@ import {
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends
   (<T>() => T extends B ? 1 : 2) ? true : false;
 type Assert<T extends true> = T;
-type _RunId = Assert<Equal<NonNullable<ReturnType<typeof validatedRunId>>, RunId>>;
-type _ErrorCode = Assert<Equal<NonNullable<ReturnType<typeof validatedErrorCode>>, AgentErrorCodeType>>;
-type _OutputPath = Assert<Equal<NonNullable<ReturnType<typeof validatedPath<OutputPath>>>, OutputPath>>;
-type _SessionPath = Assert<Equal<NonNullable<ReturnType<typeof validatedPath<SessionPath>>>, SessionPath>>;
-type _DiagnosticsPath = Assert<Equal<NonNullable<ReturnType<typeof validatedPath<DiagnosticsPath>>>, DiagnosticsPath>>;
+const validatedBrandContracts: readonly [
+  Assert<Equal<NonNullable<ReturnType<typeof validatedRunId>>, RunId>>,
+  Assert<Equal<NonNullable<ReturnType<typeof validatedErrorCode>>, AgentErrorCodeType>>,
+  Assert<Equal<NonNullable<ReturnType<typeof validatedPath<OutputPath>>>, OutputPath>>,
+  Assert<Equal<NonNullable<ReturnType<typeof validatedPath<SessionPath>>>, SessionPath>>,
+  Assert<Equal<NonNullable<ReturnType<typeof validatedPath<DiagnosticsPath>>>, DiagnosticsPath>>,
+] = [true, true, true, true, true];
+void validatedBrandContracts;
 
 
 function row(id: string, ordinal: string, state: AgentRow["state"], task = "task"): [ReturnType<typeof agentId>, AgentRow] {

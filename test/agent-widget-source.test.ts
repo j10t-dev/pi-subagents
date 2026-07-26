@@ -11,7 +11,6 @@ import {
   AgentState,
   CompletionState,
   agentCount,
-  agentDepth,
   agentId,
   agentObservationRevision,
   agentOrdinal,

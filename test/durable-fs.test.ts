@@ -73,7 +73,6 @@ function retrySyncAdapter(failedParent: string, trace: string[]): DurableFileSys
 }
 
 function adapter(trace: string[] = [], fail?: string, cleanupFail = false): DurableFileSystem {
-  let destinationDirectory = "";
   const operation = (name: string) => {
     trace.push(name);
     if (name === fail) throw new Error(`primary:${name}`);
@@ -83,7 +82,6 @@ function adapter(trace: string[] = [], fail?: string, cleanupFail = false): Dura
     mkdir(path, mode) { operation(`mkdir:${path}`); mkdirSync(path, { mode }); },
     open(path, flags, mode) {
       const isDirectory = existsSync(path) && statSync(path).isDirectory();
-      if (isDirectory) destinationDirectory = path;
       operation(isDirectory ? "directory:open" : flags === "wx" ? "temporary:open" : "file:open");
       return openSync(path, flags, mode);
     },

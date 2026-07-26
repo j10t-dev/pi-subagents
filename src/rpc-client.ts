@@ -45,7 +45,7 @@ import {
 } from "./rpc-wire.ts";
 import { OutputStore } from "./output-store.ts";
 import { UIForwarder, type UIForwardOutcome } from "./ui-forwarder.ts";
-import { AgentUsageSchema, AssistantMessageSchema, UsageSchema, type WireAssistantMessage, type WireExtensionUIDialog } from "./schemas.ts";
+import { AgentUsageSchema, AssistantMessageSchema, type WireAssistantMessage, type WireExtensionUIDialog } from "./schemas.ts";
 import type { RpcLaunchSpec } from "./pi-launcher.ts";
 import { launchWatchdogRpcTransport, type WatchdogClient } from "./watchdog-client.ts";
 import { MAX_RPC_RECORD_BYTES } from "./constants.ts";
@@ -131,7 +131,6 @@ export class RpcRunClient {
   private terminalCleaned = false;
   private started = false;
   private transportFailure: Promise<void> | undefined;
-  private finalAssistant: WireAssistantMessage | undefined;
   private settlementRecovery: Promise<void> | undefined;
   private agentStarted = false;
   private agentStartError: Error | undefined;
@@ -416,7 +415,6 @@ export class RpcRunClient {
         this.safeObservation(() => this.options.observationSink?.record({ kind: "assistant-end", finalBlocks: record.finalBlocks, usage: record.usage, stopReason: record.stopReason }));
         if (!this.accumulateUsage(record.message)) return;
         if (!this.routeOutputMutation(() => this.routeMessageEvent({ kind: "message_end", message: record.message }))) return;
-        this.finalAssistant = record.message;
         return;
       case "tool":
         this.safeObservation(() => this.options.observationSink?.record(record));

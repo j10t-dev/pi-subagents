@@ -30,7 +30,6 @@ export function createAgentWidgetSource(
   deps: AgentWidgetSourceDeps,
 ): AgentWidgetSource & { dispose(): void } {
   const listeners = new Set<() => void>();
-  let disposed = false;
   let current: AgentWidgetSnapshot;
 
   const index = createRecursiveAgentIndex(port, {
@@ -74,7 +73,6 @@ export function createAgentWidgetSource(
       return () => { listeners.delete(onChange); };
     },
     dispose: (): void => {
-      disposed = true;
       listeners.clear();
       let failure: unknown;
       const contain = (operation: () => void): void => {

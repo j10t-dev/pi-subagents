@@ -9,7 +9,6 @@ import type {
   AbsolutePath,
   ContainmentReceiptPath,
   ObservedCgroupScopePath,
-  RunAttemptId,
 } from "../src/domain.ts";
 import { agentId, createRunAttemptId } from "../src/domain.ts";
 import { verifyContainmentReceipt } from "../src/watchdog-client.ts";

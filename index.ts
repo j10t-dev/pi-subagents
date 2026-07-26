@@ -6,7 +6,6 @@ import { Text } from "@earendil-works/pi-tui";
 
 import { canDelegateFrom, parseExtensionLaunchContext, type DelegationLimits } from "./src/delegation-policy.ts";
 import { onAmbientStatus, setAmbientStatus } from "./src/ambient-status-lease.ts";
-import { SubagentController } from "./src/controller.ts";
 import { delegationDepth, type AbsolutePath, type DelegationDepth } from "./src/domain.ts";
 import { createProductionController } from "./src/pi-composition.ts";
 import { createObservationDisplayResolver, renderLifecycleToolResult } from "./src/tool-presentation.ts";

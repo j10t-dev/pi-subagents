@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { Value } from "typebox/value";
-import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, directAgentOrdinal, modelSpec, runCapacity, runId, runAttemptId, truncateUtf8, utf8Bytes, type AgentCompletion, type ToolName, type Utf8Bytes } from "../src/domain.ts";
+import { AgentErrorCode, AgentState, CodedError, CompletionState, PublicPreflightError, agentId, directAgentOrdinal, modelSpec, runCapacity, runId, runAttemptId, truncateUtf8, utf8Bytes, type ToolName } from "../src/domain.ts";
 import { directAgentRow } from "../src/agent-observation.ts";
 import { AgentObservationStore } from "../src/agent-observation-store.ts";
 import { createObservationDisplayResolver } from "../src/tool-presentation.ts";
 import { diagnosticsPath } from "../src/paths.ts";
-import { CompletionService, type AgentSummary } from "../src/completion-service.ts";
+import { CompletionService } from "../src/completion-service.ts";
 import { MAX_AGGREGATE_AWAIT_BYTES } from "../src/constants.ts";
 import { SubagentController, type LaunchSession, type LaunchTransport, type PiControllerComposition, type PublicStopOutcome } from "../src/controller.ts";
 import { deferred } from "./support/async.ts";
-import { testAbsolutePath, testAttemptId, testCommittedOutputPath, testReceiptPath, testRunId, testSessionPath, testToolName, testVerifiedReceiptPath } from "./support/brands.ts";
+import { testAbsolutePath, testCommittedOutputPath, testRunId, testSessionPath, testToolName, testVerifiedReceiptPath } from "./support/brands.ts";
 import { launchSession, runningTransport as sharedRunningTransport, testRuntime } from "./support/launches.ts";
 import {
   createSubagentTools,
@@ -32,12 +32,15 @@ type Equal<A, B> =
   (<T>() => T extends B ? 1 : 2) ? true : false;
 type Assert<T extends true> = T;
 
-type _SpawnInput = Assert<Equal<SubagentToolInput<"spawn_agent">, SpawnAgentInput>>;
-type _SendInput = Assert<Equal<SubagentToolInput<"send_input">, SendInputInput>>;
-type _AwaitInput = Assert<Equal<SubagentToolInput<"await_agent">, AwaitAgentInput>>;
-type _StopInput = Assert<Equal<SubagentToolInput<"stop_agent">, StopAgentInput>>;
-type _RegistryKeys = Assert<Equal<keyof SubagentToolRegistry,
-  "spawn_agent" | "send_input" | "await_agent" | "stop_agent">>;
+const toolTypeContracts: readonly [
+  Assert<Equal<SubagentToolInput<"spawn_agent">, SpawnAgentInput>>,
+  Assert<Equal<SubagentToolInput<"send_input">, SendInputInput>>,
+  Assert<Equal<SubagentToolInput<"await_agent">, AwaitAgentInput>>,
+  Assert<Equal<SubagentToolInput<"stop_agent">, StopAgentInput>>,
+  Assert<Equal<keyof SubagentToolRegistry,
+    "spawn_agent" | "send_input" | "await_agent" | "stop_agent">>,
+] = [true, true, true, true, true];
+void toolTypeContracts;
 type ToolControllerFake = Partial<Record<keyof SubagentToolController, (...args: never[]) => unknown>>;
 
 /**
@@ -47,10 +50,6 @@ type ToolControllerFake = Partial<Record<keyof SubagentToolController, (...args:
 function fakeToolController(value: ToolControllerFake): SubagentToolController {
   // malformed trust-boundary fixture: fake tool methods may return deliberately invalid DTOs.
   return value as unknown as SubagentToolController;
-}
-
-function withFixtureExtras<T extends object, TExtras extends object>(value: T, extras: TExtras): T & TExtras {
-  return { ...value, ...extras };
 }
 
 const TEST_SELECTION = Object.freeze({
@@ -148,7 +147,7 @@ describe("exact tool contracts", () => {
   test("spawn and send execute through production composition without wrapping literal input", async () => {
     const messages: string[] = [];
     const controller = fakeToolController({
-      spawn: async (input: { task: string }) => ({ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: AgentState.Running,
+      spawn: async (_input: { task: string }) => ({ agentId: agentId("agent-a"), runId: runId("deadbeef"), state: AgentState.Running,
         model: modelSpec("mock-provider/luna"), thinkingLevel: "high", tools: ["web_fetch", "read"] }),
       sendInput: async (_id: unknown, message: string) => { messages.push(message); return { agentId: agentId("agent-a"), runId: runId("cafebabe"), state: AgentState.Running }; },
     });

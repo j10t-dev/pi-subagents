@@ -14,7 +14,6 @@ import {
   AgentState,
   CancellationReason,
   CodedError,
-  agentId,
   toAgentError,
   type AgentCompletion,
   type AgentError,
@@ -32,7 +31,6 @@ import {
   directAgentOrdinal,
   agentObservationRevision,
   modelSpecFrom,
-  verifiedContainmentReceiptPath,
   isPublicPreflightError,
   truncateUtf8,
 } from "./domain.ts";
@@ -54,7 +52,6 @@ import {
   applyRestoration,
   collectRestorationEvidence,
   planRestoration,
-  type RestorationContainmentDecision,
   type AppliedAgentRecord,
   type RestorationPort,
   type RestoredTerminalObligation,

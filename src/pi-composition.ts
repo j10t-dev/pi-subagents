@@ -37,7 +37,6 @@ import {
   sessionEntryId,
   toAgentError,
   retainUtf8Tail,
-  verifiedContainmentReceiptPath,
   type AbsolutePath,
   type AgentCompletion,
   type AgentId,

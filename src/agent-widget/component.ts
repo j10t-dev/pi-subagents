@@ -29,7 +29,7 @@ export class AgentWidgetComponent implements Component, Focusable {
 
   constructor(
     private readonly tui: TUI,
-    private readonly theme: Theme,
+    _theme: Theme,
     private readonly view: () => AgentWidgetView,
     private readonly applyModel: (next: AgentWidgetModel) => void,
     private readonly returnFocusToEditor: () => void,
