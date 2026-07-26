@@ -470,7 +470,7 @@ export class SubagentController {
         completion: candidate,
       });
       this.durableCompletions.set(agentRunKey(completion.agentId, completion.runId), completion);
-      await this.completions.publish(completion);
+      await this.completions.publishRestored(completion);
       this.observation.publishCompletion(completion);
       this.restoredRecords.delete(agentIdValue);
     }

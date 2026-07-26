@@ -431,6 +431,26 @@ describe("CompletionService notification epochs", () => {
     expect(await service.readyNotification()).toBeUndefined();
     expect((await service.awaitReady()).completion).toMatchObject({ agentId: restored.agentId, runId: restored.runId });
   });
+
+  test("passively republishes a restored completion without creating or altering notification eligibility", async () => {
+    const passive = new CompletionService();
+    const restored = completion({ agentId: OTHER_AGENT, runId: testRunId("cafebabe") });
+
+    await passive.publishRestored(restored);
+
+    expect(await passive.readyNotification()).toBeUndefined();
+    expect(passive.snapshotAgents()).toMatchObject([{ agentId: restored.agentId, latestCompletionState: restored.state }]);
+    expect((await passive.awaitReady()).completion).toMatchObject({ agentId: restored.agentId, runId: restored.runId });
+
+    const service = new CompletionService();
+    const live = completion();
+    await service.publish(live);
+    await service.publishRestored(restored);
+
+    expect(await service.readyNotification()).toEqual({ epoch: completionKey(live), readyCount: agentCount(2) });
+    expect((await service.awaitReady()).completion).toMatchObject({ agentId: live.agentId, runId: live.runId });
+    expect((await service.awaitReady()).completion).toMatchObject({ agentId: restored.agentId, runId: restored.runId });
+  });
 });
 
 describe("CompletionService.restore", () => {

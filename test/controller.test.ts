@@ -197,6 +197,7 @@ describe("parent lifecycle wiring", () => {
       await expect(c.restore()).resolves.toBeUndefined();
       expect(proofAttempts).toBe(2);
       expect(readFileSync(committed, "utf8")).toBe("reconstructed");
+      await c.parentSettled();
       expect(pings).toEqual([]);
       expect(completionArray(await c.awaitReady())).toMatchObject([{
         agentId: testAgentId(),

@@ -97,23 +97,13 @@ export class CompletionService {
   /** Publishes a terminal completion and creates an eligible notification candidate when needed. */
   async publish(completion: AgentCompletion): Promise<void> {
     this.liveOperationsStarted = true;
-    await this.mutex.runExclusive(() => {
-      const key = completionKey(completion);
-      if (this.publishedRuns.has(key)) return;
-      this.publishedRuns.add(key);
-      const wasEmpty = this.queue.length === 0;
-      this.queue.push(completion);
-      this.upsertCompletionSummaryLocked(completion);
+    await this.mutex.runExclusive(() => this.publishLocked(completion, true));
+  }
 
-      const waiting = this.waitingReceiver;
-      if (waiting !== undefined) {
-        this.waitingReceiver = undefined;
-        waiting.wake();
-        return;
-      }
-
-      if (wasEmpty) this.notificationEpoch = key;
-    });
+  /** Republishes a restored terminal completion without changing notification eligibility. */
+  async publishRestored(completion: AgentCompletion): Promise<void> {
+    this.liveOperationsStarted = true;
+    await this.mutex.runExclusive(() => this.publishLocked(completion, false));
   }
 
   async readyNotification(): Promise<ReadyNotificationCandidate | undefined> {
@@ -265,6 +255,24 @@ export class CompletionService {
   }
 
   queuedCount(): number { return this.queue.length; }
+
+  private publishLocked(completion: AgentCompletion, createNotification: boolean): void {
+    const key = completionKey(completion);
+    if (this.publishedRuns.has(key)) return;
+    this.publishedRuns.add(key);
+    const wasEmpty = this.queue.length === 0;
+    this.queue.push(completion);
+    this.upsertCompletionSummaryLocked(completion);
+
+    const waiting = this.waitingReceiver;
+    if (waiting !== undefined) {
+      this.waitingReceiver = undefined;
+      waiting.wake();
+      return;
+    }
+
+    if (createNotification && wasEmpty) this.notificationEpoch = key;
+  }
 
   private snapshotAgentsLocked(): AgentSummary[] {
     return Array.from(this.agents.values(), (summary) => ({ ...summary }));
