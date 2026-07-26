@@ -188,6 +188,44 @@ describe("createAgentWidgetSource", () => {
     terminal.dispose();
   });
 
+  test("reconstructs completed descendants after source recreation", () => {
+    const store = new AgentObservationStore();
+    register(store, "completed-root", 1, "Finished root");
+    writePublished("completed-root", [{ ordinal: "A2", sessionId: "completed-child" }]);
+    writePublished("completed-child", [{ ordinal: "A3", sessionId: "completed-grandchild" }]);
+    const direct = store.directSnapshot();
+    if (direct.kind !== "snapshot") throw new Error("expected snapshot fixture");
+    const port: SubagentObservationPort = {
+      observation: (id) => store.observation(id),
+      directSnapshot: () => ({
+        ...direct,
+        entries: direct.entries.map((entry) => ({
+          ...entry,
+          observation: { ...entry.observation, lifecycleState: AgentState.Stopped, displayState: CompletionState.Completed },
+          row: { ...entry.row, state: CompletionState.Completed },
+        })),
+      }),
+      transcriptSource: (id) => store.transcriptSource(id),
+      subscribe: (listener) => store.subscribe(listener),
+    };
+
+    const source = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    expect(source.snapshot().rows.map((row) => row.ordinal)).toEqual([
+      agentOrdinal("A1"), agentOrdinal("A1.2"), agentOrdinal("A1.2.3"),
+    ]);
+    expect(source.transcriptSource(agentOrdinal("A1"))).toBeDefined();
+    expect(source.transcriptSource(agentOrdinal("A1.2"))).toBeUndefined();
+    source.dispose();
+
+    const recreated = createAgentWidgetSource(port, { agentDir: AGENT_DIR, maxRows: MAX_WIDGET_ROWS });
+    expect(recreated.snapshot().rows.map((row) => row.ordinal)).toEqual([
+      agentOrdinal("A1"), agentOrdinal("A1.2"), agentOrdinal("A1.2.3"),
+    ]);
+    expect(recreated.transcriptSource(agentOrdinal("A1"))).toBeDefined();
+    expect(recreated.transcriptSource(agentOrdinal("A1.2"))).toBeUndefined();
+    recreated.dispose();
+  });
+
   test("refreshes from snapshot-watcher changes and stops watching after disposal", async () => {
     const store = new AgentObservationStore();
     register(store, "watch-root", 1, "Root task");

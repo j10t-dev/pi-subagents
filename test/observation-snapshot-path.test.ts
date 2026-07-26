@@ -141,8 +141,15 @@ describe("readKnownChildSnapshots hardening", () => {
     expect([...readKnownChildSnapshots(agentDir, [CHILD_1]).snapshots.keys()]).toEqual([CHILD_1]);
   });
 
-  test("reports missing, oversized and smuggled slots without throwing", () => {
-    expect(readKnownChildSnapshots(agentDir, [agentId("never-written")]).skipped.get(agentId("never-written"))).toBe("missing");
+  test("distinguishes an absent slot directory from a pending snapshot file", () => {
+    const absent = agentId("absent-owner");
+    expect(readKnownChildSnapshots(agentDir, [absent]).skipped.get(absent)).toBe("missing-directory");
+
+    mkdirSync(observationSlotDirectory(agentDir, CHILD_1), { recursive: true });
+    expect(readKnownChildSnapshots(agentDir, [CHILD_1]).skipped.get(CHILD_1)).toBe("missing-file");
+  });
+
+  test("reports oversized and smuggled slots without throwing", () => {
     writeSnapshot(CHILD_1, { ...raw(snapshot()), ignored: "x".repeat(Number(MAX_SNAPSHOT_BYTES)) });
     expect(readKnownChildSnapshots(agentDir, [CHILD_1]).skipped.get(CHILD_1)).toBe("oversized");
     expect(readKnownChildSnapshots(agentDir, [smuggled("../escape")]).skipped.get(smuggled("../escape"))).toBe("invalid-session-id");
@@ -167,7 +174,7 @@ describe("readKnownChildSnapshots hardening", () => {
       ...filesystem,
       read: (): number => { throw Object.assign(new Error("missing during read"), { code: "ENOENT" }); },
     });
-    expect(readThenClose.skipped.get(CHILD_1)).toBe("missing");
+    expect(readThenClose.skipped.get(CHILD_1)).toBe("missing-file");
   });
 
   test("refuses a child slot symlinked outside the managed root", () => {

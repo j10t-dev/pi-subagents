@@ -67,7 +67,8 @@ export function encodeObservationSnapshot(snapshot: ObservationSnapshot): Encode
  */
 export type SnapshotSkipReason =
   | "invalid-session-id"
-  | "missing"
+  | "missing-directory"
+  | "missing-file"
   | "escapes-managed-root"
   | "not-a-regular-file"
   | "unreadable"
@@ -143,16 +144,24 @@ function readOne(
   sessionId: AgentId,
   filesystem: SnapshotReadFileSystem,
 ): ReadOutcome {
+  let slotDirectory: AbsolutePath;
   let path: ObservationSnapshotPath;
   try {
+    slotDirectory = observationSlotDirectory(agentDir, sessionId);
     path = observationSnapshotPath(agentDir, sessionId);
   } catch {
     return { ok: false, reason: "invalid-session-id" };
   }
+  const managedRoot = absolutePath(join(agentDir, STATE_DIR_NAME));
   try {
-    realContainedPath(join(agentDir, STATE_DIR_NAME), path);
+    realContainedPath(managedRoot, slotDirectory);
   } catch (error) {
-    return { ok: false, reason: isMissing(error) ? "missing" : "escapes-managed-root" };
+    return { ok: false, reason: isMissing(error) ? "missing-directory" : "escapes-managed-root" };
+  }
+  try {
+    realContainedPath(managedRoot, path);
+  } catch (error) {
+    return { ok: false, reason: isMissing(error) ? "missing-file" : "escapes-managed-root" };
   }
   const read = readBounded(path, filesystem);
   if (!read.ok) return read;
@@ -194,7 +203,7 @@ function readBounded(path: ObservationSnapshotPath, filesystem: SnapshotReadFile
   }
   return failure === undefined
     ? outcome
-    : { ok: false, reason: isMissing(failure) ? "missing" : "unreadable" };
+    : { ok: false, reason: isMissing(failure) ? "missing-file" : "unreadable" };
 }
 
 function decodeSnapshot(value: unknown, requestedSessionId: AgentId): ObservationSnapshot | "session-id-mismatch" | undefined {

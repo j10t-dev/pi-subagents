@@ -115,7 +115,7 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
     }
 
     const roots: AdmittedNode[] = [];
-    const activeQueue: AdmittedNode[] = [];
+    const ownerQueue: AdmittedNode[] = [];
     const tracked: AgentId[] = [];
     const seen = new Set<AgentId>();
     const nextOwners = new Map<AgentOrdinal, AgentId>();
@@ -139,21 +139,19 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
       seen.add(entry.agentId);
       admittedCount += 1;
       if (!nextOwners.has(entry.row.ordinal)) nextOwners.set(entry.row.ordinal, entry.agentId);
-      if (!isTerminal(entry.row.state)) {
-        activeQueue.push(node);
-        tracked.push(entry.agentId);
-      }
+      ownerQueue.push(node);
+      if (!isTerminal(entry.row.state)) tracked.push(entry.agentId);
     }
 
     let levelStart = 0;
-    while (levelStart < activeQueue.length) {
+    while (levelStart < ownerQueue.length) {
       if (admittedCount >= maximumRows) {
-        degraded = true;
+        if (ownerQueue.length > levelStart) degraded = true;
         break;
       }
-      const levelEnd = activeQueue.length;
+      const levelEnd = ownerQueue.length;
       for (let cursor = levelStart; cursor < levelEnd; cursor += 1) {
-        const parent = activeQueue[cursor]!;
+        const parent = ownerQueue[cursor]!;
         let result: KnownChildSnapshots;
         try {
           result = this.readSlots(this.dependencies.agentDir, [parent.sessionId]);
@@ -163,10 +161,12 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
         }
         const incoming = result.snapshots.get(parent.sessionId);
         if (incoming === undefined) {
-          degraded = true;
+          const skip = result.skipped.get(parent.sessionId);
+          if (!isTerminal(parent.row.state) || skip !== "missing-directory") degraded = true;
           continue;
         }
 
+        if (isTerminal(parent.row.state)) tracked.push(parent.sessionId);
         const retained = this.retained.get(parent.sessionId);
         let selected = incoming;
         if (retained !== undefined && retained.snapshot.incarnation === incoming.incarnation &&
@@ -206,13 +206,11 @@ class ManagedRecursiveAgentIndex implements RecursiveAgentIndex {
           parent.children.push(node);
           seen.add(child.sessionId);
           admittedCount += 1;
-          if (!isTerminal(child.state)) {
-            activeQueue.push(node);
-            tracked.push(child.sessionId);
-          }
+          ownerQueue.push(node);
+          if (!isTerminal(child.state)) tracked.push(child.sessionId);
         }
       }
-      if (admittedCount >= maximumRows && activeQueue.length > levelEnd) {
+      if (admittedCount >= maximumRows && ownerQueue.length > levelEnd) {
         degraded = true;
         break;
       }

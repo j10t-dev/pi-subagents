@@ -325,8 +325,27 @@ describe("RecursiveAgentIndex", () => {
 
     expect(reads).toEqual([left]);
     expect(index.snapshot().rows[1]?.taskLabel).toBe("fresh-lower-revision" as TaskLabel);
-    expect(index.snapshot().degraded).toBe(false);
+    expect(index.snapshot().degraded).toBe(true);
     expect(watcher.calls.at(-1)).toEqual([left]);
+  });
+
+  test("degrades when an admitted terminal direct publisher is unread at the exact row budget", () => {
+    const terminal = agentId("terminal-direct-budget");
+    const reads: AgentId[] = [];
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => {
+      reads.push(...ids);
+      return { snapshots: new Map(), skipped: new Map() };
+    };
+    const { index } = fixture(
+      direct([projection(terminal, "A1", CompletionState.Completed)]),
+      { maxRows: 1, readKnownChildSnapshots: reader },
+    );
+
+    index.refresh();
+
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(1), omitted: agentCount(0), degraded: true });
+    expect(reads).toEqual([]);
   });
 
   test("finishes current-level accounting but does not read the next BFS level after exhausting the row budget", () => {
@@ -362,7 +381,7 @@ describe("RecursiveAgentIndex", () => {
     expect(new Set(readBatches.flat()).size).toBeLessThanOrEqual(5);
   });
 
-  test("keeps an exact full budget healthy when no next-level publisher remains", () => {
+  test("degrades when an unread terminal next-level owner exactly fills the budget", () => {
     const root = agentId("exact-budget-root");
     writeSnapshot(snapshot(root, [
       observationRow("A1", "exact-budget-leaf", CompletionState.Completed),
@@ -372,7 +391,7 @@ describe("RecursiveAgentIndex", () => {
     index.refresh();
 
     expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1"]);
-    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: false });
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: true });
   });
 
   test("clamps an oversized dependency budget to MAX_WIDGET_ROWS across admission and retention", () => {
@@ -381,11 +400,16 @@ describe("RecursiveAgentIndex", () => {
     const reads: AgentId[] = [];
     const reader: typeof readKnownChildSnapshots = (_root, ids) => {
       reads.push(...ids);
+      const directOwners = new Set(owners);
       return {
-        snapshots: new Map(ids.map((owner) => [owner, snapshot(owner, [
-          observationRow("A1", `${owner}-leaf`, CompletionState.Completed, phase === 1 ? "old" : "new"),
-        ], { incarnation: incarnationId("bounded-inc"), revision: phase === 1 ? 5 : 4 })])),
-        skipped: new Map(),
+        snapshots: new Map(ids.flatMap((owner) => directOwners.has(owner)
+          ? [[owner, snapshot(owner, [
+            observationRow("A1", `${owner}-leaf`, CompletionState.Completed, phase === 1 ? "old" : "new"),
+          ], { incarnation: incarnationId("bounded-inc"), revision: phase === 1 ? 5 : 4 })] as const]
+          : [])),
+        skipped: new Map(ids.flatMap((owner) => directOwners.has(owner)
+          ? []
+          : [[owner, "missing-directory"]] as const)),
       };
     };
     const { index, port, watcher } = fixture(
@@ -439,12 +463,12 @@ describe("RecursiveAgentIndex", () => {
     });
   });
 
-  test.each(["missing", "malformed", "unreadable", "oversized", "session-id-mismatch"] as const)(
+  test.each(["missing-directory", "malformed", "unreadable", "oversized", "session-id-mismatch"] as const)(
     "keeps an active parent without inventing descendants for an unusable %s slot",
     (failure) => {
       const root = agentId(`root-${failure}`);
       const path = observationSnapshotPath(agentDir, root);
-      if (failure !== "missing") mkdirSync(observationSlotDirectory(agentDir, root), { recursive: true });
+      if (failure !== "missing-directory") mkdirSync(observationSlotDirectory(agentDir, root), { recursive: true });
       if (failure === "malformed") writeFileSync(path, "{");
       if (failure === "unreadable") {
         writeFileSync(path, "{}");
@@ -472,23 +496,44 @@ describe("RecursiveAgentIndex", () => {
     CompletionState.Completed,
     CompletionState.Failed,
     CompletionState.Cancelled,
-  ] as const)("does not descend, read, watch or degrade terminal state %s", (state) => {
+  ] as const)("reconstructs valid terminal state %s slots", (state) => {
     const terminal = agentId(`terminal-${state}`);
-    writeSnapshot(snapshot(terminal, [observationRow("A1", "forbidden")]));
+    const terminalChild = agentId(`terminal-${state}-child`);
+    writeSnapshot(snapshot(terminal, [observationRow("A1", terminalChild, CompletionState.Completed)]));
     const reads: AgentId[] = [];
     const reader: typeof readKnownChildSnapshots = (root, ids) => {
       reads.push(...ids);
       return readKnownChildSnapshots(root, ids);
     };
     const { index, watcher } = fixture(direct([projection(terminal, "A1", state)]), {
+      maxRows: 3,
       readKnownChildSnapshots: reader,
     });
     index.refresh();
 
-    expect(ordinals(index.snapshot().rows)).toEqual(["A1"]);
-    expect(index.snapshot().degraded).toBe(false);
-    expect(reads).toEqual([]);
-    expect(watcher.calls.at(-1)).toEqual([]);
+    expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.1"]);
+    expect(index.snapshot()).toMatchObject({ total: agentCount(2), omitted: agentCount(0), degraded: false });
+    expect(reads).toEqual([terminal, terminalChild]);
+    expect(watcher.calls.at(-1)).toEqual([terminal]);
+  });
+
+  test("reconstructs a completed three-level tree after fresh index creation", () => {
+    const parent = agentId("completed-parent");
+    const child = agentId("completed-child");
+    writeSnapshot(snapshot(parent, [observationRow("A2", child, CompletionState.Completed)]));
+    writeSnapshot(snapshot(child, [observationRow("A3", "completed-grandchild", CompletionState.Completed)]));
+    const directProjection = direct([projection(parent, "A1", CompletionState.Completed)]);
+
+    const first = fixture(directProjection);
+    first.index.refresh();
+    const second = fixture(directProjection);
+    second.index.refresh();
+
+    for (const index of [first.index, second.index]) {
+      expect(ordinals(index.snapshot().rows)).toEqual(["A1", "A1.2", "A1.2.3"]);
+      expect(index.snapshot().rows.map((row) => Number(row.depth))).toEqual([0, 1, 2]);
+      expect(index.snapshot()).toMatchObject({ total: agentCount(3), omitted: agentCount(0), degraded: false });
+    }
   });
 
   test.each([
@@ -511,7 +556,7 @@ describe("RecursiveAgentIndex", () => {
     });
     index.refresh();
 
-    expect(reads).toEqual(active ? [child] : []);
+    expect(reads).toEqual([child]);
     expect(watcher.calls.at(-1)).toEqual(active ? [child] : []);
     expect(index.snapshot().degraded).toBe(active);
   });
@@ -527,7 +572,12 @@ describe("RecursiveAgentIndex", () => {
       })]]),
       skipped: new Map(),
     };
-    const reader: typeof readKnownChildSnapshots = () => outcome;
+    const reader: typeof readKnownChildSnapshots = (_root, ids) => ids.includes(owner)
+      ? outcome
+      : {
+        snapshots: new Map(),
+        skipped: new Map(ids.map((id) => [id, "missing-directory"] as const)),
+      };
     const { index, port } = fixture(direct([projection(owner, "A1")]), { readKnownChildSnapshots: reader });
 
     index.refresh();
