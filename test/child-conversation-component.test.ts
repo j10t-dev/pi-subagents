@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { initTheme, Theme, type KeybindingsManager as AppKeybindingsManager, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { initTheme, Theme, ToolExecutionComponent, type KeybindingsManager as AppKeybindingsManager, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, TUI, TUI_KEYBINDINGS, visibleWidth, type Terminal } from "@earendil-works/pi-tui";
 
 import type { AgentDisplayState, ConversationAssistantBlock, ConversationSnapshot, ConversationTurn } from "../src/agent-observation.ts";
@@ -9,7 +9,7 @@ import {
   toggleConversationThinking,
   toggleConversationTools,
 } from "../src/agent-widget/conversation-model.ts";
-import { createPiConversationAdapter } from "../src/agent-widget/conversation-native-adapter.ts";
+import { createPiConversationAdapter, type PiConversationAdapterFactories } from "../src/agent-widget/conversation-native-adapter.ts";
 import { renderChildConversation } from "../src/agent-widget/conversation-render.ts";
 import {
   AgentState, agentOrdinal, conversationCallKey, conversationRevision, conversationTurnKey,
@@ -146,7 +146,7 @@ function expectOffset(frame: string, expected: number): void {
   expect(frame).toContain(`paused · ${expected} lines from tail`);
 }
 
-function harness(rows = 12) {
+function harness(rows = 12, adapterFactories?: Partial<PiConversationAdapterFactories>) {
   const terminal = new MutableTerminal(rows);
   const tui = new TUI(terminal);
   let renders = 0;
@@ -155,7 +155,10 @@ function harness(rows = 12) {
   const reports: unknown[] = [];
   const component = new ChildConversationComponent(
     tui, theme, keybindings(), createChildConversationModel(conversation()),
-    { close: () => { closes += 1 }, report: (error) => { reports.push(error) } },
+    {
+      close: () => { closes += 1 }, report: (error) => { reports.push(error) },
+      ...(adapterFactories === undefined ? {} : { adapterFactories }),
+    },
   );
   return { component, terminal, renders: () => renders, closes: () => closes, reports };
 }
@@ -308,6 +311,25 @@ describe("ChildConversationComponent", () => {
     const fallback = component.render(13);
     expect(fallback).toHaveLength(7);
     expect(fallback.every((line) => line === " ".repeat(13))).toBe(true);
+  });
+
+  test("an item-level native updater failure does not poison subsequent component renders", () => {
+    const h = harness(50, {
+      createToolExecution: (...args) => {
+        const component = new ToolExecutionComponent(...args);
+        component.setExpanded = () => { throw new Error("tool toggle fault"); };
+        return component;
+      },
+    });
+
+    h.component.handleInput("g");
+    for (const action of [() => undefined, () => h.component.handleInput("o")]) {
+      action();
+      const frame = Bun.stripANSI(h.component.render(80).join("\n"));
+      expect(frame).toContain("Item unavailable");
+      expect(frame).toContain("private thought");
+    }
+    expect(h.reports).toEqual([]);
   });
 
   test("render, input, invalidate and dispose failures are contained behind an opaque fallback", () => {

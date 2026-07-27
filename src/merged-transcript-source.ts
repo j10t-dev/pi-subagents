@@ -305,6 +305,7 @@ function unionSensitive(durable: TranscriptSnapshot, observed: TranscriptSnapsho
   return Object.freeze({
     nativeIds: Object.freeze(new Set<string>([...durable.sensitiveValues.nativeIds, ...(observed?.sensitiveValues.nativeIds ?? [])])) as ReadonlySet<string>,
     managedPathsAndNames: Object.freeze(new Set<string>([...durable.sensitiveValues.managedPathsAndNames, ...(observed?.sensitiveValues.managedPathsAndNames ?? [])])) as ReadonlySet<string>,
+    overflowed: durable.sensitiveValues.overflowed || observed?.sensitiveValues.overflowed === true,
   });
 }
 
@@ -312,6 +313,7 @@ function sameSnapshot(left: TranscriptSnapshot, right: TranscriptSnapshot): bool
   return left.availability === right.availability
     && left.truncatedBefore === right.truncatedBefore
     && left.renderingCwd === right.renderingCwd
+    && left.sensitiveValues.overflowed === right.sensitiveValues.overflowed
     && sameSet(left.sensitiveValues.nativeIds, right.sensitiveValues.nativeIds)
     && sameSet(left.sensitiveValues.managedPathsAndNames, right.sensitiveValues.managedPathsAndNames)
     && sameItems(left.items, right.items);

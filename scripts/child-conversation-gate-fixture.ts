@@ -46,12 +46,13 @@ export const CHILD_GATE_NATIVE_USER_TEXT = "CHILD_GATE_NATIVE_USER";
 export const CHILD_GATE_NATIVE_ASSISTANT_TEXT = "CHILD_GATE_NATIVE_ASSISTANT";
 export const CHILD_GATE_BUILTIN_SUMMARY = "CHILD_GATE_BUILTIN_RESULT";
 export const CHILD_GATE_TOOL_PREVIEW = "CHILD_GATE_TOOL_PREVIEW";
-export const CHILD_GATE_OVERRIDE_SECRET = "CHILD_GATE_OVERSIZED_ARGUMENT_MUST_NOT_RENDER";
+export const CHILD_GATE_SENSITIVE_VALUE = "CHILD_GATE_SENSITIVE_ARGUMENT_MUST_NOT_RENDER";
 
 const taskContext: TaskLabelContext = {
   knownAgentIds: new Set(),
   knownRunIds: new Set(),
   knownInternalPaths: new Set(),
+  sensitiveHistoryOverflowed: false,
 };
 const model = deriveModelLabel(modelSpec("fixture/fixture"), "high");
 const context = contextLabel({ kind: "unavailable" });
@@ -112,7 +113,9 @@ function selected(row: AgentRow): SelectedTranscriptSnapshot {
           kind: "tool",
           presentation: {
             tool: toolDisplayName("read"), phase: "completed",
-            arguments: oversizedFixtureJson({ path: CHILD_GATE_OVERRIDE_SECRET.repeat(300) }),
+            // Authorised gate deviation: prove renderer override with admitted sensitive JSON;
+            // focused source-boundary tests retain the separate oversized-admission proof.
+            arguments: boundedFixtureJson({ path: CHILD_GATE_SENSITIVE_VALUE }),
             result: { content: [transcriptText(CHILD_GATE_TOOL_PREVIEW)], isError: false },
           },
         },
@@ -130,7 +133,7 @@ function selected(row: AgentRow): SelectedTranscriptSnapshot {
     revision: selectedTranscriptRevision(1),
     transcript: Object.freeze({
       revision: transcriptRevision(1), items: Object.freeze(items), truncatedBefore: false, availability: "live",
-      sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set([CHILD_GATE_OVERRIDE_SECRET]) },
+      sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set([CHILD_GATE_SENSITIVE_VALUE]), overflowed: false },
       renderingCwd: absolutePath(fixtureCwd),
     }),
     row, routeAvailable: true,
@@ -146,11 +149,6 @@ function boundedFixtureJson(value: unknown): BoundedTranscriptJson {
   const admitted = admitBoundedTranscriptJson(value);
   if (admitted === undefined) throw new Error("fixture tool JSON was unexpectedly rejected");
   return admitted;
-}
-
-/** Deliberately violates the source boundary to prove the presentation projector fails closed. */
-function oversizedFixtureJson(value: unknown): BoundedTranscriptJson {
-  return value as unknown as BoundedTranscriptJson;
 }
 
 const source: AgentWidgetSource & { dispose(): void } = {

@@ -21,6 +21,7 @@ import {
   type ModelSpec,
   type RunId,
   type RunAttemptId,
+  type RpcToolCallId,
   type SessionPath,
   type ThinkingLevel,
   type TranscriptRevision,
@@ -148,6 +149,17 @@ interface RetainedTranscript {
   disposed: boolean;
 }
 
+type SensitiveHistoryEntry =
+  | { readonly kind: "agent"; readonly value: AgentId; readonly bytes: number }
+  | { readonly kind: "run"; readonly value: RunId; readonly bytes: number }
+  | { readonly kind: "tool"; readonly value: RpcToolCallId; readonly bytes: number }
+  | { readonly kind: "path"; readonly value: AbsolutePath; readonly bytes: number };
+type SensitiveHistoryValue =
+  | { readonly kind: "agent"; readonly value: AgentId }
+  | { readonly kind: "run"; readonly value: RunId }
+  | { readonly kind: "tool"; readonly value: RpcToolCallId }
+  | { readonly kind: "path"; readonly value: AbsolutePath };
+
 interface PendingObservationAttempt {
   readonly agentId: AgentId;
   readonly attemptId: RunAttemptId;
@@ -168,7 +180,11 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
   private readonly listeners = new Set<ObservationListener>();
   private readonly knownAgentIds = new Set<AgentId>();
   private readonly knownRunIds = new Set<RunId>();
+  private readonly knownToolCallIds = new Set<RpcToolCallId>();
   private readonly knownInternalPaths = new Set<AbsolutePath>();
+  private readonly sensitiveHistory = new Map<string, SensitiveHistoryEntry>();
+  private sensitiveHistoryBytes = 0;
+  private sensitiveHistoryOverflowed = false;
   private readonly reconciliationSupplier: (() => ObservationReconciliationSnapshot) | undefined;
   private readonly diagnostic: (message: string) => void;
   private revision = agentObservationRevision(0);
@@ -432,13 +448,16 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
     const changed: AgentOrdinal[] = [];
     const changedTranscripts = new Set<RetainedTranscript>(sensitiveChanged ? this.transcripts.values() : []);
     const authoritativeIds = new Set(snapshot.spawnSequence);
+    let agentRemoved = false;
     for (const [id, agent] of this.agents) {
       if (authoritativeIds.has(id)) continue;
       this.agents.delete(id);
       this.disposeTranscript(this.transcripts.get(id));
       this.transcripts.delete(id);
       changed.push(agent.ordinal);
+      agentRemoved = true;
     }
+    if (agentRemoved) for (const source of this.transcripts.values()) changedTranscripts.add(source);
     for (let index = 0; index < snapshot.spawnSequence.length; index++) {
       const id = snapshot.spawnSequence[index]!;
       const authority = authorities.get(id);
@@ -649,8 +668,13 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
       truncatedBefore: source.truncatedBefore,
       availability: source.availability,
       sensitiveValues: Object.freeze({
-        nativeIds: Object.freeze(new Set<string>([...this.knownAgentIds, ...this.knownRunIds].map(String))) as ReadonlySet<string>,
+        nativeIds: Object.freeze(new Set<string>([
+          ...[...this.knownAgentIds].map(String),
+          ...[...this.knownRunIds].map(String),
+          ...[...this.knownToolCallIds].map(String),
+        ])) as ReadonlySet<string>,
         managedPathsAndNames: Object.freeze(managed) as ReadonlySet<string>,
+        overflowed: this.sensitiveHistoryOverflowed,
       }),
       ...(agent === undefined ? {} : { renderingCwd: agent.cwd }),
     });
@@ -758,6 +782,9 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
         break;
       }
       case "tool": {
+        if (this.addSensitiveHistoryValue({ kind: "tool", value: event.toolCallId })) {
+          for (const transcript of this.transcripts.values()) affected.add(transcript);
+        }
         if (source.assistantEntry === undefined) {
           source.generation++;
           source.blockIndex.clear();
@@ -1072,17 +1099,60 @@ export class AgentObservationStore implements SubagentObservationPort, AgentObse
 
   private addSensitiveValues(values: ObservationSensitiveValues, publishTranscriptMetadata = true): boolean {
     let changed = false;
-    for (const id of values.agentIds) if (!this.knownAgentIds.has(id)) { this.knownAgentIds.add(id); changed = true; }
-    for (const id of values.runIds) if (!this.knownRunIds.has(id)) { this.knownRunIds.add(id); changed = true; }
-    for (const path of values.internalPaths) if (!this.knownInternalPaths.has(path)) { this.knownInternalPaths.add(path); changed = true; }
+    for (const id of values.agentIds) changed = this.addSensitiveHistoryValue({ kind: "agent", value: id }) || changed;
+    for (const id of values.runIds) changed = this.addSensitiveHistoryValue({ kind: "run", value: id }) || changed;
+    for (const path of values.internalPaths) changed = this.addSensitiveHistoryValue({ kind: "path", value: path }) || changed;
     if (changed && publishTranscriptMetadata) this.commitTranscripts(new Set(this.transcripts.values()));
     return changed;
+  }
+
+  private addSensitiveHistoryValue(candidate: SensitiveHistoryValue): boolean {
+    const key = `${candidate.kind}\u0000${candidate.value}`;
+    if (this.sensitiveHistory.has(key)) return false;
+    const bytes = transcriptEncoder.encode(candidate.value).byteLength;
+    const entry: SensitiveHistoryEntry = { ...candidate, bytes };
+    this.sensitiveHistory.set(key, entry);
+    this.sensitiveHistoryBytes += bytes;
+    this.addSensitiveHistorySetValue(entry);
+    let changed = true;
+    while (this.sensitiveHistory.size > this.transcriptBudgets.globalItems
+      || this.sensitiveHistoryBytes > this.transcriptBudgets.globalBytes) {
+      const oldest = this.sensitiveHistory.entries().next().value as [string, SensitiveHistoryEntry] | undefined;
+      if (oldest === undefined) break;
+      this.sensitiveHistory.delete(oldest[0]);
+      this.sensitiveHistoryBytes -= oldest[1].bytes;
+      this.deleteSensitiveHistorySetValue(oldest[1]);
+      if (!this.sensitiveHistoryOverflowed) this.sensitiveHistoryOverflowed = true;
+      changed = true;
+    }
+    return changed;
+  }
+
+  private addSensitiveHistorySetValue(entry: SensitiveHistoryEntry): void {
+    if (entry.kind === "agent") this.knownAgentIds.add(entry.value);
+    else if (entry.kind === "run") this.knownRunIds.add(entry.value);
+    else if (entry.kind === "tool") this.knownToolCallIds.add(entry.value);
+    else this.knownInternalPaths.add(entry.value);
+  }
+
+  private deleteSensitiveHistorySetValue(entry: SensitiveHistoryEntry): void {
+    if (entry.kind === "agent") this.knownAgentIds.delete(entry.value);
+    else if (entry.kind === "run") this.knownRunIds.delete(entry.value);
+    else if (entry.kind === "tool") this.knownToolCallIds.delete(entry.value);
+    else this.knownInternalPaths.delete(entry.value);
   }
 
   private registerSensitiveValuesWithoutCommit(values: ObservationSensitiveValues): boolean {
     return this.addSensitiveValues(values, false);
   }
-  private labelContext() { return { knownAgentIds: this.knownAgentIds, knownRunIds: this.knownRunIds, knownInternalPaths: this.knownInternalPaths }; }
+  private labelContext() {
+    return {
+      knownAgentIds: this.knownAgentIds,
+      knownRunIds: this.knownRunIds,
+      knownInternalPaths: this.knownInternalPaths,
+      sensitiveHistoryOverflowed: this.sensitiveHistoryOverflowed,
+    };
+  }
   private nextRevision(): AgentObservationRevision { return agentObservationRevision(Number(this.revision) + 1); }
 
   private commit(ordinals: readonly AgentOrdinal[], forceRescan: boolean): void {
@@ -1276,13 +1346,16 @@ function transcriptItemBytes(item: TranscriptItem): number {
     const previewBytes = block.presentation.preview === undefined
       ? 0
       : transcriptEncoder.encode(block.presentation.preview).byteLength;
+    const callIdBytes = block.presentation.callId === undefined
+      ? 0
+      : transcriptEncoder.encode(block.presentation.callId).byteLength;
     const argumentBytes = transcriptJsonBytes(block.presentation.arguments);
     const resultBytes = block.presentation.result?.content.reduce(
       (bytes, text) => bytes + transcriptEncoder.encode(text).byteLength,
       0,
     ) ?? 0;
     const detailBytes = transcriptJsonBytes(block.presentation.result?.details);
-    return total + previewBytes + argumentBytes + resultBytes + detailBytes;
+    return total + callIdBytes + previewBytes + argumentBytes + resultBytes + detailBytes;
   }, 0);
 }
 function transcriptJsonBytes(value: import("./domain.ts").BoundedTranscriptJson | undefined): number {

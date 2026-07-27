@@ -19,6 +19,8 @@ import {
   MAX_SESSION_RECOVERY_BYTES,
   MAX_TRANSCRIPT_SOURCE_BYTES,
   MAX_TRANSCRIPT_SOURCE_ITEMS,
+  MAX_TRANSCRIPT_STORE_BYTES,
+  MAX_TRANSCRIPT_STORE_ITEMS,
   MAX_TOOL_JSON_STRING_BYTES,
   TRANSCRIPT_FALLBACK_INTERVAL_MS,
   TRANSCRIPT_REFRESH_WINDOW_MS,
@@ -681,6 +683,9 @@ describe("createSessionTranscriptSource", () => {
     expect(tool.presentation.result?.content).toEqual(["line one" as TranscriptText]);
     expect(tool.presentation.result?.details).toEqual(admitBoundedTranscriptJson({ lines: 1 }));
     expect(tool.presentation.result?.isError).toBe(false);
+    expect([...started.source.snapshot().sensitiveValues.nativeIds]).toEqual(expect.arrayContaining([
+      OWNER, CHILD, "aaaaaaaa", "bbbbbbbb", "cccccccc", "call-1",
+    ]));
     started.dispose();
   });
 
@@ -747,6 +752,28 @@ describe("createSessionTranscriptSource", () => {
     started.dispose();
   });
 
+  test("authoritative sensitive history is bounded and marks overflow", async () => {
+    const batch = (batchIndex: number): string => jsonl(header(), ...Array.from({ length: MAX_TRANSCRIPT_SOURCE_ITEMS }, (_, index) => {
+      const value = batchIndex * MAX_TRANSCRIPT_SOURCE_ITEMS + index;
+      const id = value.toString(16).padStart(8, "0");
+      const parentId = index === 0 ? null : (value - 1).toString(16).padStart(8, "0");
+      return JSON.stringify({ type: "future_entry", id, parentId });
+    }));
+    const started = startedOver(batch(0));
+    await started.filesystem.settleReads();
+    for (let index = 1; index <= Math.ceil(MAX_TRANSCRIPT_STORE_ITEMS / MAX_TRANSCRIPT_SOURCE_ITEMS); index += 1) {
+      started.filesystem.replace(batch(index));
+      await started.refresh();
+    }
+
+    const sensitive = started.source.snapshot().sensitiveValues;
+    const values = new Set([...sensitive.nativeIds, ...sensitive.managedPathsAndNames]);
+    expect(sensitive.overflowed).toBeTrue();
+    expect(values.size).toBeLessThanOrEqual(MAX_TRANSCRIPT_STORE_ITEMS);
+    expect([...values].reduce((bytes, value) => bytes + Buffer.byteLength(value), 0)).toBeLessThanOrEqual(Number(MAX_TRANSCRIPT_STORE_BYTES));
+    started.dispose();
+  });
+
   test("a header without a usable working directory publishes none", async () => {
     const started = startedOver(jsonl(header(CHILD, 2, "relative/dir"), messageEntry("aaaaaaaa", null, userMessage("Hello"))));
     await started.filesystem.settleReads();
@@ -797,6 +824,16 @@ describe("createSessionTranscriptSource", () => {
     expect(Number(after.revision)).toBeGreaterThan(Number(before.revision));
     expect(after.sensitiveValues.nativeIds.has("bbbbbbbb")).toBe(true);
     expect(notifications).toBe(1);
+
+    started.filesystem.replace(jsonl(
+      header(),
+      JSON.stringify({ type: "future_entry", id: "cccccccc", parentId: null }),
+    ));
+    await started.refresh();
+    const rebuilt = started.source.snapshot().sensitiveValues;
+    expect(rebuilt.nativeIds.has("aaaaaaaa")).toBeTrue();
+    expect(rebuilt.nativeIds.has("bbbbbbbb")).toBeTrue();
+    expect(rebuilt.nativeIds.has("cccccccc")).toBeTrue();
     started.dispose();
   });
 

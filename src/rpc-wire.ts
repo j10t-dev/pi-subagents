@@ -292,7 +292,7 @@ export function classifyInboundRecord(value: unknown): RpcWireResult {
       const event = decode(ToolObservationEventSchema, value);
       if (event === undefined) return { ok: false, reason: `malformed ${type} record` };
       try {
-        const argumentsValue = event.type === "tool_execution_start" && event.args !== undefined
+        const argumentsValue = event.type !== "tool_execution_end" && event.args !== undefined
           ? admitBoundedTranscriptJson(event.args)
           : undefined;
         const result = event.type === "tool_execution_end"

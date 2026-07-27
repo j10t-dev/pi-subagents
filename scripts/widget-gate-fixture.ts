@@ -30,6 +30,7 @@ const taskLabelContext: TaskLabelContext = {
   knownAgentIds: new Set(),
   knownRunIds: new Set(),
   knownInternalPaths: new Set(),
+  sensitiveHistoryOverflowed: false,
 };
 
 const rows: readonly AgentRow[] = [

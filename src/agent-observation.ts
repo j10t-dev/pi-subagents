@@ -131,6 +131,8 @@ export interface AgentWidgetSource { snapshot(): AgentWidgetSnapshot; transcript
 export interface TranscriptSensitiveValues {
   readonly nativeIds: ReadonlySet<string>;
   readonly managedPathsAndNames: ReadonlySet<string>;
+  /** Sticky fail-closed state: bounded history discarded at least one sensitive value. */
+  readonly overflowed: boolean;
 }
 export interface TranscriptToolResult {
   readonly content: readonly TranscriptText[];
@@ -281,6 +283,8 @@ export interface TaskLabelContext {
   readonly knownAgentIds: ReadonlySet<AgentId>;
   readonly knownRunIds: ReadonlySet<RunId>;
   readonly knownInternalPaths: ReadonlySet<AbsolutePath>;
+  /** Sticky fail-closed state: bounded sensitive history discarded at least one value. */
+  readonly sensitiveHistoryOverflowed: boolean;
 }
 
 const CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/gu;
@@ -289,6 +293,7 @@ const PATH_TOKEN_PATTERN = /(?:[A-Za-z]:[\\/]|(?:\.{0,2}|~)?[\\/])\S+|\b\S*[\\/]
 const encoder = new TextEncoder();
 
 export function deriveTaskLabel(assignment: string, context: TaskLabelContext): TaskLabel {
+  if (context.sensitiveHistoryOverflowed) return "Delegated task" as TaskLabel;
   const line = assignment.replaceAll("\r\n", "\n").split("\n")
     .find((value) => value.trim().length > 0 && !isStandaloneFence(value))?.trim() ?? "";
   const sentence = /^(.+?[.!?])(?:\s|$)/u.exec(line)?.[1] ?? line;

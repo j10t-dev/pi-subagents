@@ -34,7 +34,7 @@ void validatedBrandContracts;
 
 
 function row(id: string, ordinal: string, state: AgentRow["state"], task = "task"): [ReturnType<typeof agentId>, AgentRow] {
-  return [agentId(id), Object.freeze({ ordinal: agentOrdinal(ordinal), depth: agentDepth(0), model: "luna:h" as AgentRow["model"], context: contextLabel({ kind: "unavailable" }), taskLabel: deriveTaskLabel(task, { knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set() }), state })];
+  return [agentId(id), Object.freeze({ ordinal: agentOrdinal(ordinal), depth: agentDepth(0), model: "luna:h" as AgentRow["model"], context: contextLabel({ kind: "unavailable" }), taskLabel: deriveTaskLabel(task, { knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(), sensitiveHistoryOverflowed: false }), state })];
 }
 function resolver(entries: Array<[ReturnType<typeof agentId>, AgentRow]>): AgentDisplayResolver {
   const rows = new Map(entries);

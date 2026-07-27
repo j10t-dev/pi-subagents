@@ -32,20 +32,30 @@ import { admitBoundedTranscriptJson } from "../src/schemas.ts";
 
 function text(value: string): TranscriptText { return value as TranscriptText }
 function tool(value: string): ToolDisplayName { return value as ToolDisplayName }
-function json(value: Record<string, string>) {
+function json(value: unknown) {
   const admitted = admitBoundedTranscriptJson(value);
   if (admitted === undefined) throw new Error("test fixture JSON rejected");
   return admitted;
 }
 function textBlock(value: string): TranscriptAssistantBlock { return { kind: "text", phase: "final", text: text(value) } }
 function thinkingBlock(value: string): TranscriptAssistantBlock { return { kind: "thinking", phase: "final", text: text(value) } }
-function toolBlock(name: string, argumentsValue?: Record<string, string>, preview?: string): TranscriptAssistantBlock {
+function toolBlock(
+  name: string,
+  argumentsValue?: unknown,
+  preview?: string,
+  result?: { readonly content: readonly string[]; readonly details?: unknown; readonly isError?: boolean },
+): TranscriptAssistantBlock {
   return {
     kind: "tool",
     presentation: {
       tool: tool(name), phase: "completed",
       ...(argumentsValue === undefined ? {} : { arguments: json(argumentsValue) }),
       ...(preview === undefined ? {} : { preview: text(preview) }),
+      ...(result === undefined ? {} : { result: {
+        content: result.content.map(text),
+        ...(result.details === undefined ? {} : { details: json(result.details) }),
+        isError: result.isError ?? false,
+      } }),
     },
   };
 }
@@ -70,7 +80,7 @@ function selectedWith(
   items: readonly TranscriptItem[],
   options: {
     readonly renderingCwd?: string;
-    readonly sensitiveValues?: { readonly nativeIds: ReadonlySet<string>; readonly managedPathsAndNames: ReadonlySet<string> };
+    readonly sensitiveValues?: { readonly nativeIds: ReadonlySet<string>; readonly managedPathsAndNames: ReadonlySet<string>; readonly overflowed: boolean };
   } = {},
 ): SelectedTranscriptSnapshot {
   const row: AgentRow = {
@@ -82,7 +92,7 @@ function selectedWith(
     revision: selectedTranscriptRevision(73),
     transcript: {
       revision: transcriptRevision(61), items, truncatedBefore: false, availability: "live",
-      sensitiveValues: options.sensitiveValues ?? { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() },
+      sensitiveValues: options.sensitiveValues ?? { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>(), overflowed: false },
       ...(options.renderingCwd === undefined ? {} : { renderingCwd: options.renderingCwd as AbsolutePath }),
     },
     row, routeAvailable: true,
@@ -94,6 +104,19 @@ function toolOf(projected: ReturnType<typeof projectConversationSnapshot>): Conv
   const block = turn.blocks[0];
   if (block === undefined || block.kind !== "tool") throw new Error("test fixture has no tool block");
   return block.presentation;
+}
+
+function validArguments(name: string): unknown {
+  switch (name) {
+    case "read": return { path: "/home/child/a.ts" };
+    case "bash": return { command: "printf ok" };
+    case "edit": return { path: "/home/child/a.ts", edits: [{ oldText: "a", newText: "b" }] };
+    case "write": return { path: "/home/child/a.ts", content: "text" };
+    case "grep": return { pattern: "todo" };
+    case "find": return { pattern: "*.ts" };
+    case "ls": return {};
+    default: throw new Error("unknown built-in fixture");
+  }
 }
 
 describe("projectConversationSnapshot", () => {
@@ -125,15 +148,70 @@ describe("projectConversationSnapshot", () => {
   });
 
   test.each([
-    ["read", "native-built-in"], ["bash", "native-built-in"], ["edit", "native-built-in"],
-    ["write", "native-built-in"], ["grep", "native-built-in"], ["find", "native-built-in"],
-    ["ls", "native-built-in"], ["spawn_agent", "native-generic"], ["mcp__server__thing", "native-generic"],
-  ] as const)("%s selects %s rendering when its data validates", (name, rendering) => {
+    ["read", { path: "/home/child/a.ts" }, undefined],
+    ["bash", { command: "printf ok" }, { fullOutputPath: "/home/child/bash.log" }],
+    ["edit", { path: "/home/child/a.ts", edits: [{ oldText: "a", newText: "b" }] }, { diff: "-a +b", patch: "patch" }],
+    ["write", { path: "/home/child/a.ts", content: "text" }, undefined],
+    ["grep", { pattern: "todo" }, { matchLimitReached: 4, linesTruncated: false }],
+    ["find", { pattern: "*.ts" }, { resultLimitReached: 4 }],
+    ["ls", {}, { entryLimitReached: 4 }],
+  ] as const)("%s selects native built-in rendering for compatible public presentation data", (name, argumentsValue, details) => {
     const projected = projectConversationSnapshot(selectedWith([
-      assistantItem(0, undefined, 0, "final", undefined, [toolBlock(name, { file: "/home/child/a.ts" }, "ok")]),
+      assistantItem(0, undefined, 0, "final", undefined, [toolBlock(name, argumentsValue, "ok", {
+        content: ["ok"], ...(details === undefined ? {} : { details }),
+      })]),
     ], { renderingCwd: "/home/child" }));
-    expect(toolOf(projected).rendering).toBe(rendering as ConversationToolRendering);
+    expect(toolOf(projected).rendering).toBe("native-built-in" as ConversationToolRendering);
   });
+
+  test.each(["spawn_agent", "mcp__server__thing"])("%s selects native generic rendering", (name) => {
+    const projected = projectConversationSnapshot(selectedWith([
+      assistantItem(0, undefined, 0, "final", undefined, [toolBlock(name, { value: "safe" }, "ok")]),
+    ], { renderingCwd: "/home/child" }));
+    expect(toolOf(projected).rendering).toBe("native-generic");
+  });
+
+  test.each([
+    ["read", { offset: 1 }],
+    ["bash", { timeout: 1 }],
+    ["edit", { path: "/home/child/a.ts", edits: [{ oldText: "a" }] }],
+    ["write", { path: "/home/child/a.ts" }],
+    ["grep", { path: "/home/child" }],
+    ["find", { limit: 4 }],
+    ["ls", { limit: "many" }],
+  ] as const)("%s selects renderer override for incompatible arguments", (name, argumentsValue) => {
+    const projected = projectConversationSnapshot(selectedWith([
+      assistantItem(0, undefined, 0, "final", undefined, [toolBlock(name, argumentsValue, "ok", { content: ["ok"] })]),
+    ], { renderingCwd: "/home/child" }));
+    expect(toolOf(projected).rendering).toBe("renderer-override");
+  });
+
+  test.each([
+    ["read", { truncation: { truncated: "yes" } }],
+    ["bash", { fullOutputPath: 3 }],
+    ["edit", { diff: "only" }],
+    ["write", { unexpected: true }],
+    ["grep", { linesTruncated: "yes" }],
+    ["find", { resultLimitReached: "many" }],
+    ["ls", { entryLimitReached: "many" }],
+  ] as const)("%s selects renderer override for incompatible admitted details", (name, details) => {
+    const projected = projectConversationSnapshot(selectedWith([
+      assistantItem(0, undefined, 0, "final", undefined, [toolBlock(name, validArguments(name), "ok", { content: ["ok"], details })]),
+    ], { renderingCwd: "/home/child" }));
+    expect(toolOf(projected).rendering).toBe("renderer-override");
+  });
+
+  test.each(["read", "bash", "edit", "write", "grep", "find", "ls"])(
+    "%s selects renderer override when a completed result is missing or empty",
+    (name) => {
+      for (const result of [undefined, { content: [] as string[] }]) {
+        const projected = projectConversationSnapshot(selectedWith([
+          assistantItem(0, undefined, 0, "final", undefined, [toolBlock(name, validArguments(name), "ok", result)]),
+        ], { renderingCwd: "/home/child" }));
+        expect(toolOf(projected).rendering).toBe("renderer-override");
+      }
+    },
+  );
 
   test.each([
     ["no working directory", {}, { file: "/home/child/a.ts" }],
@@ -152,7 +230,7 @@ describe("projectConversationSnapshot", () => {
       ]),
     ], {
       renderingCwd: "/home/child",
-      sensitiveValues: { nativeIds: new Set(["aaaaaaaa"]), managedPathsAndNames: new Set(["child.jsonl"]) },
+      sensitiveValues: { nativeIds: new Set(["aaaaaaaa"]), managedPathsAndNames: new Set(["child.jsonl"]), overflowed: false },
     }));
     const projectedTool = toolOf(projected);
     expect(projectedTool.arguments).toBeUndefined();
@@ -160,10 +238,73 @@ describe("projectConversationSnapshot", () => {
     expect(projectedTool.preview).toBeDefined();
   });
 
+  test("rejected built-in details select renderer override rather than reaching a native renderer", () => {
+    const projected = projectConversationSnapshot(selectedWith([
+      assistantItem(0, undefined, 0, "final", undefined, [toolBlock("read", { path: "/home/child/a.ts" }, "ok", {
+        content: ["ok"], details: { source: "entry-cross-source" },
+      })]),
+    ], {
+      renderingCwd: "/home/child",
+      sensitiveValues: { nativeIds: new Set(["entry-cross-source"]), managedPathsAndNames: new Set(), overflowed: false },
+    }));
+    const presentation = toolOf(projected);
+    expect(presentation.result?.details).toBeUndefined();
+    expect(presentation.rendering).toBe("renderer-override");
+  });
+
+  test.each([
+    ["tool-call ID", "call-cross-source", "nativeIds"],
+    ["agent ID", "agent-cross-source", "nativeIds"],
+    ["run ID", "run-cross-source", "nativeIds"],
+    ["managed path", "/state/pi-subagents/managed", "managedPathsAndNames"],
+  ] as const)("omits whole rich and text values containing a cross-source %s", (_label, sensitiveValue, setName) => {
+    const sensitiveValues = {
+      nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>(), overflowed: false,
+    };
+    sensitiveValues[setName].add(sensitiveValue);
+    const projected = projectConversationSnapshot(selectedWith([
+      assistantItem(0, undefined, 0, "final", undefined, [toolBlock("read", {
+        path: `/home/child/${sensitiveValue}/argument`,
+      }, `preview ${sensitiveValue} suffix`, {
+        content: ["safe result", `result ${sensitiveValue} suffix`],
+        details: { source: `detail ${sensitiveValue} suffix` },
+      })]),
+    ], { renderingCwd: "/home/child", sensitiveValues }));
+    const presentation = toolOf(projected);
+    expect(presentation.arguments).toBeUndefined();
+    expect(presentation.result?.details).toBeUndefined();
+    expect(presentation.result?.content).toEqual([text("safe result")]);
+    expect(presentation.preview).toBeUndefined();
+    expect(JSON.stringify(projected)).not.toContain(sensitiveValue);
+  });
+
+  test("sensitive-history overflow suppresses every rich tool field and downgrades built-ins", () => {
+    const projected = projectConversationSnapshot(selectedWith([
+      assistantItem(0, undefined, 0, "final", undefined, [toolBlock("read", { path: "/home/child/safe.ts" }, "safe preview", {
+        content: ["safe result"], details: { source: "safe detail" },
+      })]),
+      assistantItem(1, undefined, 1, "final", undefined, [toolBlock("extension_tool", { value: "safe" }, "safe generic preview", {
+        content: ["safe generic result"], details: { source: "safe generic detail" },
+      })]),
+    ], {
+      renderingCwd: "/home/child",
+      sensitiveValues: { nativeIds: new Set(), managedPathsAndNames: new Set(), overflowed: true },
+    }));
+
+    for (const turn of projected.turns) {
+      if (turn.kind !== "assistant") continue;
+      const presentation = (turn.blocks[0] as Extract<ConversationAssistantBlock, { readonly kind: "tool" }>).presentation;
+      expect(presentation.arguments).toBeUndefined();
+      expect(presentation.result).toBeUndefined();
+      expect(presentation.preview).toBeUndefined();
+      expect(presentation.rendering).toBe("renderer-override");
+    }
+  });
+
   test("a working directory inside a managed root or naming a sensitive value is refused", () => {
     const refused = projectConversationSnapshot(selectedWith([], {
       renderingCwd: "/state/pi-subagents/aaaaaaaa",
-      sensitiveValues: { nativeIds: new Set(["aaaaaaaa"]), managedPathsAndNames: new Set(["/state/pi-subagents"]) },
+      sensitiveValues: { nativeIds: new Set(["aaaaaaaa"]), managedPathsAndNames: new Set(["/state/pi-subagents"]), overflowed: false },
     }));
     expect(refused.renderingCwd).toBeUndefined();
   });

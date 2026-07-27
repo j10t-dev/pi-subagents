@@ -76,7 +76,7 @@ function selected(revision = 0): SelectedTranscriptSnapshot {
         text: "safe text" as TranscriptText,
       }],
       truncatedBefore: false, availability: "live" as const,
-      sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() },
+      sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>(), overflowed: false },
     }),
     row: Object.freeze({
       ordinal: agentOrdinal("A1"), depth: agentDepth(0), model: "luna:h" as ModelLabel,

@@ -22,7 +22,11 @@ import type {
   ConversationToolPresentation,
   ConversationTurn,
 } from "../src/agent-observation.ts";
-import { createPiConversationAdapter, stripShellIntegration } from "../src/agent-widget/conversation-native-adapter.ts";
+import {
+  createPiConversationAdapter,
+  stripShellIntegration,
+  type PiConversationAdapterFactories,
+} from "../src/agent-widget/conversation-native-adapter.ts";
 import {
   AgentState,
   agentOrdinal,
@@ -366,6 +370,91 @@ describe("native Pi conversation adapter", () => {
       ToolExecutionComponent.prototype.updateResult = original;
     }
   });
+
+  test.each([
+    ["skill parsing", { parseSkillBlock: () => { throw new Error("parse fault"); } }],
+    ["message construction", { createUserMessage: () => { throw new Error("user constructor fault"); } }],
+  ] as const)("%s failure degrades only the affected turn during construction", (_label, factories) => {
+    const turns: readonly ConversationTurn[] = [
+      { key: conversationTurnKey(conversationRevision(1), 0), kind: "notice", code: "context-compacted" },
+      userTurn("poison", 1),
+      { key: conversationTurnKey(conversationRevision(1), 2), kind: "notice", code: "transport-unavailable" },
+    ];
+    const body = Bun.stripANSI(createPiConversationAdapter({
+      tui, theme, factories: factories as Partial<PiConversationAdapterFactories>,
+    }).render(snapshotWith(turns), options).join("\n"));
+    expect(body).toContain("Context compacted");
+    expect(body).toContain("Item unavailable");
+    expect(body).toContain("Transport unavailable");
+  });
+
+  test.each(["tool definition", "tool component", "tool state"] as const)(
+    "%s failure degrades only the affected tool while sibling turns remain",
+    (failure) => {
+      const factories: Partial<PiConversationAdapterFactories> = failure === "tool definition"
+        ? { createPresentationToolDefinition: () => { throw new Error("definition fault"); } }
+        : failure === "tool component"
+          ? { createToolExecution: () => { throw new Error("tool constructor fault"); } }
+          : { createToolExecution: (...args) => {
+            const component = new ToolExecutionComponent(...args);
+            component.setArgsComplete = () => { throw new Error("state fault"); };
+            return component;
+          } };
+      const poison = toolPresentation("read", "renderer-override");
+      const turns: readonly ConversationTurn[] = [
+        { key: conversationTurnKey(conversationRevision(1), 0), kind: "notice", code: "context-compacted" },
+        assistantTurn([{ kind: "tool", presentation: poison }], "toolUse"),
+        { key: conversationTurnKey(conversationRevision(1), 2), kind: "notice", code: "transport-unavailable" },
+      ];
+      const body = Bun.stripANSI(createPiConversationAdapter({ tui, theme, factories }).render(snapshotWith(turns, {
+        renderingCwd: presentationCwd("/home/child"),
+      }), options).join("\n"));
+      expect(body).toContain("Context compacted");
+      expect(body).toContain("Item unavailable");
+      expect(body).toContain("Transport unavailable");
+    },
+  );
+
+  test.each(["assistant", "skill", "tool"] as const)(
+    "%s in-place updater failure replaces only its item and remains contained on subsequent renders",
+    (kind) => {
+      const factories: Partial<PiConversationAdapterFactories> = kind === "assistant"
+        ? { createAssistantMessage: (...args) => {
+          const component = new AssistantMessageComponent(...args);
+          component.setHideThinkingBlock = () => { throw new Error("assistant toggle fault"); };
+          return component;
+        } }
+        : kind === "skill"
+          ? { createSkillInvocation: (...args) => {
+            const component = new SkillInvocationMessageComponent(...args);
+            component.setExpanded = () => { throw new Error("skill toggle fault"); };
+            return component;
+          } }
+          : { createToolExecution: (...args) => {
+            const component = new ToolExecutionComponent(...args);
+            component.setExpanded = () => { throw new Error("tool toggle fault"); };
+            return component;
+          } };
+      const affected = kind === "assistant"
+        ? assistantTurn([textBlock("assistant poison")])
+        : kind === "skill"
+          ? userTurn('<skill name="audit" location="/skills/audit/SKILL.md">\nAudit\n</skill>\n\nCheck')
+          : assistantTurn([{ kind: "tool", presentation: toolPresentation("read", "native-built-in") }], "toolUse");
+      const snapshot = snapshotWith([
+        { key: conversationTurnKey(conversationRevision(1), 0), kind: "notice", code: "context-compacted" },
+        affected,
+        { key: conversationTurnKey(conversationRevision(1), 2), kind: "notice", code: "transport-unavailable" },
+      ], { renderingCwd: presentationCwd("/home/child") });
+      const adapter = createPiConversationAdapter({ tui, theme, factories });
+
+      for (const renderOptions of [options, { ...options, thinkingVisible: false, toolsExpanded: true }]) {
+        const body = Bun.stripANSI(adapter.render(snapshot, renderOptions).join("\n"));
+        expect(body).toContain("Context compacted");
+        expect(body).toContain("Item unavailable");
+        expect(body).toContain("Transport unavailable");
+      }
+    },
+  );
 
   test("one native component render failure degrades only that item", () => {
     const original = UserMessageComponent.prototype.render;

@@ -12,12 +12,18 @@ import {
   type ChildConversationModel,
   type ConversationMovement,
 } from "./conversation-model.ts";
-import { createPiConversationAdapter, type PiConversationAdapter } from "./conversation-native-adapter.ts";
+import {
+  createPiConversationAdapter,
+  type PiConversationAdapter,
+  type PiConversationAdapterFactories,
+} from "./conversation-native-adapter.ts";
 import { renderChildConversation, type ChildConversationRender } from "./conversation-render.ts";
 
 export interface ChildConversationComponentOptions {
   readonly close: () => void;
   readonly report: (error: unknown) => void;
+  /** Native adapter compatibility seam; production uses the package-root constructors. */
+  readonly adapterFactories?: Partial<PiConversationAdapterFactories>;
 }
 
 /** Full-terminal, read-only child-conversation component. */
@@ -36,7 +42,11 @@ export class ChildConversationComponent implements Component {
     private readonly options: ChildConversationComponentOptions,
   ) {
     this.model = model;
-    this.adapter = createPiConversationAdapter({ tui, theme });
+    this.adapter = createPiConversationAdapter({
+      tui,
+      theme,
+      ...(options.adapterFactories === undefined ? {} : { factories: options.adapterFactories }),
+    });
   }
 
   render(width: number): string[] {

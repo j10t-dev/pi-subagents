@@ -21,6 +21,8 @@ import {
   MAX_SESSION_RECOVERY_BYTES,
   MAX_TRANSCRIPT_SOURCE_BYTES,
   MAX_TRANSCRIPT_SOURCE_ITEMS,
+  MAX_TRANSCRIPT_STORE_BYTES,
+  MAX_TRANSCRIPT_STORE_ITEMS,
   MAX_TOOL_RESULT_BLOCKS,
   STATE_DIR_NAME,
   TRANSCRIPT_FALLBACK_INTERVAL_MS,
@@ -164,7 +166,8 @@ export function createSessionTranscriptSource(
   let refreshing = false;
   let pending = false;
   let revision = 0;
-  let sensitiveValues = sourceSensitiveValues(route, deps, new Set<string>());
+  const sensitiveHistory = createSourceSensitiveHistory(route, deps);
+  let sensitiveValues = sensitiveHistory.snapshot();
   let renderingCwd: AbsolutePath | undefined;
   let published: TranscriptSnapshot = frozenSnapshot(0, [], false, "live", sensitiveValues, renderingCwd);
   let displayState: AgentDisplayState = AgentState.Running;
@@ -215,7 +218,8 @@ export function createSessionTranscriptSource(
       return;
     }
     const proofBefore = endReached;
-    sensitiveValues = sourceSensitiveValues(route, deps, result.entryIds);
+    sensitiveHistory.addNative(result.entryIds);
+    sensitiveValues = sensitiveHistory.snapshot();
     renderingCwd = result.renderingCwd;
     if (result.rebuilt) endReached = false;
     consumedChangeGeneration = Math.max(consumedChangeGeneration, observedChangeGeneration);
@@ -746,6 +750,7 @@ function projectBranch(
 
   const items: TranscriptItem[] = [];
   const toolBlocks = new Map<string, { readonly item: number; readonly block: number }>();
+  const toolCallIds = new Set<string>();
   let nextSequence = 0;
   let nextGroup = 0;
   const appendItem = (item: TranscriptItem): number => {
@@ -781,6 +786,7 @@ function projectBranch(
           continue;
         }
         if (block.kind !== "tool-call") continue;
+        toolCallIds.add(block.callId);
         const tool = trySafeToolDisplayName(block.tool);
         if (tool === undefined) continue;
         const callId = tryToolCallId(block.callId);
@@ -793,6 +799,7 @@ function projectBranch(
       blocks.forEach((block, index) => { if (block.kind === "tool" && block.presentation.callId !== undefined) toolBlocks.set(String(block.presentation.callId), { item: position, block: index }); });
       continue;
     }
+    toolCallIds.add(message.callId);
     const located = toolBlocks.get(message.callId);
     if (located === undefined) continue;
     const owner = items[located.item];
@@ -809,7 +816,10 @@ function projectBranch(
     items[located.item] = Object.freeze({ ...owner, blocks: Object.freeze(blocks) });
   }
 
-  return evictToBounds(items, truncatedBefore, new Set(branch.map((entry) => String(entry.id))));
+  return evictToBounds(items, truncatedBefore, new Set([
+    ...branch.map((entry) => String(entry.id)),
+    ...toolCallIds,
+  ]));
 }
 
 /** Drops complete oldest items until the retained item and byte bounds hold. */
@@ -916,11 +926,45 @@ function frozenSnapshot(
     ...(renderingCwd === undefined ? {} : { renderingCwd }) });
 }
 
-function sourceSensitiveValues(route: TranscriptRoute, deps: SessionTranscriptSourceDependencies, entryIds: ReadonlySet<string>): TranscriptSensitiveValues {
-  return Object.freeze({
-    nativeIds: Object.freeze(new Set<string>([String(route.ownerSessionId), String(route.childSessionId), ...entryIds])) as ReadonlySet<string>,
-    managedPathsAndNames: Object.freeze(new Set<string>([String(route.fileName), String(deps.agentDir)])) as ReadonlySet<string>,
-  });
+interface SourceSensitiveHistory {
+  addNative(values: ReadonlySet<string>): void;
+  snapshot(): TranscriptSensitiveValues;
+}
+
+function createSourceSensitiveHistory(route: TranscriptRoute, deps: SessionTranscriptSourceDependencies): SourceSensitiveHistory {
+  const history = new Map<string, { readonly kind: "native" | "path"; readonly value: string; readonly bytes: number }>();
+  let bytes = 0;
+  let overflowed = false;
+  const append = (kind: "native" | "path", value: string): void => {
+    const key = `${kind}\u0000${value}`;
+    if (history.has(key)) return;
+    const valueBytes = encoder.encode(value).byteLength;
+    history.set(key, { kind, value, bytes: valueBytes });
+    bytes += valueBytes;
+    while (history.size > MAX_TRANSCRIPT_STORE_ITEMS || bytes > Number(MAX_TRANSCRIPT_STORE_BYTES)) {
+      const oldest = history.entries().next().value as [string, { readonly bytes: number }] | undefined;
+      if (oldest === undefined) break;
+      history.delete(oldest[0]);
+      bytes -= oldest[1].bytes;
+      overflowed = true;
+    }
+  };
+  append("native", String(route.ownerSessionId));
+  append("native", String(route.childSessionId));
+  append("path", String(route.fileName));
+  append("path", String(deps.agentDir));
+
+  return {
+    addNative: (values): void => { for (const value of values) append("native", value); },
+    snapshot: (): TranscriptSensitiveValues => {
+      const retained = [...history.values()];
+      return Object.freeze({
+        nativeIds: Object.freeze(new Set(retained.filter(({ kind }) => kind === "native").map(({ value }) => value))) as ReadonlySet<string>,
+        managedPathsAndNames: Object.freeze(new Set(retained.filter(({ kind }) => kind === "path").map(({ value }) => value))) as ReadonlySet<string>,
+        overflowed,
+      });
+    },
+  };
 }
 
 /** Retains native correlation privately; an unusable ID leaves the block uncorrelated. */
@@ -939,6 +983,7 @@ function changed(
   return current.availability !== availability
     || current.truncatedBefore !== truncatedBefore
     || current.renderingCwd !== renderingCwd
+    || current.sensitiveValues.overflowed !== sensitiveValues.overflowed
     || !sameStringSet(current.sensitiveValues.nativeIds, sensitiveValues.nativeIds)
     || !sameStringSet(current.sensitiveValues.managedPathsAndNames, sensitiveValues.managedPathsAndNames)
     || !sameItems(current.items, items);

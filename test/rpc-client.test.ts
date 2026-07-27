@@ -224,6 +224,7 @@ describe("RpcRunClient", () => {
     await client.waitSettled();
 
     expect(tools).toEqual([
+      expect.objectContaining({ phase: "running", arguments: { path: "/initial" } }),
       expect.objectContaining({ phase: "running", arguments: { path: "/not-copied" } }),
       expect.objectContaining({ phase: "completed", result: {
         content: ["not-copied"], details: {}, isError: false,

@@ -15,7 +15,7 @@ import {
   CHILD_GATE_EDITOR_TEXT,
   CHILD_GATE_NATIVE_ASSISTANT_TEXT,
   CHILD_GATE_NATIVE_USER_TEXT,
-  CHILD_GATE_OVERRIDE_SECRET,
+  CHILD_GATE_SENSITIVE_VALUE,
   CHILD_GATE_TOOL_PREVIEW,
 } from "./child-conversation-gate-fixture.ts";
 import {
@@ -392,7 +392,7 @@ async function drive(command: readonly string[], workDir: string, eventFile: str
       && terminal.text().includes("Result shown in bounded form")
       && !terminal.text().includes(CHILD_GATE_BUILTIN_SUMMARY)
       && !terminal.text().includes("subagent_probe")
-      && !terminal.text().includes(CHILD_GATE_OVERRIDE_SECRET), "renderer override tool");
+      && !terminal.text().includes(CHILD_GATE_SENSITIVE_VALUE), "renderer override tool");
     events.push("native-override-tool-rendered");
     writeFileSync(proofFile, "native-built-in-rendered\n", { flag: "wx", mode: 0o600 });
     await observe(() => readTrace(eventFile).includes("native-builtin-names-asserted"), "runtime built-in names");

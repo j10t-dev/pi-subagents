@@ -64,7 +64,7 @@ function snapshotAt(revision: number): TranscriptSnapshot {
     items: [],
     truncatedBefore: false,
     availability: "live" as const,
-    sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() },
+    sensitiveValues: { nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>(), overflowed: false },
   });
 }
 

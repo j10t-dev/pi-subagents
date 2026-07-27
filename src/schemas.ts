@@ -124,6 +124,7 @@ export const ToolObservationEventSchema = Type.Union([
     type: Type.Literal("tool_execution_update"),
     toolCallId: Type.String({ minLength: 1, maxLength: 256 }),
     toolName: Type.String({ minLength: 1, maxLength: 256 }),
+    args: Type.Optional(Type.Unknown()),
   }),
   Type.Object({
     type: Type.Literal("tool_execution_end"),

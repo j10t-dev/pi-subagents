@@ -780,6 +780,7 @@ describe("deterministic network-free real-Pi matrix", () => {
             knownAgentIds: new Set(),
             knownRunIds: new Set(),
             knownInternalPaths: new Set(),
+            sensitiveHistoryOverflowed: false,
           }),
           modelLabel: unknownModelLabel(),
           context: { kind: "unavailable" },
@@ -909,7 +910,7 @@ describe("deterministic network-free real-Pi matrix", () => {
           model: deriveModelLabel(modelSpec("mock-provider/mock"), "high"),
           context: contextLabel({ kind: "unavailable" }),
           taskLabel: deriveTaskLabel("nested committed", {
-            knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(),
+            knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(), sensitiveHistoryOverflowed: false,
           }),
           state: AgentState.Running,
           transcriptFile: transcriptFileName(basename(nestedFile)),

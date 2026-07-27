@@ -40,19 +40,19 @@ describe("agent observation projection", () => {
     ["opening tilde fence with arbitrary info", "  ~~~ typescript title='review'  \n\n  Review the adapter  \n~~~~"],
     ["bare closing fences", "~~~\n```\nReview the adapter\n~~~~"],
   ] as const)("skips standalone Markdown fence lines for %s", (_name, assignment) => {
-    expect(String(deriveTaskLabel(assignment, { knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set() })))
+    expect(String(deriveTaskLabel(assignment, { knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(), sensitiveHistoryOverflowed: false })))
       .toBe("Review the adapter");
   });
 
   test("does not classify ordinary prose containing backticks as a fence", () => {
     expect(String(deriveTaskLabel("Review `inline` code and the ``` token", {
-      knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(),
+      knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(), sensitiveHistoryOverflowed: false,
     }))).toBe("Review inline code and the token");
   });
 
   test("bounds the first descriptive line after standalone fences", () => {
     const label = deriveTaskLabel(`\n\`\`\`\n${"界".repeat(1_000)}\n\`\`\``, {
-      knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(),
+      knownAgentIds: new Set(), knownRunIds: new Set(), knownInternalPaths: new Set(), sensitiveHistoryOverflowed: false,
     });
     expect([...label]).toHaveLength(80);
     expect(Buffer.byteLength(label, "utf8")).toBeLessThanOrEqual(512);
@@ -63,6 +63,7 @@ describe("agent observation projection", () => {
       knownAgentIds: new Set([agentId("agent-a")]),
       knownRunIds: new Set(),
       knownInternalPaths: new Set(),
+      sensitiveHistoryOverflowed: false,
     });
     expect(String(label)).toBe("Review path for path");
     expect(label).not.toContain("agent-a");

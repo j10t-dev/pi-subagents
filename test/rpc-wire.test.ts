@@ -380,6 +380,18 @@ describe("classifyInboundRecord", () => {
     } } });
   });
 
+  test("admits bounded replacement arguments on tool execution updates", () => {
+    expect(classifyInboundRecord({
+      type: "tool_execution_update",
+      toolCallId: "call-1",
+      toolName: "read",
+      args: { path: "/home/child/replaced.ts" },
+    })).toMatchObject({
+      ok: true,
+      record: { kind: "tool", phase: "running", arguments: { path: "/home/child/replaced.ts" } },
+    });
+  });
+
   test("keeps tool observations while omitting unusable rich values", () => {
     const oversized = { blob: "x".repeat(4_097) };
     const start = classifyInboundRecord({

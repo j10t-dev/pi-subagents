@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { AgentObservationStore, createTotalRpcObservationAdapter } from "../src/agent-observation-store.ts";
 import type { ObservationReconciliationSnapshot, TranscriptAssistantBlock, TranscriptItem } from "../src/agent-observation.ts";
+import { projectConversationSnapshot } from "../src/agent-widget/conversation-projection.ts";
 import { createContextObservationService } from "../src/context-observation.ts";
 import { rpcContentIndex, rpcStopReason, rpcToolCallId } from "../src/domain.ts";
 import { toolDisplayName, transcriptText } from "../src/agent-observation.ts";
@@ -15,6 +16,7 @@ import {
   modelSpec,
   runAttemptId,
   runId,
+  selectedTranscriptRevision,
   transcriptFileName,
   truncateUtf8,
   utf8Bytes,
@@ -327,6 +329,46 @@ describe("AgentObservationStore", () => {
     expect(labels.at(-1)?.[0]).not.toContain("/tmp/a.ts");
   });
 
+  test("sensitive-history overflow keeps every row and conversation header label generic", () => {
+    const sensitiveIdentity = agentId("discarded-sensitive-agent");
+    const store = new AgentObservationStore({
+      transcriptBudgets: { perSourceItems: 10, perSourceBytes: 1_024, globalItems: 5, globalBytes: 1_024 },
+    });
+    register(store, A, 1, `Review ${sensitiveIdentity} result`);
+    store.registerSensitiveValues({
+      agentIds: new Set([sensitiveIdentity]), runIds: new Set(), internalPaths: new Set(),
+    });
+    for (const value of ["00000001", "00000002", "00000003", "00000004", "00000005"]) {
+      store.registerSensitiveValues({
+        agentIds: new Set(), runIds: new Set([runId(value)]), internalPaths: new Set(),
+      });
+    }
+    expect(store.transcriptSource(A)!.snapshot().sensitiveValues).toMatchObject({ overflowed: true });
+    expect(store.transcriptSource(A)!.snapshot().sensitiveValues.nativeIds).not.toContain(sensitiveIdentity);
+
+    const second = agentId("agent-b");
+    register(store, second, 2, `Register ${sensitiveIdentity}`);
+    store.acceptRun({
+      agentId: A,
+      runId: runId("00000006"),
+      attemptId: runAttemptId("overflow-assignment-update"),
+      assignment: `Update ${sensitiveIdentity}`,
+    });
+
+    const snapshot = store.directSnapshot();
+    if (snapshot.kind !== "snapshot") throw new Error("expected snapshot");
+    expect(snapshot.entries.map((entry) => String(entry.row.taskLabel))).toEqual(["Delegated task", "Delegated task"]);
+    const headers = snapshot.entries.map((entry, index) => projectConversationSnapshot({
+      revision: selectedTranscriptRevision(index + 1),
+      transcript: store.transcriptSource(entry.agentId)!.snapshot(),
+      row: entry.row,
+      routeAvailable: true,
+    }).header.taskLabel);
+    expect(headers.map(String)).toEqual(["Delegated task", "Delegated task"]);
+    expect(JSON.stringify([...snapshot.entries.map((entry) => entry.row.taskLabel), ...headers]))
+      .not.toContain(sensitiveIdentity);
+  });
+
   test("coalesces revisions and isolates throwing, thenable, re-entrant, and unsubscribed listeners", async () => {
     const diagnostics: string[] = [];
     const store = new AgentObservationStore({ diagnostic: (message) => diagnostics.push(message) });
@@ -527,6 +569,93 @@ describe("AgentObservationStore", () => {
     const tool = assistant.blocks[0] as Extract<TranscriptAssistantBlock, { kind: "tool" }>;
     expect(tool.presentation.phase).toBe("completed");
     expect(tool.presentation.result?.content).toEqual([transcriptText("line one")]);
+    expect(store.transcriptSource(A)!.snapshot().sensitiveValues.nativeIds.has("call-1")).toBe(true);
+  });
+
+  test("historical agent, run and tool identities survive owner eviction and removal for another source", () => {
+    const store = new AgentObservationStore({
+      transcriptBudgets: { perSourceItems: 1, perSourceBytes: 1_024, globalItems: 16, globalBytes: 2_048 },
+    });
+    const retainedAgent = agentId("retained-agent");
+    const historicalRun = runId("cafefeed");
+    const historicalCall = rpcToolCallId("historical-call");
+    register(store, A, 1); register(store, retainedAgent, 2);
+    const ownerSink = bindTranscript(store, A, historicalRun, runAttemptId("historical-attempt")).sink;
+    ownerSink.record({
+      kind: "tool", toolCallId: historicalCall, tool: toolDisplayName("read"), phase: "completed",
+      result: { content: [transcriptText("owner result")], isError: false },
+    });
+    ownerSink.record({ kind: "prompt-accepted", text: transcriptText("evicts owner tool item") });
+    expect(retainedToolCallIds(store.transcriptSource(A)!.snapshot().items)).not.toContain(String(historicalCall));
+    store.updateLifecycle({
+      agentId: A, state: AgentState.Stopped, runId: historicalRun,
+      transcriptPath: testSessionPath(`/tmp/pi-subagents-test/${A}.jsonl`),
+    });
+
+    store.reconcile({
+      spawnSequence: [retainedAgent],
+      agents: [{ agentId: retainedAgent, sessionPath: testSessionPath(`/tmp/pi-subagents-test/${retainedAgent}.jsonl`), cwd: testAbsolutePath("/tmp/pi-subagents-test"), model: modelSpec("mock-provider/luna"), thinkingLevel: "high" }],
+      runs: [{ agentId: retainedAgent, state: AgentState.Stopped }], completions: [], pendingDelivery: new Set(),
+      acceptedAssignments: new Map(),
+      sensitiveValues: { agentIds: new Set([retainedAgent]), runIds: new Set(), internalPaths: new Set() },
+    });
+
+    const sensitive = store.transcriptSource(retainedAgent)!.snapshot().sensitiveValues;
+    expect(sensitive.nativeIds.has(String(A))).toBeTrue();
+    expect(sensitive.nativeIds.has(String(historicalRun))).toBeTrue();
+    expect(sensitive.nativeIds.has(String(historicalCall))).toBeTrue();
+    expect(sensitive.overflowed).toBeFalse();
+  });
+
+  test("high-volume multi-run sensitive history is explicitly bounded and overflows closed", () => {
+    const store = new AgentObservationStore({
+      transcriptBudgets: { perSourceItems: 3, perSourceBytes: 300, globalItems: 4, globalBytes: 500 },
+    });
+    const other = agentId("bounded-tools-b");
+    register(store); register(store, other, 2);
+    for (let index = 0; index < 40; index += 1) {
+      const id = index % 2 === 0 ? A : other;
+      const run = runId(index.toString(16).padStart(8, "0"));
+      bindTranscript(store, id, run, runAttemptId(`volume-attempt-${index}`)).sink.record({
+        kind: "tool",
+        toolCallId: rpcToolCallId(`call-volume-${index}-${"🙂".repeat(20)}`),
+        tool: toolDisplayName("read"),
+        phase: "completed",
+        result: { content: [transcriptText("ok")], isError: false },
+      });
+    }
+
+    const snapshots = [store.transcriptSource(A)!.snapshot(), store.transcriptSource(other)!.snapshot()];
+    const retainedIds = snapshots.flatMap((snapshot) => retainedToolCallIds(snapshot.items));
+    expect(retainedIds.length).toBeLessThanOrEqual(4);
+    expect(retainedIds.reduce((bytes, value) => bytes + Buffer.byteLength(value), 0)).toBeLessThanOrEqual(500);
+    const sensitive = snapshots[0]!.sensitiveValues;
+    const sensitiveScan = new Set([...sensitive.nativeIds, ...sensitive.managedPathsAndNames]);
+    expect(sensitive.overflowed).toBeTrue();
+    expect(sensitiveScan.size).toBeLessThanOrEqual(4);
+    expect([...sensitiveScan].reduce((bytes, value) => bytes + Buffer.byteLength(value), 0)).toBeLessThanOrEqual(500);
+    expect(store.testAdapter().transcriptItemCount()).toBeLessThanOrEqual(4);
+  });
+
+  test("tool update arguments replace the existing live block in place", () => {
+    const { store, sink } = boundTranscriptStore();
+    sink.record({
+      kind: "tool", toolCallId: rpcToolCallId("call-update"), tool: toolDisplayName("read"), phase: "running",
+      arguments: admitBoundedTranscriptJson({ path: "/home/child/initial.ts" })!,
+    });
+    const before = store.transcriptSource(A)!.snapshot();
+    sink.record({
+      kind: "tool", toolCallId: rpcToolCallId("call-update"), tool: toolDisplayName("read"), phase: "running",
+      arguments: admitBoundedTranscriptJson({ path: "/home/child/replaced.ts" })!,
+    });
+
+    const after = store.transcriptSource(A)!.snapshot();
+    expect(after.items).toHaveLength(1);
+    expect(after.items[0]?.sequence).toBe(before.items[0]?.sequence);
+    expect(after.items[0]).toMatchObject({
+      kind: "assistant",
+      blocks: [{ kind: "tool", presentation: { arguments: { path: "/home/child/replaced.ts" } } }],
+    });
   });
 
   test("the live snapshot publishes known identity and the child working directory", () => {
@@ -875,9 +1004,11 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "tool", toolCallId: rpcToolCallId("call-1"), tool: toolDisplayName("read"), phase: "running",
       arguments: admitBoundedTranscriptJson({ file: "/home/child/a.ts" })! });
 
-    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ availability: "unavailable", items: [
+    const snapshot = store.transcriptSource(A)!.snapshot();
+    expect(snapshot).toMatchObject({ availability: "unavailable", items: [
       expect.objectContaining({ kind: "notice", code: "projection-unavailable" }),
     ] });
+    expect(transcriptBytes(snapshot.items)).toBeLessThanOrEqual(16);
   });
 
   test("serialised tool result details count against grouped source retention", () => {
@@ -887,7 +1018,9 @@ describe("AgentObservationStore", () => {
     sink.record({ kind: "tool", toolCallId: rpcToolCallId("call-1"), tool: toolDisplayName("read"), phase: "completed",
       result: { content: [], details: admitBoundedTranscriptJson({ file: "/home/child/a.ts" })!, isError: false } });
 
-    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ availability: "live", truncatedBefore: true, items: [] });
+    const snapshot = store.transcriptSource(A)!.snapshot();
+    expect(snapshot).toMatchObject({ availability: "live", truncatedBefore: true, items: [] });
+    expect(transcriptBytes(snapshot.items)).toBeLessThanOrEqual(16);
   });
 
   test("serialised rich tool data counts against global store retention", () => {
@@ -905,8 +1038,12 @@ describe("AgentObservationStore", () => {
       result: { content: [], details, isError: false },
     });
 
-    expect(store.transcriptSource(A)!.snapshot()).toMatchObject({ truncatedBefore: true, items: [] });
-    expect(store.transcriptSource(other)!.snapshot().items).toHaveLength(1);
+    const sourceA = store.transcriptSource(A)!.snapshot();
+    const sourceB = store.transcriptSource(other)!.snapshot();
+    expect(sourceA).toMatchObject({ truncatedBefore: true, items: [] });
+    expect(sourceB.items).toHaveLength(1);
+    expect(transcriptBytes([...sourceA.items, ...sourceB.items])).toBeLessThanOrEqual(40);
+    expect(transcriptBytes(sourceB.items)).toBe(Buffer.byteLength("call-b") + Buffer.byteLength(JSON.stringify(details)));
   });
 
   test("per-source byte pressure evicts closed UTF-8 items to the exact independent cap", () => {
@@ -1014,6 +1151,9 @@ describe("AgentObservationStore", () => {
 
   test("disposed retained transcript source has one immutable terminal snapshot and inert subscriptions", async () => {
     const store = new AgentObservationStore(); register(store);
+    bindTranscript(store, A, R1, runAttemptId("dispose-sensitive")).sink.record({
+      kind: "tool", toolCallId: rpcToolCallId("call-disposed"), tool: toolDisplayName("read"), phase: "running",
+    });
     const source = store.transcriptSource(A)!;
     let calls = 0; source.subscribe(() => { calls++; });
     store.dispose(); await flush();
@@ -1021,6 +1161,7 @@ describe("AgentObservationStore", () => {
     expect(final.availability).toBe("unavailable");
     expect(Object.isFrozen(final)).toBeTrue();
     expect(Object.isFrozen(final.items)).toBeTrue();
+    expect(final.sensitiveValues.nativeIds.has("call-disposed")).toBe(true);
     source.subscribe(() => { calls++; });
     expect(source.snapshot()).toBe(final);
     expect(calls).toBe(0);
@@ -1154,10 +1295,22 @@ function transcriptBytes(items: readonly TranscriptItem[]): number {
     ? Buffer.byteLength(item.text)
     : item.kind === "assistant"
       ? item.blocks.reduce((bytes, block) => bytes + (block.kind === "tool"
-        ? Buffer.byteLength(block.presentation.preview ?? "")
+        ? Buffer.byteLength(block.presentation.callId ?? "")
+          + Buffer.byteLength(block.presentation.preview ?? "")
+          + transcriptJsonBytes(block.presentation.arguments)
           + (block.presentation.result?.content.reduce((sum, text) => sum + Buffer.byteLength(text), 0) ?? 0)
+          + transcriptJsonBytes(block.presentation.result?.details)
         : Buffer.byteLength(block.text)), 0)
       : 0), 0);
+}
+
+function transcriptJsonBytes(value: ReturnType<typeof admitBoundedTranscriptJson>): number {
+  return value === undefined ? 0 : Buffer.byteLength(JSON.stringify(value));
+}
+
+function retainedToolCallIds(items: readonly TranscriptItem[]): string[] {
+  return items.flatMap((item) => item.kind !== "assistant" ? [] : item.blocks.flatMap((block) =>
+    block.kind === "tool" && block.presentation.callId !== undefined ? [String(block.presentation.callId)] : []));
 }
 
 function appendGenerationAndTool(sink: ReturnType<AgentObservationStore["createAttemptSink"]>, text: string): void {

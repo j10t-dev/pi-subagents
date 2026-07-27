@@ -60,10 +60,22 @@ export function stripShellIntegration(line: string): string {
   return output;
 }
 
+export interface PiConversationAdapterFactories {
+  readonly getMarkdownTheme: typeof getMarkdownTheme;
+  readonly parseSkillBlock: typeof parseSkillBlock;
+  readonly createUserMessage: (...args: ConstructorParameters<typeof UserMessageComponent>) => UserMessageComponent;
+  readonly createSkillInvocation: (...args: ConstructorParameters<typeof SkillInvocationMessageComponent>) => SkillInvocationMessageComponent;
+  readonly createAssistantMessage: (...args: ConstructorParameters<typeof AssistantMessageComponent>) => AssistantMessageComponent;
+  readonly createPresentationToolDefinition: typeof createPresentationToolDefinition;
+  readonly createToolExecution: (...args: ConstructorParameters<typeof ToolExecutionComponent>) => ToolExecutionComponent;
+}
+
 export interface PiConversationAdapterOptions {
   readonly tui: TUI;
   /** Governs local fallback presentation; native components use Pi's process-global theme. */
   readonly theme: Theme;
+  /** Constructor boundary used by host compatibility tests and item-level containment. */
+  readonly factories?: Partial<PiConversationAdapterFactories>;
 }
 
 export interface PiConversationRenderOptions {
@@ -83,33 +95,50 @@ interface ExpandableComponent {
   setExpanded(expanded: boolean): void;
 }
 
+interface ComponentUpdater<T> {
+  readonly component: T;
+  readonly childIndex: number;
+}
+
 interface BuiltComponents {
   readonly revision: number;
   readonly renderingCwd: string | undefined;
-  readonly children: readonly Component[];
-  readonly assistants: readonly AssistantMessageComponent[];
-  readonly expandable: readonly ExpandableComponent[];
+  readonly children: Component[];
+  readonly assistants: readonly ComponentUpdater<AssistantMessageComponent>[];
+  readonly expandable: readonly ComponentUpdater<ExpandableComponent>[];
+  readonly failedChildren: Set<number>;
 }
 
 export function createPiConversationAdapter(options: PiConversationAdapterOptions): PiConversationAdapter {
+  const factories: PiConversationAdapterFactories = {
+    getMarkdownTheme,
+    parseSkillBlock,
+    createUserMessage: (...args) => new UserMessageComponent(...args),
+    createSkillInvocation: (...args) => new SkillInvocationMessageComponent(...args),
+    createAssistantMessage: (...args) => new AssistantMessageComponent(...args),
+    createPresentationToolDefinition,
+    createToolExecution: (...args) => new ToolExecutionComponent(...args),
+    ...options.factories,
+  };
   let built: BuiltComponents | undefined;
   let constructions = 0;
   let disposed = false;
 
   function build(conversation: ConversationSnapshot): BuiltComponents {
     const children: Component[] = [];
-    const assistants: AssistantMessageComponent[] = [];
-    const expandable: ExpandableComponent[] = [];
+    const assistants: ComponentUpdater<AssistantMessageComponent>[] = [];
+    const expandable: ComponentUpdater<ExpandableComponent>[] = [];
     for (const turn of conversation.turns) {
-      appendTurn(turn, conversation, children, assistants, expandable, options);
+      appendTurn(turn, conversation, children, assistants, expandable, options, factories);
     }
     constructions += 1;
     return Object.freeze({
       revision: Number(conversation.revision),
       renderingCwd: conversation.renderingCwd === undefined ? undefined : String(conversation.renderingCwd),
-      children: Object.freeze(children),
+      children,
       assistants: Object.freeze(assistants),
       expandable: Object.freeze(expandable),
+      failedChildren: new Set<number>(),
     });
   }
 
@@ -122,8 +151,16 @@ export function createPiConversationAdapter(options: PiConversationAdapterOption
       if (built === undefined || built.revision !== Number(conversation.revision) || built.renderingCwd !== cwd) {
         built = build(conversation);
       }
-      for (const assistant of built.assistants) assistant.setHideThinkingBlock(!renderOptions.thinkingVisible);
-      for (const item of built.expandable) item.setExpanded(renderOptions.toolsExpanded);
+      for (const assistant of built.assistants) {
+        if (built.failedChildren.has(assistant.childIndex)) continue;
+        try { assistant.component.setHideThinkingBlock(!renderOptions.thinkingVisible); }
+        catch { degradeBuiltItem(built, assistant.childIndex, options); }
+      }
+      for (const item of built.expandable) {
+        if (built.failedChildren.has(item.childIndex)) continue;
+        try { item.component.setExpanded(renderOptions.toolsExpanded); }
+        catch { degradeBuiltItem(built, item.childIndex, options); }
+      }
       const width = Math.max(1, Number(renderOptions.width));
       const lines: string[] = [];
       for (const child of built.children) {
@@ -149,50 +186,90 @@ function appendTurn(
   turn: ConversationTurn,
   conversation: ConversationSnapshot,
   children: Component[],
-  assistants: AssistantMessageComponent[],
-  expandable: ExpandableComponent[],
+  assistants: ComponentUpdater<AssistantMessageComponent>[],
+  expandable: ComponentUpdater<ExpandableComponent>[],
   options: PiConversationAdapterOptions,
+  factories: PiConversationAdapterFactories,
 ): void {
-  const markdown = getMarkdownTheme();
   if (turn.kind === "notice") {
-    if (children.length > 0) children.push(new Spacer(1));
-    children.push(new Text(options.theme.fg("warning", noticeText(turn.code)), NATIVE_OUTPUT_PAD, 0));
+    appendTransaction(children, assistants, expandable, options, (pending) => {
+      if (children.length > 0) pending.children.push(new Spacer(1));
+      pending.children.push(new Text(options.theme.fg("warning", noticeText(turn.code)), NATIVE_OUTPUT_PAD, 0));
+    });
     return;
   }
   if (turn.kind === "user") {
-    if (children.length > 0) children.push(new Spacer(1));
-    const text = String(turn.text);
-    const skill = parseSkillBlock(text);
-    if (skill === null) {
-      children.push(new UserMessageComponent(text, markdown, NATIVE_OUTPUT_PAD));
-      return;
-    }
-    const skillComponent = new SkillInvocationMessageComponent(skill, markdown);
-    children.push(skillComponent);
-    expandable.push(skillComponent);
-    if (skill.userMessage) {
-      children.push(new Spacer(1));
-      children.push(new UserMessageComponent(skill.userMessage, markdown, NATIVE_OUTPUT_PAD));
-    }
+    appendTransaction(children, assistants, expandable, options, (pending) => {
+      const markdown = factories.getMarkdownTheme();
+      if (children.length > 0) pending.children.push(new Spacer(1));
+      const text = String(turn.text);
+      const skill = factories.parseSkillBlock(text);
+      if (skill === null) {
+        pending.children.push(factories.createUserMessage(text, markdown, NATIVE_OUTPUT_PAD));
+        return;
+      }
+      const skillComponent = factories.createSkillInvocation(skill, markdown);
+      pending.children.push(skillComponent);
+      pending.expandable.push({ component: skillComponent, childIndex: pending.children.length - 1 });
+      if (skill.userMessage) {
+        pending.children.push(new Spacer(1));
+        pending.children.push(factories.createUserMessage(skill.userMessage, markdown, NATIVE_OUTPUT_PAD));
+      }
+    });
     return;
   }
 
-  const assistant = new AssistantMessageComponent(
-    presentationMessage(turn),
-    false,
-    markdown,
-    HIDDEN_THINKING_LABEL,
-    NATIVE_OUTPUT_PAD,
-  );
-  children.push(assistant);
-  assistants.push(assistant);
+  appendTransaction(children, assistants, expandable, options, (pending) => {
+    const assistant = factories.createAssistantMessage(
+      presentationMessage(turn),
+      false,
+      factories.getMarkdownTheme(),
+      HIDDEN_THINKING_LABEL,
+      NATIVE_OUTPUT_PAD,
+    );
+    pending.children.push(assistant);
+    pending.assistants.push({ component: assistant, childIndex: pending.children.length - 1 });
+  });
   for (const block of turn.blocks) {
     if (block.kind !== "tool") continue;
-    const component = createToolComponent(block.presentation, conversation, options);
-    children.push(component);
-    expandable.push(component);
-    applyToolState(component, block.presentation, turn.stopReason);
+    appendTransaction(children, assistants, expandable, options, (pending) => {
+      const component = createToolComponent(block.presentation, conversation, options, factories);
+      applyToolState(component, block.presentation, turn.stopReason);
+      pending.children.push(component);
+      pending.expandable.push({ component, childIndex: pending.children.length - 1 });
+    });
   }
+}
+
+interface PendingComponents {
+  readonly children: Component[];
+  readonly assistants: ComponentUpdater<AssistantMessageComponent>[];
+  readonly expandable: ComponentUpdater<ExpandableComponent>[];
+}
+
+function appendTransaction(
+  children: Component[],
+  assistants: ComponentUpdater<AssistantMessageComponent>[],
+  expandable: ComponentUpdater<ExpandableComponent>[],
+  options: PiConversationAdapterOptions,
+  construct: (pending: PendingComponents) => void,
+): void {
+  const pending: PendingComponents = { children: [], assistants: [], expandable: [] };
+  try {
+    construct(pending);
+    const firstChild = children.length;
+    children.push(...pending.children);
+    assistants.push(...pending.assistants.map((item) => ({ ...item, childIndex: firstChild + item.childIndex })));
+    expandable.push(...pending.expandable.map((item) => ({ ...item, childIndex: firstChild + item.childIndex })));
+  } catch {
+    if (children.length > 0) children.push(new Spacer(1));
+    children.push(new Text(options.theme.fg("warning", "Item unavailable"), NATIVE_OUTPUT_PAD, 0));
+  }
+}
+
+function degradeBuiltItem(built: BuiltComponents, childIndex: number, options: PiConversationAdapterOptions): void {
+  built.failedChildren.add(childIndex);
+  built.children[childIndex] = new Text(options.theme.fg("warning", "Item unavailable"), NATIVE_OUTPUT_PAD, 0);
 }
 
 /** Presentation-only metadata required by Pi's public assistant message type; never persisted. */
@@ -245,11 +322,12 @@ function createToolComponent(
   presentation: ConversationToolPresentation,
   conversation: ConversationSnapshot,
   options: PiConversationAdapterOptions,
+  factories: PiConversationAdapterFactories,
 ): ToolExecutionComponent {
   const definition = presentation.rendering === "renderer-override"
-    ? createPresentationToolDefinition(presentation.tool, options.theme)
+    ? factories.createPresentationToolDefinition(presentation.tool, options.theme)
     : undefined;
-  return new ToolExecutionComponent(
+  return factories.createToolExecution(
     String(presentation.tool),
     String(presentation.callKey),
     toolArguments(presentation),

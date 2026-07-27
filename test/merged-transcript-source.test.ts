@@ -115,7 +115,7 @@ function snapshot(
 }
 
 function emptySensitiveValues(): TranscriptSensitiveValues {
-  return Object.freeze({ nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>() });
+  return Object.freeze({ nativeIds: new Set<string>(), managedPathsAndNames: new Set<string>(), overflowed: false });
 }
 
 describe("createMergedTranscriptSource", () => {
@@ -306,14 +306,30 @@ describe("createMergedTranscriptSource", () => {
     const authoritative = new MutableAuthoritativeSource([], "live", {
       nativeIds: new Set(["aaaaaaaa"]),
       managedPathsAndNames: new Set(["child.jsonl"]),
+      overflowed: false,
     });
     const live = new MutableSource([], "live", {
       nativeIds: new Set(["bbbbbbbb"]),
       managedPathsAndNames: new Set(["/state/pi-subagents"]),
+      overflowed: false,
     });
     const values = createMergedTranscriptSource(authoritative, live).snapshot().sensitiveValues;
     expect([...values.nativeIds].sort()).toEqual(["aaaaaaaa", "bbbbbbbb"]);
     expect([...values.managedPathsAndNames].sort()).toEqual(["/state/pi-subagents", "child.jsonl"]);
+  });
+
+  test.each([
+    [true, false],
+    [false, true],
+  ])("unions sensitive-history overflow from either source", (authoritativeOverflow, liveOverflow) => {
+    const authoritative = new MutableAuthoritativeSource([], "live", {
+      nativeIds: new Set(), managedPathsAndNames: new Set(), overflowed: authoritativeOverflow,
+    } as TranscriptSensitiveValues);
+    const live = new MutableSource([], "live", {
+      nativeIds: new Set(), managedPathsAndNames: new Set(), overflowed: liveOverflow,
+    } as TranscriptSensitiveValues);
+
+    expect(createMergedTranscriptSource(authoritative, live).snapshot().sensitiveValues.overflowed).toBeTrue();
   });
 
   test("the live working directory wins for a direct child and the authoritative one is the fallback", () => {
@@ -325,7 +341,7 @@ describe("createMergedTranscriptSource", () => {
 
   test("publishes a new merged revision for metadata-only source changes", () => {
     const authoritative = new MutableAuthoritativeSource([], "live", {
-      nativeIds: new Set(["aaaaaaaa"]), managedPathsAndNames: new Set<string>(),
+      nativeIds: new Set(["aaaaaaaa"]), managedPathsAndNames: new Set<string>(), overflowed: false,
     }, "/authoritative/one" as AbsolutePath);
     const merged = createMergedTranscriptSource(authoritative);
     const before = merged.snapshot();
@@ -333,7 +349,7 @@ describe("createMergedTranscriptSource", () => {
     merged.subscribe(() => { notifications += 1 });
 
     authoritative.emit([], {
-      sensitiveValues: { nativeIds: new Set(["aaaaaaaa", "bbbbbbbb"]), managedPathsAndNames: new Set<string>() },
+      sensitiveValues: { nativeIds: new Set(["aaaaaaaa", "bbbbbbbb"]), managedPathsAndNames: new Set<string>(), overflowed: false },
       renderingCwd: "/authoritative/two" as AbsolutePath,
     });
 
